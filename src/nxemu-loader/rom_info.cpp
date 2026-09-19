@@ -29,7 +29,7 @@ bool IsAddOnContentExtension(const char * fileName)
 {
     static const char * supported_extensions[] = {
         "nca",
-        "dxci",
+        "dxci", "xci", "nsp",
         "dnsp",
     };
 
@@ -132,11 +132,11 @@ void RegisterMatchingAddOnEntriesFromFile(FileSys::VirtualFile file,
     }
 
     const std::string ext = ToLowerAscii(file->GetExtension());
-    if (ext == "dnsp")
+    if (ext == "dnsp" || ext == "nsp")
     {
         RegisterMatchingAddOnEntriesFromNsp(FileSys::NSP(file), base_program_id, provider);
     }
-    else if (ext == "dxci")
+    else if (ext == "dxci" || ext == "xci")
     {
         const FileSys::XCI xci(file);
         if (xci.GetStatus() == LoaderResultStatus::Success)
@@ -194,7 +194,7 @@ void RegisterSiblingAddOnEntries(uint64_t program_id, const FileSys::VirtualFile
         }
 
         const std::string ext = ToLowerAscii(sibling->GetExtension());
-        if (ext != "dnsp" && ext != "dxci" && ext != "nca")
+        if (ext != "dnsp" && ext != "dxci" && ext != "nca" && ext != "nsp" && ext != "xci")
         {
             continue;
         }

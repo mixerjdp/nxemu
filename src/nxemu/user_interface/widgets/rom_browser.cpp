@@ -683,7 +683,7 @@ bool RomListWorker::HasSupportedFileExtension(const std::string & file_name)
 {
     static const std::unordered_set<std::string> supported_extensions = {
         "nso", "nro", "nca",
-        "dxci", "dnsp", "kip"};
+        "dxci", "dnsp", "xci", "nsp", "kip"};
     return supported_extensions.contains(stdstr(Path(file_name).GetExtension()).ToLower());
 }
 } // namespace

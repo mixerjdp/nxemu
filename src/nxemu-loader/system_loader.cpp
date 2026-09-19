@@ -416,6 +416,8 @@ bool InstallFirmwareFilesToRegistered(::FileSystemController & fs_controller, co
 }
 
 const char * const kSupportedGameExtensions[] = {
+    "xci",
+    "nsp",
     "dxci",
     "dnsp",
     "nro",
@@ -544,6 +546,27 @@ uint32_t Systemloader::GetSupportedGameExtensions(const char ** extensions, uint
 
 bool Systemloader::LoadRom(const char * fileName, int32_t program_index, int32_t previous_program_index, ApplicationLaunchType launch_type)
 {
+    const auto report_load_error = [](LoaderResultStatus error) {
+        const char* detail = "The game could not be loaded. See the log for details.";
+        switch (error) {
+        case LoaderResultStatus::ErrorMissingProductionKeyFile:
+            detail = "Missing prod.keys. Place your keys in the user/keys directory (or NXEMU_KEYS_DIR) and restart NxEmu."; break;
+        case LoaderResultStatus::ErrorMissingHeaderKey:
+            detail = "prod.keys does not contain header_key. Update your keys and restart NxEmu."; break;
+        case LoaderResultStatus::ErrorIncorrectHeaderKey:
+            detail = "The NCA header could not be decrypted. Check your header_key and that the game dump is intact."; break;
+        case LoaderResultStatus::ErrorMissingKeyAreaKey:
+            detail = "The key-area key required by this game is missing. Update prod.keys and restart NxEmu."; break;
+        case LoaderResultStatus::ErrorMissingTitlekey:
+            detail = "This content requires a title key. Supply title.keys or a container with its common ticket, then restart NxEmu."; break;
+        case LoaderResultStatus::ErrorMissingTitlekek:
+            detail = "The titlekek required by this game is missing. Update prod.keys and restart NxEmu."; break;
+        default: break;
+        }
+        const auto message = fmt::format("{} (Error {})", detail, static_cast<unsigned>(error));
+        g_notify->DisplayError(message.c_str(), "Error loading game");
+        g_settings->SetInt(NXCoreSetting::EmulationState, (int32_t)EmulationState::Stopped);
+    };
     if (fileName == nullptr || fileName[0] == '\0')
     {
         return false;
@@ -556,7 +579,7 @@ bool Systemloader::LoadRom(const char * fileName, int32_t program_index, int32_t
     if (!impl->m_appLoader)
     {
         g_notify->DisplayError("The file format is not supported.", "Error loading file!");
-        g_settings->SetBool(NXCoreSetting::EmulationState, (int32_t)EmulationState::Stopped);
+        g_settings->SetInt(NXCoreSetting::EmulationState, (int32_t)EmulationState::Stopped);
         return false;
     }
 
@@ -566,7 +589,7 @@ bool Systemloader::LoadRom(const char * fileName, int32_t program_index, int32_t
     if (file_type == LoaderFileType::Unknown || file_type == LoaderFileType::Error)
     {
         g_notify->DisplayError("The file format is not supported.", "Error loading file!");
-        g_settings->SetBool(NXCoreSetting::EmulationState, (int32_t)EmulationState::Stopped);
+        g_settings->SetInt(NXCoreSetting::EmulationState, (int32_t)EmulationState::Stopped);
         return false;
     }
     uint64_t program_id = 0;
@@ -604,7 +627,7 @@ bool Systemloader::LoadRom(const char * fileName, int32_t program_index, int32_t
     if (load_result != LoaderResultStatus::Success)
     {
         LOG_CRITICAL(Core, "Failed to load ROM (Error {})!", load_result);
-        g_settings->SetBool(NXCoreSetting::EmulationState, (int32_t)EmulationState::Stopped);
+        report_load_error(load_result);
         return false;
     }
     std::vector<u8> nacp_data;

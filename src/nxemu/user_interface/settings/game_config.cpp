@@ -21,7 +21,7 @@ static const char * FileTypeLabel(LoaderFileType type)
     case LoaderFileType::NRO: return "NRO";
     case LoaderFileType::NCA: return "NCA";
     case LoaderFileType::NSP: return "DNSP";
-    case LoaderFileType::XCI: return "DXCI";
+    case LoaderFileType::XCI: return "XCI / DXCI";
     case LoaderFileType::NAX: return "NAX";
     case LoaderFileType::KIP: return "KIP";
     case LoaderFileType::DeconstructedRomDirectory: return "Directory";
