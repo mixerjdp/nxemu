@@ -3,6 +3,8 @@
 
 #include "core/file_sys/fssystem/fssystem_nca_file_system_driver.h"
 #include "core/file_sys/vfs/vfs_offset.h"
+#include <fmt/format.h>
+#include "yuzu_common/logging/log.h"
 
 namespace FileSys {
 
@@ -16,11 +18,9 @@ constexpr Result CheckNcaMagic(u32 magic) {
     // Verify the magic is not a deprecated one.
     R_UNLESS(magic != NcaHeader::Magic0, ResultUnsupportedSdkVersion);
     R_UNLESS(magic != NcaHeader::Magic1, ResultUnsupportedSdkVersion);
-    R_UNLESS(magic != NcaHeader::Magic2, ResultUnsupportedSdkVersion);
-    R_UNLESS(magic != NcaHeader::Magic3, ResultInvalidNcaSignature);
-
     // Verify the magic is the current one.
-    R_UNLESS(magic == NcaHeader::MagicDecrypted, ResultInvalidNcaSignature);
+    R_UNLESS(magic == NcaHeader::MagicDecrypted || magic == NcaHeader::Magic3 ||
+                 magic == NcaHeader::Magic2, ResultInvalidNcaSignature);
 
     R_SUCCEED();
 }
@@ -44,14 +44,58 @@ Result NcaReader::Initialize(VirtualFile base_storage, const NcaCompressionConfi
     VirtualFile work_header_storage;
 
     // Read the header.
-    base_storage->ReadObject(std::addressof(m_header), 0);
-    const Result magic_result = CheckNcaMagic(m_header.magic);
-    R_UNLESS(R_SUCCEEDED(magic_result), magic_result);
-
-    // Configure to use the plaintext header.
-    auto base_storage_size = base_storage->GetSize();
-    work_header_storage = std::make_shared<OffsetVfsFile>(base_storage, base_storage_size, 0);
-    R_UNLESS(work_header_storage != nullptr, ResultAllocationMemoryFailedInNcaReaderA);
+    R_UNLESS(base_storage->ReadObject(std::addressof(m_header), 0) == sizeof(m_header), ResultInvalidNcaHeader);
+    work_header_storage = base_storage;
+    if (R_FAILED(CheckNcaMagic(m_header.magic))) {
+        auto& keys = Core::Crypto::KeyStore::Instance();
+        m_load_error = keys.HasProductionKeys() ? LoaderResultStatus::ErrorMissingHeaderKey
+                                              : LoaderResultStatus::ErrorMissingProductionKeyFile;
+        const auto header_key = keys.GetHeaderKey();
+        if (!header_key) {
+            LOG_ERROR(Loader, "Encrypted NCA requires header_key in user/keys/prod.keys (or NXEMU_KEYS_DIR). Restart after installing keys.");
+            R_THROW(ResultInvalidNcaSignature);
+        }
+        work_header_storage = std::make_shared<Core::Crypto::XtsStorage>(base_storage, *header_key);
+        m_load_error = LoaderResultStatus::ErrorIncorrectHeaderKey;
+        R_UNLESS(work_header_storage->ReadObject(std::addressof(m_header), 0) == sizeof(m_header), ResultInvalidNcaHeader);
+        R_TRY(CheckNcaMagic(m_header.magic));
+    }
+    if (m_header.magic == NcaHeader::Magic2) {
+        m_load_error = LoaderResultStatus::ErrorNCA2;
+        R_THROW(ResultUnsupportedSdkVersion);
+    }
+    m_load_error = LoaderResultStatus::ErrorBadNCAHeader;
+    // Eden derives section keys from the key-area key or a rights-managed title key.
+    // DNCA retains its original key fields but must never require production keys.
+    if (!IsDecrypted()) {
+        auto& keys = Core::Crypto::KeyStore::Instance();
+        const unsigned revision = std::max<unsigned>(m_header.GetProperKeyGeneration(), 1) - 1;
+        if (m_header.rights_id != Core::Crypto::Key128{}) {
+            auto title = keys.GetTitleKey(m_header.rights_id);
+            m_load_error = LoaderResultStatus::ErrorMissingTitlekey;
+            R_UNLESS(title.has_value(), ResultInvalidNcaHeader);
+            const auto kek = keys.GetKey(fmt::format("titlekek_{:02x}", revision));
+            m_load_error = LoaderResultStatus::ErrorMissingTitlekek;
+            R_UNLESS(kek.has_value(), ResultInvalidNcaHeader);
+            R_UNLESS(Core::Crypto::DecryptEcb(*kek, *title), ResultInvalidNcaHeader);
+            m_ctr_key = *title;
+        } else {
+            constexpr const char* types[] = {"application", "ocean", "system"};
+            R_UNLESS(m_header.key_index < 3, ResultInvalidNcaKeyIndex);
+            const auto area = keys.GetKey(fmt::format("key_area_key_{}_{:02x}", types[m_header.key_index], revision));
+            m_load_error = LoaderResultStatus::ErrorMissingKeyAreaKey;
+            if (!area) {
+                LOG_ERROR(Loader, "Missing key_area_key_{}_{:02x} in prod.keys", types[m_header.key_index], revision);
+                R_THROW(ResultInvalidNcaHeader);
+            }
+            std::array<u8, 0x40> decrypted{};
+            std::copy_n(m_header.encrypted_key_area.begin(), decrypted.size(), decrypted.begin());
+            R_UNLESS(Core::Crypto::DecryptEcb(*area, decrypted), ResultInvalidNcaHeader);
+            std::copy_n(decrypted.begin(), 32, m_xts_key.begin());
+            std::copy_n(decrypted.begin() + 32, 16, m_ctr_key.begin());
+        }
+    }
+    m_load_error = LoaderResultStatus::ErrorBadNCAHeader;
 
     // Validate the sdk version.
     R_UNLESS(m_header.sdk_addon_version >= SdkAddonVersionMin, ResultUnsupportedSdkVersion);
@@ -220,7 +264,7 @@ Result NcaReader::ReadHeader(NcaFsHeader* dst, s32 index) const {
     ASSERT(0 <= index && index < NcaHeader::FsCountMax);
 
     const s64 offset = sizeof(NcaHeader) + sizeof(NcaFsHeader) * index;
-    m_header_storage->ReadObject(dst, offset);
+    R_UNLESS(m_header_storage->ReadObject(dst, offset) == sizeof(*dst), ResultInvalidNcaHeader);
 
     R_SUCCEED();
 }

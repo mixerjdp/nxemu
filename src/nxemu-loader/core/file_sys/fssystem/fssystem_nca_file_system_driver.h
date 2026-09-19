@@ -6,6 +6,7 @@
 #include "core/file_sys/fssystem/fssystem_compression_common.h"
 #include "core/file_sys/fssystem/fssystem_nca_header.h"
 #include "core/file_sys/vfs/vfs.h"
+#include "core/crypto/loader_crypto.h"
 
 namespace FileSys
 {
@@ -36,6 +37,10 @@ public:
     ~NcaReader();
 
     Result Initialize(VirtualFile base_storage, const NcaCompressionConfiguration & compression_cfg);
+    LoaderResultStatus GetLoadError() const { return m_load_error; }
+    const Core::Crypto::Key128& GetCtrKey() const { return m_ctr_key; }
+    const Core::Crypto::Key256& GetXtsKey() const { return m_xts_key; }
+    bool IsDecrypted() const { return m_header.magic == NcaHeader::MagicDecrypted; }
 
     VirtualFile GetSharedBodyStorage();
     u32 GetMagic() const;
@@ -76,7 +81,10 @@ private:
     VirtualFile m_header_storage;
     bool m_is_software_aes_prioritized;
     bool m_is_available_sw_key;
-    bool m_is_header_sign1_signature_valid;
+    bool m_is_header_sign1_signature_valid = false;
+    Core::Crypto::Key128 m_ctr_key{};
+    Core::Crypto::Key256 m_xts_key{};
+    LoaderResultStatus m_load_error = LoaderResultStatus::ErrorBadNCAHeader;
     GetDecompressorFunction m_get_decompressor;
 };
 
@@ -207,13 +215,15 @@ private:
     Result OpenStorageImpl(VirtualFile * out, NcaFsHeaderReader * out_header_reader, s32 fs_index, StorageContext * ctx);
     Result OpenIndirectableStorageAsOriginal(VirtualFile * out, const NcaFsHeaderReader * header_reader, StorageContext * ctx);
     Result CreateBodySubStorage(VirtualFile * out, s64 offset, s64 size);
+    Result DecryptSection(VirtualFile* out, VirtualFile storage, s64 offset, const NcaFsHeaderReader* header);
+    Result CreateAesCtrStorage(VirtualFile* out, VirtualFile storage, s64 offset, const NcaAesCtrUpperIv& upper_iv);
     Result CreateSparseStorageMetaStorage(VirtualFile * out, VirtualFile base_storage, s64 offset, const NcaAesCtrUpperIv & upper_iv, const NcaSparseInfo & sparse_info);
     Result CreateSparseStorageCore(std::shared_ptr<SparseStorage> * out, VirtualFile base_storage, s64 base_size, VirtualFile meta_storage, const NcaSparseInfo & sparse_info, bool external_info);
     Result CreateSparseStorage(VirtualFile * out, s64 * out_fs_data_offset, std::shared_ptr<SparseStorage> * out_sparse_storage, VirtualFile * out_meta_storage, s32 index, const NcaAesCtrUpperIv & upper_iv, const NcaSparseInfo & sparse_info);
     Result CreateSparseStorageMetaStorageWithVerification(VirtualFile * out, VirtualFile * out_verification, VirtualFile base_storage, s64 offset, const NcaAesCtrUpperIv & upper_iv, const NcaSparseInfo & sparse_info, const NcaMetaDataHashDataInfo & meta_data_hash_data_info);
     Result CreateSparseStorageWithVerification(VirtualFile * out, s64 * out_fs_data_offset, std::shared_ptr<SparseStorage> * out_sparse_storage, VirtualFile * out_meta_storage, VirtualFile * out_verification, s32 index, const NcaAesCtrUpperIv & upper_iv, const NcaSparseInfo & sparse_info, const NcaMetaDataHashDataInfo & meta_data_hash_data_info, NcaFsHeader::MetaDataHashType meta_data_hash_type);
     Result CreateAesCtrExStorageMetaStorage(VirtualFile * out, VirtualFile base_storage, s64 offset, NcaFsHeader::EncryptionType encryption_type, const NcaAesCtrUpperIv & upper_iv, const NcaPatchInfo & patch_info);
-    Result CreateAesCtrExStorage(VirtualFile * out, std::shared_ptr<AesCtrCounterExtendedStorage> * out_ext, VirtualFile base_storage, VirtualFile meta_storage, s64 counter_offset, const NcaAesCtrUpperIv & upper_iv, const NcaPatchInfo & patch_info);
+    Result CreateAesCtrExStorage(VirtualFile * out, std::shared_ptr<AesCtrCounterExtendedStorage> * out_ext, VirtualFile base_storage, VirtualFile meta_storage, s64 counter_offset, const NcaAesCtrUpperIv & upper_iv, const NcaPatchInfo & patch_info, bool encrypted);
     Result CreateIndirectStorageMetaStorage(VirtualFile * out, VirtualFile base_storage, const NcaPatchInfo & patch_info);
     Result CreateIndirectStorage(VirtualFile * out, std::shared_ptr<IndirectStorage> * out_ind, VirtualFile base_storage, VirtualFile original_data_storage, VirtualFile meta_storage, const NcaPatchInfo & patch_info);
     Result CreatePatchMetaStorage(VirtualFile * out_aes_ctr_ex_meta, VirtualFile * out_indirect_meta, VirtualFile * out_verification, VirtualFile base_storage, s64 offset, const NcaAesCtrUpperIv & upper_iv, const NcaPatchInfo & patch_info, const NcaMetaDataHashDataInfo & meta_data_hash_data_info);

@@ -5,6 +5,7 @@
 #include "core/file_sys/fssystem/fssystem_aes_ctr_storage.h"
 #include "core/file_sys/fssystem/fssystem_nca_header.h"
 #include "core/file_sys/vfs/vfs_offset.h"
+#include "core/crypto/loader_crypto.h"
 
 namespace FileSys {
 
@@ -70,6 +71,9 @@ Result AesCtrCounterExtendedStorage::Initialize(const void* key, size_t key_size
     }
 
     // Set members.
+    R_UNLESS((key == nullptr && key_size == 0) || (key != nullptr && key_size == KeySize), ResultInvalidArgument);
+    m_encrypted = key != nullptr;
+    if (m_encrypted) std::memcpy(m_key.data(), key, KeySize);
     m_data_storage = data_storage;
     m_secure_value = secure_value;
     m_counter_offset = counter_offset;
@@ -167,7 +171,7 @@ size_t AesCtrCounterExtendedStorage::Read(u8* buffer, size_t size, size_t offset
     ASSERT(table_offsets.IsInclude(offset, size));
 
     // Read the data.
-    m_data_storage->Read(buffer, size, offset);
+    if (m_data_storage->Read(buffer, size, offset) != size) return 0;
 
     // Find the offset in our tree.
     BucketTree::Visitor visitor;
@@ -213,6 +217,12 @@ size_t AesCtrCounterExtendedStorage::Read(u8* buffer, size_t size, size_t offset
         const auto cur_size = static_cast<size_t>(std::min(remaining_size, data_size));
         ASSERT(cur_size <= size);
 
+        if (m_encrypted && cur_entry.encryption_value == 0) {
+            const uint64_t upper = (uint64_t(m_secure_value) << 32) | static_cast<u32>(cur_entry.generation);
+            const auto iv = Core::Crypto::MakeCounter(upper, m_counter_offset + cur_offset);
+            if (!Core::Crypto::TranscodeCtr(m_key, iv, std::span<u8>(cur_data, cur_size))) return 0;
+        }
+
         // Advance.
         cur_data += cur_size;
         cur_offset += cur_size;
@@ -224,7 +234,7 @@ size_t AesCtrCounterExtendedStorage::Read(u8* buffer, size_t size, size_t offset
 void SoftwareDecryptor::Decrypt(u8* buf, size_t buf_size,
                                 const std::array<u8, AesCtrCounterExtendedStorage::KeySize>& key,
                                 const std::array<u8, AesCtrCounterExtendedStorage::IvSize>& iv) {
-    UNIMPLEMENTED();
+    Core::Crypto::TranscodeCtr(key, iv, std::span<u8>(buf, buf_size));
 }
 
 } // namespace FileSys

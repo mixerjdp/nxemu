@@ -81,6 +81,8 @@ AppLoader_NSP::LoadResult AppLoader_NSP::Load(Systemloader & loader, ISystemModu
         return {LoaderResultStatus::ErrorAlreadyLoaded, {}};
     }
 
+    if (nsp->GetStatus() != LoaderResultStatus::Success)
+        return {nsp->GetStatus(), {}};
     const auto title_id = nsp->GetProgramTitleID();
 
     if (!nsp->IsExtractedType() && title_id == 0)
@@ -199,6 +201,8 @@ LoaderResultStatus AppLoader_NSP::ReadUpdateRaw(FileSys::VirtualFile& out_file)
 
 LoaderResultStatus AppLoader_NSP::ReadProgramId(uint64_t& out_program_id)
 {
+    if (nsp->GetStatus() != LoaderResultStatus::Success)
+        return nsp->GetStatus();
     out_program_id = nsp->GetProgramTitleID();
     if (out_program_id == 0)
     {

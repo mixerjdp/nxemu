@@ -12,6 +12,7 @@
 #include "core/file_sys/program_metadata.h"
 #include "core/file_sys/submission_package.h"
 #include "core/loader/loader.h"
+#include "core/crypto/loader_crypto.h"
 #include "yuzu_common/hex_util.h"
 #include "yuzu_common/logging/log.h"
 
@@ -35,6 +36,11 @@ NSP::NSP(VirtualFile file_, uint64_t title_id_, std::size_t program_index_) :
         extracted = true;
         InitializeExeFSAndRomFS(files);
         return;
+    }
+    // Tickets must be registered before any rights-managed NCA is opened.
+    for (const auto& entry : files) {
+        if (entry && entry->GetExtension() == "tik")
+            Core::Crypto::KeyStore::Instance().AddTicket(entry);
     }
     ReadNCAs(files);
 }
@@ -247,9 +253,13 @@ void NSP::ReadNCAs(const std::vector<VirtualFile> & files)
         }
 
         const auto nca = std::make_shared<NCA>(outer_file);
-        if (nca->GetStatus() != LoaderResultStatus::Success || nca->GetSubdirectories().empty())
+        if (nca->GetStatus() != LoaderResultStatus::Success)
         {
-            program_status[nca->GetTitleId()] = nca->GetStatus();
+            status = nca->GetStatus();
+            return;
+        }
+        if (nca->GetSubdirectories().empty())
+        {
             continue;
         }
 
@@ -283,10 +293,13 @@ void NSP::ReadNCAs(const std::vector<VirtualFile> & files)
 
                 auto next_nca = std::make_shared<NCA>(std::move(next_file));
 
-                if (next_nca->GetType() == NCAContentType::Program)
+                if (rec.type == LoaderContentRecordType::Program)
                 {
-                    program_status[next_nca->GetTitleId()] = next_nca->GetStatus();
-                    program_ids.insert(next_nca->GetTitleId() & 0xFFFFFFFFFFFFF000);
+                    const bool readable = next_nca->GetStatus() == LoaderResultStatus::Success ||
+                        next_nca->GetStatus() == LoaderResultStatus::ErrorMissingBKTRBaseRomFS;
+                    const auto id = readable ? next_nca->GetTitleId() : cnmt.GetTitleID();
+                    program_status[id] = next_nca->GetStatus();
+                    program_ids.insert(id & 0xFFFFFFFFFFFFF000);
                 }
 
                 if (next_nca->GetStatus() != LoaderResultStatus::Success &&
@@ -310,7 +323,16 @@ void NSP::ReadNCAs(const std::vector<VirtualFile> & files)
                     }
                     else
                     {
-                        ncas[cnmt.GetTitleID()][{cnmt.GetType(), rec.type}] = std::move(next_nca);
+                        // Containers can carry several update NCAs for one title and type
+                        // (for example Bayonetta Origins inside Bayonetta 3); keep the
+                        // first program NCA instead of letting a later one overwrite it.
+                        auto & target_map = ncas[cnmt.GetTitleID()];
+                        const auto key = std::make_pair(cnmt.GetType(), rec.type);
+                        if (rec.type == LoaderContentRecordType::Program && target_map.count(key) != 0)
+                        {
+                            continue;
+                        }
+                        target_map[key] = std::move(next_nca);
                     }
                 }
                 else

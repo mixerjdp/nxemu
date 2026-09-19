@@ -56,7 +56,6 @@ LoaderFileType IdentifyFile(FileSys::VirtualFile file)
         {
             return LoaderFileType::Unknown;
         }
-        UNIMPLEMENTED();
         return LoaderFileType::Unknown;
     }
 }
@@ -73,15 +72,14 @@ LoaderFileType GuessFromFilename(const std::string & name)
     {
         return LoaderFileType::NCA;
     }
-    if (extension == "dxci")
+    if (extension == "dxci" || extension == "xci")
     {
         return LoaderFileType::XCI;
     }
-    if (extension == "dnsp")
+    if (extension == "dnsp" || extension == "nsp")
     {
         return LoaderFileType::NSP;
     }
-    UNIMPLEMENTED();
     return LoaderFileType::Unknown;
 }
 
@@ -148,7 +146,14 @@ std::shared_ptr<AppLoader> GetLoader(Systemloader & loader, FileSys::VirtualFile
         return nullptr;
     }
 
-    const LoaderFileType type = IdentifyFile(file);
+    LoaderFileType type = IdentifyFile(file);
+    // Preserve the container's detailed error (for example missing keys).
+    if (type == LoaderFileType::Unknown || type == LoaderFileType::Error)
+    {
+        const auto guessed = GuessFromFilename(file->GetName());
+        if (guessed == LoaderFileType::XCI || guessed == LoaderFileType::NSP)
+            type = guessed;
+    }
 
     LOG_DEBUG(Loader, "Loading file {} as {}...", file->GetName(), GetFileTypeString(type));
 

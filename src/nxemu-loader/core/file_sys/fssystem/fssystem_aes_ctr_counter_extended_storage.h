@@ -32,6 +32,7 @@ public:
 
     struct Entry {
         std::array<u8, sizeof(s64)> offset;
+        u8 encryption_value; // 0: encrypted; 1: plaintext (Eden/Nintendo BKTR layout).
         std::array<u8, 3> reserved;
         s32 generation;
 
@@ -99,7 +100,8 @@ private:
 private:
     mutable BucketTree m_table;
     VirtualFile m_data_storage;
-    std::array<u8, KeySize> m_key;
+    std::array<u8, KeySize> m_key{};
+    bool m_encrypted = false;
     u32 m_secure_value;
     s64 m_counter_offset;
     std::unique_ptr<IDecryptor> m_decryptor;

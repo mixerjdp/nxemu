@@ -42,7 +42,7 @@ NCA::NCA(VirtualFile file_, const NCA * base_nca) :
             LOG_ERROR(Loader, "File reader errored out during header read: {:#x}",
                       rc.GetInnerValue());
         }
-        status = LoaderResultStatus::ErrorBadNCAHeader;
+        status = reader->GetLoadError();
         return;
     }
 

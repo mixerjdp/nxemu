@@ -40,6 +40,10 @@ XCI::XCI(VirtualFile file_, uint64_t program_id, size_t program_index) :
         return;
     }
 
+    if (header.hfs_offset >= file->GetSize()) {
+        status = LoaderResultStatus::ErrorBadXCIHeader;
+        return;
+    }
     PartitionFilesystem main_hfs(std::make_shared<OffsetVfsFile>(
         file, file->GetSize() - header.hfs_offset, header.hfs_offset));
 
@@ -60,9 +64,16 @@ XCI::XCI(VirtualFile file_, uint64_t program_id, size_t program_index) :
         partitions_raw[static_cast<std::size_t>(partition)] = std::move(raw);
     }
 
-    secure_partition = std::make_shared<NSP>(
-        main_hfs.GetFile(partition_names[static_cast<std::size_t>(XCIPartition::Secure)]),
-        program_id, program_index);
+    auto secure = main_hfs.GetFile(partition_names[static_cast<std::size_t>(XCIPartition::Secure)]);
+    if (!secure) {
+        status = LoaderResultStatus::ErrorXCIMissingPartition;
+        return;
+    }
+    secure_partition = std::make_shared<NSP>(secure, program_id, program_index);
+    if (secure_partition->GetStatus() != LoaderResultStatus::Success) {
+        status = secure_partition->GetStatus();
+        return;
+    }
 
     ncas = secure_partition->GetNCAsCollapsed();
     program =
@@ -374,7 +385,8 @@ LoaderResultStatus XCI::TryReadHeader()
         }
 
         // Ensure the header magic matches. If it doesn't, this isn't a card image header.
-        if (header.magic != Common::MakeMagic('D', 'X', 'C', 'I'))
+        if (header.magic != Common::MakeMagic('D', 'X', 'C', 'I') &&
+            header.magic != Common::MakeMagic('H', 'E', 'A', 'D'))
         {
             return LoaderResultStatus::ErrorBadXCIHeader;
         }

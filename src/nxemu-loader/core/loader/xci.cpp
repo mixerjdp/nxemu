@@ -128,11 +128,15 @@ LoaderResultStatus AppLoader_XCI::ReadUpdateRaw(FileSys::VirtualFile& out_file)
 
 LoaderResultStatus AppLoader_XCI::ReadProgramId(uint64_t& out_program_id)
 {
+    if (xci->GetStatus() != LoaderResultStatus::Success)
+        return xci->GetStatus();
     return nca_loader->ReadProgramId(out_program_id);
 }
 
 LoaderResultStatus AppLoader_XCI::ReadProgramIds(uint64_t * buffer, uint32_t * count)
 {
+    if (xci->GetStatus() != LoaderResultStatus::Success)
+        return xci->GetStatus();
     if (count == nullptr)
     {
         return LoaderResultStatus::ErrorNotImplemented;
