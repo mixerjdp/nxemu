@@ -23,11 +23,16 @@
   </ImportGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.props" />
   <PropertyGroup>
+    <NxEmuOpenSSLDir Condition="'$(NxEmuOpenSSLDir)'==''">$(SolutionDir)external\openssl</NxEmuOpenSSLDir>
     <TargetName>nxemu-loader</TargetName>
     <TargetName Condition="'$(Configuration)'=='Debug'">nxemu-loader_d</TargetName>
     <OutDir>$(SolutionDir)modules\$(Platform)\loader\</OutDir>
   </PropertyGroup>
   <ItemDefinitionGroup>
+    <Link>
+      <AdditionalLibraryDirectories>$(NxEmuOpenSSLDir)\lib;%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
+      <AdditionalDependencies>libcrypto.lib;%(AdditionalDependencies)</AdditionalDependencies>
+    </Link>
     <ClCompile>
       <WarningLevel>Level3</WarningLevel>
       <UseStandardPreprocessor>true</UseStandardPreprocessor>
@@ -36,12 +41,17 @@
     <PreBuildEvent>
       <Command>"$(SolutionDir)src\script\update_version.cmd" "$(Configuration)" "$(Platform)" "$(SolutionDir)src\nxemu-loader\version.h.in" "$(SolutionDir)src\nxemu-loader\version.h"</Command>
     </PreBuildEvent>
+    <PostBuildEvent>
+      <Command>copy /Y "$(NxEmuOpenSSLDir)\lib\libcrypto.dll" "$(SolutionDir)bin\$(Platform)\$(Configuration)\libcrypto-4-x64.dll"</Command>
+    </PostBuildEvent>
     <ClCompile>
-      <AdditionalIncludeDirectories>$(SolutionDir)external\boost;$(SolutionDir)external\fmt\include;$(SolutionDir)src\3rd_party\nx_tzdb\include;$(SolutionDir)external\zlib;$(SolutionDir)external\zlib\contrib\minizip;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <AdditionalIncludeDirectories>$(NxEmuOpenSSLDir)\include;$(SolutionDir)external\boost;$(SolutionDir)external\fmt\include;$(SolutionDir)src\3rd_party\nx_tzdb\include;$(SolutionDir)external\zlib;$(SolutionDir)external\zlib\contrib\minizip;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
     </ClCompile>
   </ItemDefinitionGroup>
   <ItemGroup>
     <None Include="version.h.in" />
+    <ClInclude Include="core\crypto\loader_crypto.h" />
+    <ClCompile Include="core\crypto\loader_crypto.cpp" />
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="core\core.h" />

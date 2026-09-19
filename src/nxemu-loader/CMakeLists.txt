@@ -14,6 +14,8 @@ file(GLOB_RECURSE NXEMU_LOADER_SOURCES CONFIGURE_DEPENDS
 )
 
 add_library(nxemu-loader SHARED ${NXEMU_LOADER_SOURCES})
+find_package(OpenSSL 3 REQUIRED COMPONENTS Crypto)
+target_link_libraries(nxemu-loader PRIVATE OpenSSL::Crypto)
 
 target_include_directories(nxemu-loader PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}
