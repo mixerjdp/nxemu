@@ -5,6 +5,7 @@
 #include <array>
 #include <bit>
 #include <climits>
+#include <unordered_map>
 
 #include <boost/container/static_vector.hpp>
 
@@ -13,6 +14,7 @@
 #include "yuzu_common/common_types.h"
 #include "yuzu_common/div_ceil.h"
 #include "yuzu_shader_recompiler/backend/spirv/emit_spirv.h"
+#include "yuzu_shader_recompiler/backend/spirv/emit_spirv_instructions.h"
 #include "yuzu_shader_recompiler/backend/spirv/spirv_emit_context.h"
 
 namespace Shader::Backend::SPIRV {
@@ -264,20 +266,38 @@ void Name(EmitContext& ctx, Id object, std::string_view format_str, Args&&... ar
 
 void DefineConstBuffers(EmitContext& ctx, const Info& info, Id UniformDefinitions::*member_type,
                         u32 binding, Id type, char type_char, u32 element_size) {
-    const Id array_type{ctx.TypeArray(type, ctx.Const(65536U / element_size))};
-    ctx.Decorate(array_type, spv::Decoration::ArrayStride, element_size);
-
-    const Id struct_type{ctx.TypeStruct(array_type)};
-    Name(ctx, struct_type, "{}_cbuf_block_{}{}", ctx.stage, type_char, element_size * CHAR_BIT);
-    ctx.Decorate(struct_type, spv::Decoration::Block);
-    ctx.MemberName(struct_type, 0, "data");
-    ctx.MemberDecorate(struct_type, 0, spv::Decoration::Offset, 0U);
-
-    const Id struct_pointer_type{ctx.TypePointer(spv::StorageClass::Uniform, struct_type)};
     const Id uniform_type{ctx.TypePointer(spv::StorageClass::Uniform, type)};
     ctx.uniform_types.*member_type = uniform_type;
+    std::unordered_map<u32, Id> buffer_pointer_types;
 
     for (const ConstantBufferDescriptor& desc : info.constant_buffer_descriptors) {
+        // Metal validates the entire declared array against the backing buffer,
+        // even when a draw only reads a small constant range near its end.
+        // Indirect accesses already report 64 KiB; global-memory helpers also
+        // need the full range because they add accesses after info collection.
+        u32 size = 65536U;
+        if (ctx.profile.disable_uniform_buffer_descriptor_aliasing && !info.uses_global_memory) {
+            size = 16U;
+            for (u32 i = 0; i < desc.count; ++i) {
+                size = std::max(size, info.constant_buffer_used_sizes[desc.index + i]);
+            }
+        }
+        const u32 element_count = Common::DivCeil(size, element_size);
+        auto [pointer, inserted] = buffer_pointer_types.try_emplace(element_count);
+        if (inserted) {
+            // Sirit interns identical array/struct types. Decorate each shared
+            // type once, even when several buffers have the same declared size.
+            const Id array_type{ctx.TypeArray(type, ctx.Const(element_count))};
+            ctx.Decorate(array_type, spv::Decoration::ArrayStride, element_size);
+            const Id struct_type{ctx.TypeStruct(array_type)};
+            Name(ctx, struct_type, "{}_cbuf_block_{}{}_{}", ctx.stage, type_char,
+                 element_size * CHAR_BIT, element_count);
+            ctx.Decorate(struct_type, spv::Decoration::Block);
+            ctx.MemberName(struct_type, 0, "data");
+            ctx.MemberDecorate(struct_type, 0, spv::Decoration::Offset, 0U);
+            pointer->second = ctx.TypePointer(spv::StorageClass::Uniform, struct_type);
+        }
+        const Id struct_pointer_type = pointer->second;
         const Id id{ctx.AddGlobalVariable(struct_pointer_type, spv::StorageClass::Uniform)};
         ctx.Decorate(id, spv::Decoration::Binding, binding);
         ctx.Decorate(id, spv::Decoration::DescriptorSet, 0U);
@@ -460,6 +480,39 @@ EmitContext::EmitContext(const Profile& profile_, const RuntimeInfo& runtime_inf
     : Sirit::Module(profile_.supported_spirv), profile{profile_}, runtime_info{runtime_info_},
       stage{program.stage}, texture_rescaling_index{bindings.texture_scaling_index},
       image_rescaling_index{bindings.image_scaling_index} {
+    // Restrict this to a dedicated counter buffer. Multiple descriptors could alias the same
+    // allocation, making a read through another binding observe a partially updated value.
+    if (!profile.support_int64_atomics && !program.info.uses_global_memory &&
+        program.info.storage_buffers_descriptors.size() == 1 &&
+        program.info.storage_buffers_descriptors.front().count == 1) {
+        std::bitset<Info::MAX_SSBOS> incompatible_buffers;
+        for (const auto* block : program.blocks) {
+            for (const IR::Inst& inst : block->Instructions()) {
+                const auto name = IR::NameOf(inst.GetOpcode());
+                if (!name.starts_with("LoadStorage") && !name.starts_with("WriteStorage") &&
+                    !name.starts_with("StorageAtomic")) {
+                    continue;
+                }
+                const auto binding = inst.Arg(0);
+                if (!binding.IsImmediate()) {
+                    incompatible_buffers.set();
+                    break;
+                }
+                if ((inst.GetOpcode() != IR::Opcode::StorageAtomicIAdd64 &&
+                     inst.GetOpcode() != IR::Opcode::StorageAtomicIAdd32x2) || inst.HasUses()) {
+                    incompatible_buffers.set(binding.U32());
+                } else {
+                    atomic64_add_reduction_buffers.set(binding.U32());
+                }
+            }
+        }
+        atomic64_add_reduction_buffers &= ~incompatible_buffers;
+    }
+    shared_memory_16_to_12_packing = program.shared_memory_16_to_12_packing;
+    single_lane_subgroup =
+        (stage == Stage::Geometry && !profile.support_subgroup_in_geometry_stage) ||
+        (!profile.support_subgroup_in_vertex_stages && stage != Stage::Fragment &&
+         stage != Stage::Compute);
     const bool is_unified{profile.unified_descriptor_binding};
     u32& uniform_binding{is_unified ? bindings.unified : bindings.uniform_buffer};
     u32& storage_binding{is_unified ? bindings.unified : bindings.storage_buffer};
@@ -477,12 +530,33 @@ EmitContext::EmitContext(const Profile& profile_, const RuntimeInfo& runtime_inf
     DefineStorageBuffers(program.info, storage_binding);
     DefineTextureBuffers(program.info, texture_binding);
     DefineImageBuffers(program.info, image_binding);
-    DefineTextures(program.info, texture_binding, bindings.texture_scaling_index);
+    DefineTextures(program.info, texture_binding, bindings.texture_scaling_index,
+                   bindings.texture_table);
     DefineImages(program.info, image_binding, bindings.image_scaling_index);
+    DefineRuntimeSamplers(program.info, bindings.texture_table);
+    if (program.info.runtime_image_write_mask_words != 0) {
+        const auto storage = spv::StorageClass::StorageBuffer;
+        const Id array = TypeArray(U32[1], Const(program.info.runtime_image_write_mask_words));
+        Decorate(array, spv::Decoration::ArrayStride, 4U);
+        const Id block = TypeStruct(array);
+        Decorate(block, spv::Decoration::Block);
+        MemberDecorate(block, 0U, spv::Decoration::Offset, 0U);
+        runtime_image_write_mask = AddGlobalVariable(TypePointer(storage, block), storage);
+        runtime_image_write_mask_element = TypePointer(storage, U32[1]);
+        Decorate(runtime_image_write_mask, spv::Decoration::DescriptorSet, 0U);
+        Decorate(runtime_image_write_mask, spv::Decoration::Binding, storage_binding++);
+        Name(runtime_image_write_mask, "runtime_image_write_mask");
+        if (profile.supported_spirv >= 0x00010400) {
+            interfaces.push_back(runtime_image_write_mask);
+        }
+    }
+    DefineWriteTrackingBitmap(program.info, storage_binding);
+    DefineInputAttachments(program.info, texture_binding);
     DefineAttributeMemAccess(program.info);
     DefineWriteStorageCasLoopFunction(program.info);
-    DefineGlobalMemoryFunctions(program.info);
+    DefineGlobalMemoryFunctions(program);
     DefineRescalingInput(program.info);
+    DefineWriteTrackingFunction(program.info);
     DefineRenderArea(program.info);
 }
 
@@ -524,6 +598,18 @@ Id EmitContext::BitOffset16(const IR::Value& offset) {
         return Const(((offset.U32() / 2) % 2) * 16);
     }
     return OpBitwiseAnd(U32[1], OpShiftLeftLogical(U32[1], Def(offset), Const(3u)), Const(16u));
+}
+
+Id EmitContext::RemapSharedMemoryOffset(Id offset) {
+    if (!shared_memory_16_to_12_packing) {
+        return offset;
+    }
+    // Compact each 16-byte guest lane to the 12 bytes proven live by
+    // TryPackSharedMemory16To12(). offset - (offset / 16) * 4 is injective for
+    // offsets 0..11 within every source lane.
+    const Id lane{OpShiftRightLogical(U32[1], offset, Const(4U))};
+    const Id removed_padding{OpShiftLeftLogical(U32[1], lane, Const(2U))};
+    return OpISub(U32[1], offset, removed_padding);
 }
 
 void EmitContext::DefineCommonTypes(const Info& info) {
@@ -585,7 +671,9 @@ void EmitContext::DefineLocalMemory(const IR::Program& program) {
         return;
     }
     const u32 num_elements{Common::DivCeil(program.local_memory_size, 4U)};
-    const Id type{TypeArray(U32[1], Const(num_elements))};
+    // Sirit interns types. A signed length keeps this Private array distinct from the
+    // Workgroup array with the same size, which carries an explicit ArrayStride layout.
+    const Id type{TypeArray(U32[1], SConst(static_cast<s32>(num_elements)))};
     const Id pointer{TypePointer(spv::StorageClass::Private, type)};
     local_memory = AddGlobalVariable(pointer, spv::StorageClass::Private);
     if (profile.supported_spirv >= 0x00010400) {
@@ -597,8 +685,15 @@ void EmitContext::DefineSharedMemory(const IR::Program& program) {
     if (program.shared_memory_size == 0) {
         return;
     }
+    u32 shared_memory_size{program.shared_memory_size};
+    const u32 max_size{profile.max_compute_shared_memory_size};
+    if (max_size != 0 && shared_memory_size > max_size) {
+        LOG_WARNING(Shader_SPIRV, "Requested shared memory size ({}) exceeds device limit ({})",
+                    shared_memory_size, max_size);
+        shared_memory_size = max_size;
+    }
     const auto make{[&](Id element_type, u32 element_size) {
-        const u32 num_elements{Common::DivCeil(program.shared_memory_size, element_size)};
+        const u32 num_elements{Common::DivCeil(shared_memory_size, element_size)};
         const Id array_type{TypeArray(element_type, Const(num_elements))};
         Decorate(array_type, spv::Decoration::ArrayStride, element_size);
 
@@ -633,7 +728,7 @@ void EmitContext::DefineSharedMemory(const IR::Program& program) {
         std::tie(shared_memory_u32x4, shared_u32x4, std::ignore) = make(U32[4], 16);
         return;
     }
-    const u32 num_elements{Common::DivCeil(program.shared_memory_size, 4U)};
+    const u32 num_elements{Common::DivCeil(shared_memory_size, 4U)};
     const Id type{TypeArray(U32[1], Const(num_elements))};
     shared_memory_u32_type = TypePointer(spv::StorageClass::Workgroup, type);
 
@@ -928,100 +1023,235 @@ void EmitContext::DefineWriteStorageCasLoopFunction(const Info& info) {
     write_storage_cas_loop_func = func;
 }
 
-void EmitContext::DefineGlobalMemoryFunctions(const Info& info) {
+void EmitContext::DefineGlobalMemoryFunctions(const IR::Program& program) {
+    const Info& info{program.info};
     if (!info.uses_global_memory || !profile.support_int64) {
         return;
     }
+    // Only compute shaders have shown pathological Metal builds when these helpers are inlined.
+    const auto function_control = profile.avoid_global_memory_helper_inlining &&
+                                          stage == Stage::Compute
+                                      ? spv::FunctionControlMask::DontInline
+                                      : spv::FunctionControlMask::MaskNone;
     using DefPtr = Id StorageDefinitions::*;
     const Id zero{u32_zero_value};
+    const bool supports_uniform_aliasing{profile.SupportsUniformBufferDescriptorAliasing()};
     const auto define_body{[&](DefPtr ssbo_member, Id addr, Id element_pointer, u32 shift,
-                               auto&& callback) {
+                               u32 scalar_components, bool is_write, auto&& callback) {
         AddLabel();
         const size_t num_buffers{info.storage_buffers_descriptors.size()};
         for (size_t index = 0; index < num_buffers; ++index) {
-            if (!info.nvn_buffer_used[index]) {
+            // Indirect reads can also reference explicitly tracked buffers outside
+            // the NVN descriptor table. Test every bound guest range at runtime.
+            // Writes only reach buffers already known to be written.
+            const auto& ssbo{info.storage_buffers_descriptors[index]};
+            if (is_write && !ssbo.is_written) {
                 continue;
             }
-            const auto& ssbo{info.storage_buffers_descriptors[index]};
-            const Id ssbo_addr_cbuf_offset{Const(ssbo.cbuf_offset / 8)};
-            const Id ssbo_size_cbuf_offset{Const(ssbo.cbuf_offset / 4 + 2)};
-            const Id ssbo_addr_pointer{OpAccessChain(
-                uniform_types.U32x2, cbufs[ssbo.cbuf_index].U32x2, zero, ssbo_addr_cbuf_offset)};
-            const Id ssbo_size_pointer{OpAccessChain(uniform_types.U32, cbufs[ssbo.cbuf_index].U32,
-                                                     zero, ssbo_size_cbuf_offset)};
-
+            Id unaligned_addr{};
+            Id ssbo_size_pointer{};
+            Id ssbo_size_word{};
+            if (!supports_uniform_aliasing) {
+                // The canonical uniform view has no U32/U32x2 descriptor aliases.
+                const IR::Value cbuf_index{ssbo.cbuf_index};
+                unaligned_addr = OpBitcast(
+                    U64, EmitGetCbufU32x2(*this, cbuf_index, IR::Value{ssbo.cbuf_offset}));
+                ssbo_size_word =
+                    EmitGetCbufU32(*this, cbuf_index, IR::Value{ssbo.cbuf_offset + 8});
+            } else {
+                const Id ssbo_addr_cbuf_offset{Const(ssbo.cbuf_offset / 8)};
+                const Id ssbo_size_cbuf_offset{Const(ssbo.cbuf_offset / 4 + 2)};
+                const Id ssbo_addr_pointer{OpAccessChain(
+                    uniform_types.U32x2, cbufs[ssbo.cbuf_index].U32x2, zero, ssbo_addr_cbuf_offset)};
+                ssbo_size_pointer = OpAccessChain(uniform_types.U32, cbufs[ssbo.cbuf_index].U32,
+                                                zero, ssbo_size_cbuf_offset);
+                unaligned_addr = OpBitcast(U64, OpLoad(U32[2], ssbo_addr_pointer));
+            }
             const u64 ssbo_align_mask{~(profile.min_ssbo_alignment - 1U)};
-            const Id unaligned_addr{OpBitcast(U64, OpLoad(U32[2], ssbo_addr_pointer))};
             const Id ssbo_addr{OpBitwiseAnd(U64, unaligned_addr, Constant(U64, ssbo_align_mask))};
-            const Id ssbo_size{OpUConvert(U64, OpLoad(U32[1], ssbo_size_pointer))};
-            const Id ssbo_end{OpIAdd(U64, ssbo_addr, ssbo_size)};
-            const Id cond{OpLogicalAnd(U1, OpUGreaterThanEqual(U1, addr, ssbo_addr),
-                                       OpULessThan(U1, addr, ssbo_end))};
+            const Id ssbo_size{OpUConvert(U64, !supports_uniform_aliasing
+                                                   ? ssbo_size_word
+                                                   : OpLoad(U32[1], ssbo_size_pointer))};
+            // Validate the complete access against the guest range, not the host
+            // binding's alignment padding. Subtraction avoids overflowing its end.
+            const Id guest_offset{OpISub(U64, addr, unaligned_addr)};
+            const Id offset_in_range{
+                OpLogicalAnd(U1, OpUGreaterThanEqual(U1, addr, unaligned_addr),
+                             OpULessThanEqual(U1, guest_offset, ssbo_size))};
+            const Id access_size{Constant(U64, u64{1} << shift)};
+            const Id host_offset{OpISub(U64, addr, ssbo_addr)};
+            // Storage buffer byte offsets are 32-bit; do not truncate a large offset.
+            const Id max_host_offset{Constant(U64, u64{0x1'0000'0000} - (u64{1} << shift))};
+            const Id cond{
+                OpLogicalAnd(
+                    U1, offset_in_range,
+                    OpLogicalAnd(U1, OpULessThanEqual(U1, host_offset, max_host_offset),
+                                 OpULessThanEqual(U1, access_size,
+                                                  OpISub(U64, ssbo_size, guest_offset))))};
             const Id then_label{OpLabel()};
             const Id else_label{OpLabel()};
             OpSelectionMerge(else_label, spv::SelectionControlMask::MaskNone);
             OpBranchConditional(cond, then_label, else_label);
             AddLabel(then_label);
             const Id ssbo_id{ssbos[index].*ssbo_member};
-            const Id ssbo_offset{OpUConvert(U32[1], OpISub(U64, addr, ssbo_addr))};
-            const Id ssbo_index{OpShiftRightLogical(U32[1], ssbo_offset, Const(shift))};
+            const Id ssbo_offset{OpUConvert(U32[1], host_offset)};
+            Id ssbo_index{OpShiftRightLogical(U32[1], ssbo_offset, Const(shift))};
+            if (scalar_components > 1) {
+                // Keep the vector view's alignment when indexing the canonical U32 view.
+                ssbo_index = OpShiftLeftLogical(
+                    U32[1], ssbo_index,
+                    Const(static_cast<u32>(std::countr_zero(scalar_components))));
+            }
             const Id ssbo_pointer{OpAccessChain(element_pointer, ssbo_id, zero, ssbo_index)};
-            callback(ssbo_pointer);
+            callback(ssbo_pointer, ssbo_id, ssbo_index);
             AddLabel(else_label);
         }
     }};
-    const auto define_load{[&](DefPtr ssbo_member, Id element_pointer, Id type, u32 shift) {
+    const auto define_load{[&](DefPtr ssbo_member, Id element_pointer, Id type, u32 shift,
+                               u32 scalar_components) {
         const Id function_type{TypeFunction(type, U64)};
-        const Id func_id{OpFunction(type, spv::FunctionControlMask::MaskNone, function_type)};
+        const Id func_id{OpFunction(type, function_control, function_type)};
         const Id addr{OpFunctionParameter(U64)};
-        define_body(ssbo_member, addr, element_pointer, shift,
-                    [&](Id ssbo_pointer) { OpReturnValue(OpLoad(type, ssbo_pointer)); });
+        define_body(ssbo_member, addr, element_pointer, shift, scalar_components, false,
+                    [&](Id ssbo_pointer, Id ssbo_id, Id ssbo_index) {
+                        if (scalar_components == 1) {
+                            OpReturnValue(OpLoad(type, ssbo_pointer));
+                            return;
+                        }
+                        std::array<Id, 4> components;
+                        components[0] = OpLoad(U32[1], ssbo_pointer);
+                        for (u32 i = 1; i < scalar_components; ++i) {
+                            const Id index{OpIAdd(U32[1], ssbo_index, Const(i))};
+                            const Id pointer{OpAccessChain(element_pointer, ssbo_id, zero, index)};
+                            components[i] = OpLoad(U32[1], pointer);
+                        }
+                        OpReturnValue(OpCompositeConstruct(
+                            type, std::span{components.data(), scalar_components}));
+                    });
         OpReturnValue(ConstantNull(type));
         OpFunctionEnd();
         return func_id;
     }};
-    const auto define_write{[&](DefPtr ssbo_member, Id element_pointer, Id type, u32 shift) {
+    const auto define_write{[&](DefPtr ssbo_member, Id element_pointer, Id type, u32 shift,
+                                u32 scalar_components) {
         const Id function_type{TypeFunction(void_id, U64, type)};
-        const Id func_id{OpFunction(void_id, spv::FunctionControlMask::MaskNone, function_type)};
+        const Id func_id{OpFunction(void_id, function_control, function_type)};
         const Id addr{OpFunctionParameter(U64)};
         const Id data{OpFunctionParameter(type)};
-        define_body(ssbo_member, addr, element_pointer, shift, [&](Id ssbo_pointer) {
-            OpStore(ssbo_pointer, data);
-            OpReturn();
-        });
+        define_body(ssbo_member, addr, element_pointer, shift, scalar_components, true,
+                    [&](Id ssbo_pointer, Id ssbo_id, Id ssbo_index) {
+                        if (scalar_components == 1) {
+                            OpStore(ssbo_pointer, data);
+                        } else {
+                            OpStore(ssbo_pointer, OpCompositeExtract(U32[1], data, 0U));
+                            for (u32 i = 1; i < scalar_components; ++i) {
+                                const Id index{OpIAdd(U32[1], ssbo_index, Const(i))};
+                                const Id pointer{
+                                    OpAccessChain(element_pointer, ssbo_id, zero, index)};
+                                OpStore(pointer, OpCompositeExtract(U32[1], data, i));
+                            }
+                        }
+                        OpReturn();
+                    });
         OpReturn();
         OpFunctionEnd();
         return func_id;
     }};
-    const auto define{
-        [&](DefPtr ssbo_member, const StorageTypeDefinition& type_def, Id type, size_t size) {
-            const Id element_type{type_def.element};
-            const u32 shift{static_cast<u32>(std::countr_zero(size))};
-            const Id load_func{define_load(ssbo_member, element_type, type, shift)};
-            const Id write_func{define_write(ssbo_member, element_type, type, shift)};
-            return std::make_pair(load_func, write_func);
-        }};
+    const auto define{[&](DefPtr ssbo_member, const StorageTypeDefinition& type_def, Id type,
+                          size_t size) {
+        Id element_type{type_def.element};
+        const u32 shift{static_cast<u32>(std::countr_zero(size))};
+        u32 scalar_components{1};
+        if (!profile.support_descriptor_aliasing && size > sizeof(u32)) {
+            ssbo_member = &StorageDefinitions::U32;
+            element_type = storage_types.U32.element;
+            scalar_components = static_cast<u32>(size / sizeof(u32));
+        }
+        const Id load_func{define_load(ssbo_member, element_type, type, shift, scalar_components)};
+        const Id write_func{
+            define_write(ssbo_member, element_type, type, shift, scalar_components)};
+        return std::make_pair(load_func, write_func);
+    }};
     std::tie(load_global_func_u32, write_global_func_u32) =
         define(&StorageDefinitions::U32, storage_types.U32, U32[1], sizeof(u32));
     std::tie(load_global_func_u32x2, write_global_func_u32x2) =
         define(&StorageDefinitions::U32x2, storage_types.U32x2, U32[2], sizeof(u32[2]));
     std::tie(load_global_func_u32x4, write_global_func_u32x4) =
         define(&StorageDefinitions::U32x4, storage_types.U32x4, U32[4], sizeof(u32[4]));
+
+    // Atomics left on global memory had a pointer the optimizer could not track. Find their
+    // buffer at runtime like loads and writes. Only define the helpers this shader uses.
+    using AtomicFunc = Id (Sirit::Module::*)(Id, Id, Id, Id, Id);
+    struct GlobalAtomic {
+        IR::Opcode opcode;
+        AtomicFunc atomic_func;
+        Id EmitContext::*func_id;
+    };
+    static constexpr std::array global_atomics{
+        GlobalAtomic{IR::Opcode::GlobalAtomicIAdd32, &Sirit::Module::OpAtomicIAdd,
+                     &EmitContext::global_atomic_iadd_func_u32},
+        GlobalAtomic{IR::Opcode::GlobalAtomicSMin32, &Sirit::Module::OpAtomicSMin,
+                     &EmitContext::global_atomic_smin_func_u32},
+        GlobalAtomic{IR::Opcode::GlobalAtomicUMin32, &Sirit::Module::OpAtomicUMin,
+                     &EmitContext::global_atomic_umin_func_u32},
+        GlobalAtomic{IR::Opcode::GlobalAtomicSMax32, &Sirit::Module::OpAtomicSMax,
+                     &EmitContext::global_atomic_smax_func_u32},
+        GlobalAtomic{IR::Opcode::GlobalAtomicUMax32, &Sirit::Module::OpAtomicUMax,
+                     &EmitContext::global_atomic_umax_func_u32},
+        GlobalAtomic{IR::Opcode::GlobalAtomicAnd32, &Sirit::Module::OpAtomicAnd,
+                     &EmitContext::global_atomic_and_func_u32},
+        GlobalAtomic{IR::Opcode::GlobalAtomicOr32, &Sirit::Module::OpAtomicOr,
+                     &EmitContext::global_atomic_or_func_u32},
+        GlobalAtomic{IR::Opcode::GlobalAtomicXor32, &Sirit::Module::OpAtomicXor,
+                     &EmitContext::global_atomic_xor_func_u32},
+        GlobalAtomic{IR::Opcode::GlobalAtomicExchange32, &Sirit::Module::OpAtomicExchange,
+                     &EmitContext::global_atomic_exchange_func_u32},
+    };
+    std::bitset<global_atomics.size()> used_atomics;
+    for (const IR::Block* const block : program.blocks) {
+        for (const IR::Inst& inst : block->Instructions()) {
+            for (size_t i = 0; i < global_atomics.size(); ++i) {
+                if (inst.GetOpcode() == global_atomics[i].opcode) {
+                    used_atomics.set(i);
+                }
+            }
+        }
+    }
+    const Id scope{Const(static_cast<u32>(spv::Scope::Device))};
+    for (size_t i = 0; i < global_atomics.size(); ++i) {
+        if (!used_atomics[i]) {
+            continue;
+        }
+        const Id function_type{TypeFunction(U32[1], U64, U32[1])};
+        const Id func_id{OpFunction(U32[1], function_control, function_type)};
+        const Id addr{OpFunctionParameter(U64)};
+        const Id value{OpFunctionParameter(U32[1])};
+        define_body(&StorageDefinitions::U32, addr, storage_types.U32.element, 2, 1, true,
+                    [&](Id ssbo_pointer, Id, Id) {
+                        OpReturnValue((this->*global_atomics[i].atomic_func)(
+                            U32[1], ssbo_pointer, scope, zero, value));
+                    });
+        // No bound buffer holds the address: the access is dropped like a global write.
+        OpReturnValue(zero);
+        OpFunctionEnd();
+        this->*global_atomics[i].func_id = func_id;
+    }
 }
 
 void EmitContext::DefineRescalingInput(const Info& info) {
-    if (!info.uses_rescaling_uniform) {
+    if (!info.uses_rescaling_uniform && info.input_attachment_mask == 0 &&
+        info.write_tracking_slots == 0) {
         return;
     }
     if (profile.unified_descriptor_binding) {
-        DefineRescalingInputPushConstant();
+        DefineRescalingInputPushConstant(info);
     } else {
         DefineRescalingInputUniformConstant();
     }
 }
 
-void EmitContext::DefineRescalingInputPushConstant() {
-    boost::container::static_vector<Id, 3> members{};
+void EmitContext::DefineRescalingInputPushConstant(const Info& info) {
+    boost::container::static_vector<Id, 6> members{};
     u32 member_index{0};
 
     rescaling_textures_type = TypeArray(U32[1], Const(4u));
@@ -1037,6 +1267,21 @@ void EmitContext::DefineRescalingInputPushConstant() {
     if (stage != Stage::Compute) {
         members.push_back(F32[1]);
         rescaling_downfactor_member_index = member_index++;
+    }
+    const bool reads_attachments{stage == Stage::Fragment && Sirit::ValidId(input_attachment_type)};
+    if (reads_attachments) {
+        members.push_back(U32[1]);
+        rescaling_attachment_reads_member_index = member_index++;
+    }
+    if (info.uses_render_area) {
+        render_are_member_index = member_index++;
+        members.push_back(F32[4]);
+    }
+    if (info.write_tracking_slots != 0) {
+        const Id slots_type{TypeArray(U32[1], Const(info.write_tracking_slots * 2))};
+        Decorate(slots_type, spv::Decoration::ArrayStride, 4u);
+        write_track_member_index = member_index++;
+        members.push_back(slots_type);
     }
     const Id push_constant_struct{TypeStruct(std::span(members.data(), members.size()))};
     Decorate(push_constant_struct, spv::Decoration::Block);
@@ -1056,13 +1301,145 @@ void EmitContext::DefineRescalingInputPushConstant() {
                        static_cast<u32>(offsetof(RescalingLayout, down_factor)));
         MemberName(push_constant_struct, rescaling_downfactor_member_index, "down_factor");
     }
+    if (reads_attachments) {
+        MemberDecorate(push_constant_struct, rescaling_attachment_reads_member_index,
+                       spv::Decoration::Offset,
+                       static_cast<u32>(offsetof(RescalingLayout, attachment_reads)));
+        MemberName(push_constant_struct, rescaling_attachment_reads_member_index,
+                   "attachment_reads");
+    }
+    if (info.uses_render_area) {
+        MemberDecorate(push_constant_struct, render_are_member_index, spv::Decoration::Offset,
+                       RENDERAREA_LAYOUT_OFFSET);
+        MemberName(push_constant_struct, render_are_member_index, "render_area");
+    }
+    if (info.write_tracking_slots != 0) {
+        MemberDecorate(push_constant_struct, write_track_member_index, spv::Decoration::Offset,
+                       WRITE_TRACK_OFFSET);
+        MemberName(push_constant_struct, write_track_member_index, "write_track");
+    }
     const Id pointer_type{TypePointer(spv::StorageClass::PushConstant, push_constant_struct)};
     rescaling_push_constants = AddGlobalVariable(pointer_type, spv::StorageClass::PushConstant);
+    if (info.uses_render_area) {
+        render_area_push_constant = rescaling_push_constants;
+    }
     Name(rescaling_push_constants, "rescaling_push_constants");
 
     if (profile.supported_spirv >= 0x00010400) {
         interfaces.push_back(rescaling_push_constants);
     }
+}
+
+void EmitContext::DefineWriteTrackingBitmap(const Info& info, u32& binding) {
+    if (info.write_tracking_slots == 0) {
+        return;
+    }
+    // Slots follow the descriptor order of written buffers, as the host fills them
+    u32 slot{};
+    for (size_t index = 0; index < info.storage_buffers_descriptors.size(); ++index) {
+        if (info.storage_buffers_descriptors[index].is_written) {
+            ssbo_write_slots[index] = slot++;
+        }
+    }
+    image_buffer_write_slots.resize(info.image_buffer_descriptors.size());
+    for (size_t index = 0; index < info.image_buffer_descriptors.size(); ++index) {
+        if (info.image_buffer_descriptors[index].is_written) {
+            image_buffer_write_slots[index] = slot++;
+        }
+    }
+    const auto storage = spv::StorageClass::StorageBuffer;
+    const Id array = TypeArray(U32[1], Const(WRITE_TRACK_WORDS));
+    Decorate(array, spv::Decoration::ArrayStride, 4U);
+    const Id block = TypeStruct(array);
+    Decorate(block, spv::Decoration::Block);
+    MemberDecorate(block, 0U, spv::Decoration::Offset, 0U);
+    write_track_bitmap = AddGlobalVariable(TypePointer(storage, block), storage);
+    write_track_bitmap_element = TypePointer(storage, U32[1]);
+    Decorate(write_track_bitmap, spv::Decoration::DescriptorSet, 0U);
+    Decorate(write_track_bitmap, spv::Decoration::Binding, binding++);
+    Name(write_track_bitmap, "write_track_bitmap");
+    if (profile.supported_spirv >= 0x00010400) {
+        interfaces.push_back(write_track_bitmap);
+    }
+}
+
+void EmitContext::DefineWriteTrackingFunction(const Info& info) {
+    if (info.write_tracking_slots == 0) {
+        return;
+    }
+    // (slot, offset in texels, size in texels): sets the bits of the first and last page written
+    const Id func_type{TypeFunction(void_id, U32[1], U32[1], U32[1])};
+    const Id func{OpFunction(void_id, spv::FunctionControlMask::MaskNone, func_type)};
+    const Id slot{OpFunctionParameter(U32[1])};
+    const Id offset{OpFunctionParameter(U32[1])};
+    const Id size{OpFunctionParameter(U32[1])};
+    AddLabel();
+    const Id push_u32{TypePointer(spv::StorageClass::PushConstant, U32[1])};
+    const Id member{Const(write_track_member_index)};
+    const Id first_word{OpShiftLeftLogical(U32[1], slot, Const(1U))};
+    const Id second_word{OpIAdd(U32[1], first_word, Const(1U))};
+    const Id first_page{
+        OpLoad(U32[1], OpAccessChain(push_u32, rescaling_push_constants, member, first_word))};
+    const Id packed{
+        OpLoad(U32[1], OpAccessChain(push_u32, rescaling_push_constants, member, second_word))};
+    const Id enabled_label{OpLabel()};
+    const Id end_label{OpLabel()};
+    OpSelectionMerge(end_label, spv::SelectionControlMask::MaskNone);
+    OpBranchConditional(OpINotEqual(U1, first_page, Const(WRITE_TRACK_DISABLED)), enabled_label,
+                        end_label);
+
+    AddLabel(enabled_label);
+    const Id shift{OpShiftRightLogical(U32[1], packed, Const(16U))};
+    const Id begin{OpIAdd(U32[1], OpBitwiseAnd(U32[1], packed, Const(0xffffU)),
+                          OpShiftLeftLogical(U32[1], offset, shift))};
+    const Id last{OpIAdd(U32[1], begin,
+                         OpISub(U32[1], OpShiftLeftLogical(U32[1], size, shift), Const(1U)))};
+    const auto mark{[&](Id byte) {
+        const Id page{OpIAdd(U32[1], first_page,
+                             OpShiftRightLogical(U32[1], byte, Const(WRITE_TRACK_PAGE_BITS)))};
+        const Id word{OpBitwiseAnd(U32[1], OpShiftRightLogical(U32[1], page, Const(5U)),
+                                   Const(WRITE_TRACK_WORDS - 1))};
+        const Id bit{OpShiftLeftLogical(U32[1], Const(1U), OpBitwiseAnd(U32[1], page, Const(31U)))};
+        const Id pointer{
+            OpAccessChain(write_track_bitmap_element, write_track_bitmap, u32_zero_value, word)};
+        // Most stores find their page already marked: skip the atomic then
+        const Id is_clear{
+            OpIEqual(U1,
+                     OpBitwiseAnd(U32[1],
+                                  OpAtomicLoad(U32[1], pointer,
+                                               Const(static_cast<u32>(spv::Scope::Device)),
+                                               u32_zero_value),
+                                  bit),
+                     u32_zero_value)};
+        const Id set_label{OpLabel()};
+        const Id merge_label{OpLabel()};
+        OpSelectionMerge(merge_label, spv::SelectionControlMask::MaskNone);
+        OpBranchConditional(is_clear, set_label, merge_label);
+        AddLabel(set_label);
+        OpAtomicOr(U32[1], pointer, Const(static_cast<u32>(spv::Scope::Device)), u32_zero_value,
+                   bit);
+        OpBranch(merge_label);
+        AddLabel(merge_label);
+    }};
+    mark(begin);
+    // Most writes fit in one page
+    const Id spans_label{OpLabel()};
+    const Id spans_merge_label{OpLabel()};
+    OpSelectionMerge(spans_merge_label, spv::SelectionControlMask::MaskNone);
+    OpBranchConditional(
+        OpINotEqual(U1, OpShiftRightLogical(U32[1], begin, Const(WRITE_TRACK_PAGE_BITS)),
+                    OpShiftRightLogical(U32[1], last, Const(WRITE_TRACK_PAGE_BITS))),
+        spans_label, spans_merge_label);
+    AddLabel(spans_label);
+    mark(last);
+    OpBranch(spans_merge_label);
+    AddLabel(spans_merge_label);
+    OpBranch(end_label);
+
+    AddLabel(end_label);
+    OpReturn();
+    OpFunctionEnd();
+    track_write_func = func;
 }
 
 void EmitContext::DefineRescalingInputUniformConstant() {
@@ -1076,8 +1453,38 @@ void EmitContext::DefineRescalingInputUniformConstant() {
     }
 }
 
+void EmitContext::DefineInputAttachments(const Info& info, u32& binding) {
+    if (stage != Stage::Fragment || info.input_attachment_mask == 0) {
+        return;
+    }
+    AddCapability(spv::Capability::InputAttachment);
+    input_attachment_type =
+        TypeImage(F32[1], spv::Dim::SubpassData, 0, false, false, 2, spv::ImageFormat::Unknown);
+    const Id pointer_type{TypePointer(spv::StorageClass::UniformConstant, input_attachment_type)};
+    for (u32 index = 0; index < input_attachments.size(); ++index) {
+        if (((info.input_attachment_mask >> index) & 1) == 0) {
+            continue;
+        }
+        const Id id{AddGlobalVariable(pointer_type, spv::StorageClass::UniformConstant)};
+        Decorate(id, spv::Decoration::Binding, binding++);
+        Decorate(id, spv::Decoration::DescriptorSet, 0U);
+        Decorate(id, spv::Decoration::InputAttachmentIndex, index);
+        Name(id, fmt::format("attachment{}", index));
+        input_attachments[index] = id;
+        if (profile.supported_spirv >= 0x00010400) {
+            interfaces.push_back(id);
+        }
+    }
+    u32 slot{};
+    for (size_t index = 0; index < info.texture_descriptors.size(); ++index) {
+        if (info.texture_descriptors[index].pixel_local_read != PixelLocalRead::None) {
+            textures[index].attachment_read_slot = slot++;
+        }
+    }
+}
+
 void EmitContext::DefineRenderArea(const Info& info) {
-    if (!info.uses_render_area) {
+    if (!info.uses_render_area || Sirit::ValidId(render_area_push_constant)) {
         return;
     }
 
@@ -1092,7 +1499,8 @@ void EmitContext::DefineRenderArea(const Info& info) {
         Decorate(push_constant_struct, spv::Decoration::Block);
         Name(push_constant_struct, "RenderAreaInfo");
 
-        MemberDecorate(push_constant_struct, render_are_member_index, spv::Decoration::Offset, 0);
+        MemberDecorate(push_constant_struct, render_are_member_index, spv::Decoration::Offset,
+                       RENDERAREA_LAYOUT_OFFSET);
         MemberName(push_constant_struct, render_are_member_index, "render_area");
 
         const Id pointer_type{TypePointer(spv::StorageClass::PushConstant, push_constant_struct)};
@@ -1110,7 +1518,7 @@ void EmitContext::DefineConstantBuffers(const Info& info, u32& binding) {
     if (info.constant_buffer_descriptors.empty()) {
         return;
     }
-    if (!profile.support_descriptor_aliasing) {
+    if (!profile.SupportsUniformBufferDescriptorAliasing()) {
         DefineConstBuffers(*this, info, &UniformDefinitions::U32x4, binding, U32[4], 'u',
                            sizeof(u32[4]));
         for (const ConstantBufferDescriptor& desc : info.constant_buffer_descriptors) {
@@ -1188,7 +1596,7 @@ void EmitContext::DefineConstantBufferIndirectFunctions(const Info& info) {
         return func;
     }};
     IR::Type types{info.used_indirect_cbuf_types};
-    bool supports_aliasing = profile.support_descriptor_aliasing;
+    bool supports_aliasing = profile.SupportsUniformBufferDescriptorAliasing();
     if (supports_aliasing && True(types & IR::Type::U8)) {
         load_const_func_u8 = make_accessor(U8, &UniformDefinitions::U8);
     }
@@ -1215,8 +1623,11 @@ void EmitContext::DefineStorageBuffers(const Info& info, u32& binding) {
     }
     AddExtension("SPV_KHR_storage_buffer_storage_class");
 
-    const IR::Type used_types{profile.support_descriptor_aliasing ? info.used_storage_buffer_types
-                                                                  : IR::Type::U32};
+    IR::Type used_types{profile.support_descriptor_aliasing ? info.used_storage_buffer_types
+                                                            : IR::Type::U32};
+    if (atomic64_add_reduction_buffers.any()) {
+        used_types |= IR::Type::U32;
+    }
     if (profile.support_int8 && True(used_types & IR::Type::U8)) {
         DefineSsbos(*this, storage_types.U8, &StorageDefinitions::U8, info, binding, U8,
                     sizeof(u8));
@@ -1307,10 +1718,9 @@ void EmitContext::DefineTextureBuffers(const Info& info, u32& binding) {
     const Id type{TypePointer(spv::StorageClass::UniformConstant, image_buffer_type)};
     texture_buffers.reserve(info.texture_buffer_descriptors.size());
     for (const TextureBufferDescriptor& desc : info.texture_buffer_descriptors) {
-        if (desc.count != 1) {
-            throw NotImplementedException("Array of texture buffers");
-        }
-        const Id id{AddGlobalVariable(type, spv::StorageClass::UniformConstant)};
+        const u32 views{profile.texel_buffer_size_view ? desc.count * 2 : desc.count};
+        const Id array_type{DescType(*this, image_buffer_type, type, views)};
+        const Id id{AddGlobalVariable(array_type, spv::StorageClass::UniformConstant)};
         Decorate(id, spv::Decoration::Binding, binding);
         Decorate(id, spv::Decoration::DescriptorSet, 0U);
         Name(id, NameOf(stage, desc, "texbuf"));
@@ -1325,6 +1735,22 @@ void EmitContext::DefineTextureBuffers(const Info& info, u32& binding) {
     }
 }
 
+Id EmitContext::TexelBufferView(Id descriptor, Id image_type, Id element) {
+    const Id pointer_type{TypePointer(spv::StorageClass::UniformConstant, image_type)};
+    return OpAccessChain(pointer_type, descriptor, element);
+}
+
+Id EmitContext::TexelBufferCoord(Id coords, Id image, Id size_image) {
+    // The view that is read starts with the elements before the range the guest bound: their
+    // count is the difference of the sizes of both views
+    const Id size{OpImageQuerySize(U32[1], image)};
+    const Id guest_size{OpImageQuerySize(U32[1], size_image)};
+    const Id shifted{OpIAdd(U32[1], coords, OpISub(U32[1], size, guest_size))};
+    // A coordinate outside the guest range, negative ones included, would otherwise wrap into
+    // those leading elements: send it past the end of the view, where the access is out of bounds
+    return OpSelect(U32[1], OpULessThan(U1, coords, guest_size), shifted, size);
+}
+
 void EmitContext::DefineImageBuffers(const Info& info, u32& binding) {
     image_buffers.reserve(info.image_buffer_descriptors.size());
     for (const ImageBufferDescriptor& desc : info.image_buffer_descriptors) {
@@ -1336,7 +1762,9 @@ void EmitContext::DefineImageBuffers(const Info& info, u32& binding) {
         const Id image_type{
             TypeImage(sampled_type, spv::Dim::Buffer, false, false, false, 2, format)};
         const Id pointer_type{TypePointer(spv::StorageClass::UniformConstant, image_type)};
-        const Id id{AddGlobalVariable(pointer_type, spv::StorageClass::UniformConstant)};
+        const Id variable_type{
+            DescType(*this, image_type, pointer_type, profile.texel_buffer_size_view ? 2U : 1U)};
+        const Id id{AddGlobalVariable(variable_type, spv::StorageClass::UniformConstant)};
         Decorate(id, spv::Decoration::Binding, binding);
         Decorate(id, spv::Decoration::DescriptorSet, 0U);
         Name(id, NameOf(stage, desc, "imgbuf"));
@@ -1353,16 +1781,21 @@ void EmitContext::DefineImageBuffers(const Info& info, u32& binding) {
     }
 }
 
-void EmitContext::DefineTextures(const Info& info, u32& binding, u32& scaling_index) {
+void EmitContext::DefineTextures(const Info& info, u32& binding, u32& scaling_index,
+                                 u32& table_binding) {
     textures.reserve(info.texture_descriptors.size());
     for (const TextureDescriptor& desc : info.texture_descriptors) {
         const Id image_type{ImageType(*this, desc)};
         const Id sampled_type{TypeSampledImage(image_type)};
-        const Id pointer_type{TypePointer(spv::StorageClass::UniformConstant, sampled_type)};
-        const Id desc_type{DescType(*this, sampled_type, pointer_type, desc.count)};
+        // Direct descriptors hold images that are combined with a runtime sampler when used.
+        const Id element_type{desc.is_direct ? image_type : sampled_type};
+        const Id pointer_type{TypePointer(spv::StorageClass::UniformConstant, element_type)};
+        const Id desc_type{DescType(*this, element_type, pointer_type, desc.count)};
         const Id id{AddGlobalVariable(desc_type, spv::StorageClass::UniformConstant)};
-        Decorate(id, spv::Decoration::Binding, binding);
-        Decorate(id, spv::Decoration::DescriptorSet, 0U);
+        // Texture tables are kept in their own set, the host reuses it between draws.
+        const bool in_table_set{desc.is_direct || desc.in_table_set};
+        Decorate(id, spv::Decoration::Binding, in_table_set ? table_binding++ : binding++);
+        Decorate(id, spv::Decoration::DescriptorSet, in_table_set ? 1U : 0U);
         Name(id, NameOf(stage, desc, "tex"));
         textures.push_back({
             .id = id,
@@ -1371,11 +1804,11 @@ void EmitContext::DefineTextures(const Info& info, u32& binding, u32& scaling_in
             .image_type = image_type,
             .count = desc.count,
             .is_multisample = desc.is_multisample,
+            .is_direct = desc.is_direct,
         });
         if (profile.supported_spirv >= 0x00010400) {
             interfaces.push_back(id);
         }
-        ++binding;
         ++scaling_index;
     }
     if (info.uses_atomic_image_u32) {
@@ -1383,24 +1816,44 @@ void EmitContext::DefineTextures(const Info& info, u32& binding, u32& scaling_in
     }
 }
 
+void EmitContext::DefineRuntimeSamplers(const Info& info, u32& table_binding) {
+    if (info.runtime_sampler_count == 0) {
+        return;
+    }
+    runtime_sampler_type = TypeSampler();
+    runtime_sampler_pointer = TypePointer(spv::StorageClass::UniformConstant, runtime_sampler_type);
+    runtime_samplers_linked = info.runtime_samplers_linked;
+    const Id array_type{TypeArray(runtime_sampler_type, Const(info.runtime_sampler_count))};
+    runtime_samplers = AddGlobalVariable(
+        TypePointer(spv::StorageClass::UniformConstant, array_type),
+        spv::StorageClass::UniformConstant);
+    Decorate(runtime_samplers, spv::Decoration::Binding, table_binding++);
+    Decorate(runtime_samplers, spv::Decoration::DescriptorSet, 1U);
+    Name(runtime_samplers, "runtime_samplers");
+    if (profile.supported_spirv >= 0x00010400) {
+        interfaces.push_back(runtime_samplers);
+    }
+}
+
 void EmitContext::DefineImages(const Info& info, u32& binding, u32& scaling_index) {
     images.reserve(info.image_descriptors.size());
     for (const ImageDescriptor& desc : info.image_descriptors) {
-        if (desc.count != 1) {
-            throw NotImplementedException("Array of images");
-        }
-        const Id sampled_type{desc.is_integer ? U32[1] : F32[1]};
+        const Id sampled_type{desc.is_signed ? S32[1] : desc.is_integer ? U32[1] : F32[1]};
         const Id image_type{ImageType(*this, desc, sampled_type)};
         const Id pointer_type{TypePointer(spv::StorageClass::UniformConstant, image_type)};
-        const Id id{AddGlobalVariable(pointer_type, spv::StorageClass::UniformConstant)};
+        const Id desc_type{DescType(*this, image_type, pointer_type, desc.count)};
+        const Id id{AddGlobalVariable(desc_type, spv::StorageClass::UniformConstant)};
         Decorate(id, spv::Decoration::Binding, binding);
         Decorate(id, spv::Decoration::DescriptorSet, 0U);
         Name(id, NameOf(stage, desc, "img"));
         images.push_back({
             .id = id,
             .image_type = image_type,
+            .pointer_type = pointer_type,
             .count = desc.count,
             .is_integer = desc.is_integer,
+            .is_signed = desc.is_signed,
+            .is_direct = desc.is_direct,
         });
         if (profile.supported_spirv >= 0x00010400) {
             interfaces.push_back(id);
@@ -1429,20 +1882,23 @@ void EmitContext::DefineInputs(const IR::Program& program) {
     }
     if (info.uses_sample_id) {
         sample_id = DefineInput(*this, U32[1], false, spv::BuiltIn::SampleId);
+        // Vulkan requires Flat on integer fragment inputs, including built-ins.
+        Decorate(sample_id, spv::Decoration::Flat);
     }
     if (info.uses_is_helper_invocation) {
         is_helper_invocation = DefineInput(*this, U1, false, spv::BuiltIn::HelperInvocation);
     }
-    if (info.uses_subgroup_mask) {
+    if (info.uses_subgroup_mask && !single_lane_subgroup) {
         subgroup_mask_eq = DefineInput(*this, U32[4], false, spv::BuiltIn::SubgroupEqMaskKHR);
         subgroup_mask_lt = DefineInput(*this, U32[4], false, spv::BuiltIn::SubgroupLtMaskKHR);
         subgroup_mask_le = DefineInput(*this, U32[4], false, spv::BuiltIn::SubgroupLeMaskKHR);
         subgroup_mask_gt = DefineInput(*this, U32[4], false, spv::BuiltIn::SubgroupGtMaskKHR);
         subgroup_mask_ge = DefineInput(*this, U32[4], false, spv::BuiltIn::SubgroupGeMaskKHR);
     }
-    if (info.uses_fswzadd || info.uses_subgroup_invocation_id || info.uses_subgroup_shuffles ||
-        (profile.warp_size_potentially_larger_than_guest &&
-         (info.uses_subgroup_vote || info.uses_subgroup_mask))) {
+    if (!single_lane_subgroup &&
+        (info.uses_fswzadd || info.uses_subgroup_invocation_id || info.uses_subgroup_shuffles ||
+         (profile.warp_size_potentially_larger_than_guest &&
+          (info.uses_subgroup_vote || info.uses_subgroup_mask)))) {
         AddCapability(spv::Capability::GroupNonUniform);
         subgroup_local_invocation_id =
             DefineInput(*this, U32[1], false, spv::BuiltIn::SubgroupLocalInvocationId);
@@ -1464,7 +1920,11 @@ void EmitContext::DefineInputs(const IR::Program& program) {
         layer = DefineInput(*this, U32[1], false, spv::BuiltIn::Layer);
         Decorate(layer, spv::Decoration::Flat);
     }
-    if (loads.AnyComponent(IR::Attribute::PositionX)) {
+    // The alpha-to-coverage dither reads the pixel position. Without an alpha output the coverage
+    // is undefined and is left to the host.
+    alpha_to_coverage_dither = stage == Stage::Fragment && runtime_info.alpha_to_coverage_dither &&
+                               info.stores_frag_alpha[0];
+    if (loads.AnyComponent(IR::Attribute::PositionX) || alpha_to_coverage_dither) {
         const bool is_fragment{stage == Stage::Fragment};
         if (!is_fragment && profile.has_broken_spirv_position_input) {
             need_input_position_indirect = true;
@@ -1539,7 +1999,10 @@ void EmitContext::DefineInputs(const IR::Program& program) {
         }
         const Id type{GetAttributeType(*this, input_type)};
         const Id id{DefineInput(*this, type, true)};
-        Decorate(id, spv::Decoration::Location, static_cast<u32>(index));
+        const u32 location = stage == Stage::VertexB && runtime_info.vertex_input_locations
+                                 ? runtime_info.vertex_input_locations->at(index)
+                                 : static_cast<u32>(index);
+        Decorate(id, spv::Decoration::Location, location);
         Name(id, fmt::format("in_attr{}", index));
         input_generics[index] = GetAttributeInfo(*this, input_type, id);
 
@@ -1652,12 +2115,25 @@ void EmitContext::DefineOutputs(const IR::Program& program) {
         break;
     case Stage::Fragment:
         for (u32 index = 0; index < 8; ++index) {
-            if (!info.stores_frag_color[index] && !profile.need_declared_frag_colors) {
+            // In dual-source mode guest color output 1 is not render target 1: it is the
+            // secondary source of attachment 0.
+            const bool dual_source_output = runtime_info.dual_source_blend && index <= 1;
+            if (!dual_source_output && !info.stores_frag_color[index] &&
+                !profile.need_declared_frag_colors) {
                 continue;
             }
-            frag_color[index] = DefineOutput(*this, F32[4], std::nullopt);
-            Decorate(frag_color[index], spv::Decoration::Location, index);
-            Name(frag_color[index], fmt::format("frag_color{}", index));
+            // Both outputs of a dual-source pair use the type of attachment 0.
+            const u32 type_index = dual_source_output ? 0 : index;
+            const Id type{GetAttributeType(*this, runtime_info.color_output_types[type_index])};
+            frag_color[index] = DefineOutput(*this, type, std::nullopt);
+            if (dual_source_output) {
+                Decorate(frag_color[index], spv::Decoration::Location, 0u);
+                Decorate(frag_color[index], spv::Decoration::Index, index);
+                Name(frag_color[index], index == 0 ? "frag_color0" : "frag_color0_secondary");
+            } else {
+                Decorate(frag_color[index], spv::Decoration::Location, index);
+                Name(frag_color[index], fmt::format("frag_color{}", index));
+            }
         }
         if (info.stores_frag_depth) {
             frag_depth = DefineOutput(*this, F32[1], std::nullopt);

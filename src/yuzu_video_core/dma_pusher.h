@@ -4,6 +4,7 @@
 #pragma once
 
 #include <array>
+#include <atomic>
 #include <span>
 #include <vector>
 #include <boost/container/small_vector.hpp>
@@ -12,6 +13,7 @@
 #include "yuzu_common/bit_field.h"
 #include "yuzu_common/common_types.h"
 #include "yuzu_common/scratch_buffer.h"
+#include "yuzu_video_core/command_header.h"
 #include "yuzu_video_core/engines/engine_interface.h"
 #include "yuzu_video_core/engines/puller.h"
 
@@ -27,15 +29,6 @@ struct ChannelState;
 
 class GPU;
 class MemoryManager;
-
-enum class SubmissionMode : u32 {
-    IncreasingOld = 0,
-    Increasing = 1,
-    NonIncreasingOld = 2,
-    NonIncreasing = 3,
-    Inline = 4,
-    IncreaseOnce = 5
-};
 
 // Note that, traditionally, methods are treated as 4-byte addressable locations, and hence
 // their numbers are written down multiplied by 4 in Docs. Here we are not multiply by 4.
@@ -73,24 +66,19 @@ enum class BufferMethods : u32 {
 struct CommandListHeader {
     union {
         u64 raw;
-        BitField<0, 40, GPUVAddr> addr;
+        BitField<0, 1, u64> conditional_fetch;
+        BitField<40, 1, u64> is_privileged;
         BitField<41, 1, u64> is_non_main;
         BitField<42, 21, u64> size;
+        BitField<63, 1, u64> sync;
     };
+
+    [[nodiscard]] GPUVAddr Address() const {
+        // GP_ENTRY0 bits 0-1 are not part of the byte address.
+        return static_cast<GPUVAddr>(raw & 0xFFFFFFFFFCULL);
+    }
 };
 static_assert(sizeof(CommandListHeader) == sizeof(u64), "CommandListHeader is incorrect size");
-
-union CommandHeader {
-    u32 argument;
-    BitField<0, 13, u32> method;
-    BitField<0, 24, u32> method_count_;
-    BitField<13, 3, u32> subchannel;
-    BitField<16, 13, u32> arg_count;
-    BitField<16, 13, u32> method_count;
-    BitField<29, 3, SubmissionMode> mode;
-};
-static_assert(std::is_standard_layout_v<CommandHeader>, "CommandHeader is not standard layout");
-static_assert(sizeof(CommandHeader) == sizeof(u32), "CommandHeader has incorrect size!");
 
 inline CommandHeader BuildCommandHeader(BufferMethods method, u32 arg_count, SubmissionMode mode) {
     CommandHeader result{};
@@ -140,7 +128,17 @@ public:
 private:
     static constexpr u32 non_puller_methods = 0x40;
     static constexpr u32 max_subchannels = 8;
+    enum class MemoryOperationSyncState : u8 {
+        None,
+        Skip,
+        Armed,
+    };
+
     bool Step();
+    void SynchronizeMemoryOperations();
+    void ArmMemoryOperationSync();
+    void WaitForArmedMemoryOperationSync();
+    bool CanSkipCleanMemoryOperationSync(const CommandListHeader& header) const;
     void ProcessCommands(std::span<const CommandHeader> commands);
 
     void SetState(const CommandHeader& command_header);
@@ -167,6 +165,8 @@ private:
 
     DmaState dma_state{};
     bool dma_increment_once{};
+    MemoryOperationSyncState memory_operation_sync_state{MemoryOperationSyncState::None};
+    std::atomic<bool> memory_operation_sync_ready{};
 
     const bool ib_enable{true}; ///< IB mode enabled
 
@@ -176,6 +176,8 @@ private:
     GPU& gpu;
     MemoryManager& memory_manager;
     mutable Engines::Puller puller;
+
+    VideoCore::RasterizerInterface* rasterizer{};
 };
 
 } // namespace Tegra

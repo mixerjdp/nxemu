@@ -113,11 +113,14 @@ public:
     uint64_t GetDefaultNormalSaveSize() const;
     uint64_t GetDefaultJournalSaveSize() const;
     std::vector<u8> GetRawBytes() const;
+    bool IsValid() const { return valid; }
     uint64_t GetDeviceSaveDataSize() const;
 
     //IFileSysNACP
     uint32_t GetSupportedLanguages() const override;
     uint32_t GetParentalControlFlag() const override;
+    uint16_t GetCacheStorageMaxIndex() const override;
+    uint64_t GetCacheStorageDataAndJournalMaxSize() const override;
     bool GetUserAccountSwitchLock() const override;
     bool GetRatingAge(uint8_t* buffer, uint32_t bufferSize) const override;
     const char * GetVersionString() const override;
@@ -128,6 +131,7 @@ private:
     std::string version;
     mutable std::string developer;
     RawNACP raw{};
+    bool valid{};
 };
 
 } // namespace FileSys

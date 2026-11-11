@@ -3,10 +3,13 @@
 
 #include <array>
 #include <atomic>
+#include <cstdlib>
+#include <optional>
 
 #include "yuzu_audio_core/audio_core.h"
 #include "yuzu_common/hardware_properties.h"
 #include "core/core.h"
+#include "os_settings.h"
 #include "core/core_timing.h"
 #include "core/cpu_manager.h"
 #include "core/debugger/debugger.h"
@@ -22,7 +25,10 @@
 #include "core/hle/service/apm/apm_controller.h"
 #include "core/hle/service/filesystem/filesystem.h"
 #include "core/hle/service/glue/glue_manager.h"
+#include "core/hle/service/kernel_helpers.h"
+#include "core/hle/service/os/event.h"
 #include "core/hle/service/services.h"
+#include "core/frame_step.h"
 #include "core/internal_network/network.h"
 #include "core/perf_stats.h"
 #include "core/reporter.h"
@@ -30,6 +36,7 @@
 #include "yuzu_input_common/main.h"
 #include "network/network.h"
 #include <nxemu-module-spec/system_loader.h>
+#include <nxemu-cpu/cpu_settings_identifiers.h>
 #include <nxemu-video/video_settings_identifiers.h>
 
 #ifdef _WIN32
@@ -58,12 +65,32 @@ struct System::Impl {
     ~Impl()
     {
         hid_core.UnloadInputDevices();
-        input_subsystem->Shutdown();
+        if (input_initialized)
+        {
+            input_subsystem->Shutdown();
+        }
     }
 
     void Initialize(System& system)
     {
-        is_multicore = true; // osSettings.use_multi_core;
+        ConfigureRuntime(system);
+
+        // These objects outlive individual games and runtime setting changes.
+        frontend_applets.SetDefaultAppletsIfMissing();
+    }
+
+    void InitializeInput()
+    {
+        input_subsystem->Initialize();
+        input_initialized = true;
+    }
+
+    void ConfigureRuntime(System& system)
+    {
+        is_multicore = osSettings.use_multi_core;
+        cpu_hle_requested = osSettings.cpu_hle_synchronization;
+        cpu_hle_initialized_supported = CpuHleSupported();
+        cpu_hle_initialized_native_clock = CpuHleUsesNativeClock();
 
 #ifdef _WIN32
         const std::chrono::nanoseconds timer_resolution = Common::Windows::SetCurrentTimerResolutionToMaximum();
@@ -72,46 +99,54 @@ struct System::Impl {
 #endif
 
         core_timing.SetMulticore(is_multicore);
-        core_timing.Initialize([&system]() { system.RegisterHostThread(); });
+        core_timing.Initialize([&system]() { system.RegisterHostThread(); },
+                               cpu_hle_initialized_supported, cpu_hle_initialized_native_clock);
 
-        // Create default implementations of applets if one is not provided.
-        frontend_applets.SetDefaultAppletsIfMissing();
-
-        is_async_gpu = g_settings->GetBool(NXVideoSetting::UseAsynchronousGPUEmulation);
+        is_async_gpu = g_settings->GetBool(NXVideoSetting::GameUseAsynchronousGPUEmulation);
 
         kernel.SetMulticore(is_multicore);
         cpu_manager.SetMulticore(is_multicore);
         cpu_manager.SetAsyncGpu(is_async_gpu);
-        input_subsystem->Initialize();
     }
 
-    void ReinitializeIfNecessary(System & system)
+    void ReconfigureIfNecessary(System & system)
     {
-        const bool must_reinitialize = false;
-        //    is_multicore != osSettings.use_multi_core ||
-        //    extended_memory_layout != (Settings::values.memory_layout_mode.GetValue() !=
-        //                               Settings::MemoryLayout::Memory_4Gb);
+        const bool must_reconfigure = is_multicore != osSettings.use_multi_core ||
+            cpu_hle_requested != osSettings.cpu_hle_synchronization ||
+            cpu_hle_initialized_supported != CpuHleSupported() ||
+            cpu_hle_initialized_native_clock != CpuHleUsesNativeClock() ||
+            core_timing.CpuHleSynchronizationFailed();
 
-        if (!must_reinitialize)
+        if (!must_reconfigure)
         {
             return;
         }
 
-        LOG_DEBUG(Kernel, "Re-initializing");
+        LOG_DEBUG(Kernel, "Reconfiguring runtime timing and CPU settings");
 
-        // is_multicore = osSettings.use_multi_core;
-        // extended_memory_layout =
-        //     Settings::values.memory_layout_mode.GetValue() != Settings::MemoryLayout::Memory_4Gb;
+        ConfigureRuntime(system);
+    }
 
-        Initialize(system);
+    bool CpuHleSupported() const
+    {
+        return cpu_hle_guest64;
+    }
+
+    bool CpuHleUsesNativeClock() const
+    {
+#if (defined(_M_ARM64) || defined(ARCHITECTURE_arm64) || defined(__aarch64__)) && (defined(__linux__) || defined(__ANDROID__) || defined(__APPLE__))
+        return cpu_hle_guest64 && g_settings->GetBool(NXCpuSetting::NceEnabled);
+#else
+        return false;
+#endif
     }
 
     void Run()
     {
         std::unique_lock<std::mutex> lk(suspend_guard);
 
-        kernel.SuspendEmulation(false);
         core_timing.SyncPause(false);
+        kernel.SuspendEmulation(false);
         is_paused.store(false, std::memory_order_relaxed);
     }
 
@@ -119,8 +154,8 @@ struct System::Impl {
     {
         std::unique_lock<std::mutex> lk(suspend_guard);
 
-        core_timing.SyncPause(true);
         kernel.SuspendEmulation(true);
+        core_timing.SyncPause(true);
         is_paused.store(true, std::memory_order_relaxed);
     }
 
@@ -139,7 +174,7 @@ struct System::Impl {
 
     void UnstallApplication()
     {
-        if (!IsPaused())
+        if (!IsPaused() && !stop_event.stop_requested())
         {
             core_timing.SyncPause(false);
             kernel.SuspendEmulation(false);
@@ -148,20 +183,22 @@ struct System::Impl {
 
     void SetNVDECActive(bool is_nvdec_active)
     {
-        nvdec_active = is_nvdec_active;
+        nvdec_active.store(is_nvdec_active, std::memory_order_relaxed);
     }
 
     bool GetNVDECActive()
     {
-        return nvdec_active;
+        return nvdec_active.load(std::memory_order_relaxed);
     }
 
-    void InitializeKernel(System & system, uint64_t titleID)
+    void InitializeKernel(System & system, uint64_t titleID, bool is_64_bit)
     {
         LOG_DEBUG(Core, "initialized OK");
 
-        // Setting changes may require a full system reinitialization (e.g., disabling multicore).
-        ReinitializeIfNecessary(system);
+        cpu_hle_guest64 = is_64_bit;
+        // Reconfigure timing before creating guest threads. Input factories and
+        // frontend applets remain the instances registered during OS startup.
+        ReconfigureIfNecessary(system);
 
         kernel.Initialize();
         cpu_manager.Initialize();
@@ -199,15 +236,28 @@ struct System::Impl {
         core_timing.SyncPause(false);
         Network::CancelPendingSocketOperations();
         kernel.SuspendEmulation(true);
+        if (service_manager) {
+            // A host service still starting may wait for a service that will not register.
+            service_manager->Close();
+        }
         kernel.CloseServices();
+        applet_manager.StopEventObserver();
         kernel.ShutdownCores();
+        // The cores stop at their next reschedule: wait for them before destroying what the
+        // code they still run uses, such as a service still starting.
+        cpu_manager.Shutdown();
         applet_manager.Reset();
+        {
+            std::scoped_lock lk{general_channel_mutex};
+            general_channel.clear();
+            general_channel_event.reset();
+            general_channel_context.reset();
+        }
         services.reset();
         service_manager.reset();
         core_timing.ClearPendingEvents();
         audio_core.reset();
         perf_stats.reset();
-        cpu_manager.Shutdown();
         kernel.Shutdown();
         stop_event = {};
         Network::RestartSocketOperations();
@@ -244,13 +294,14 @@ struct System::Impl {
     Core::HID::HIDCore hid_core;
     Network::RoomNetwork room_network;
     std::shared_ptr<InputCommon::InputSubsystem> input_subsystem;
+    bool input_initialized{};
 
     CpuManager cpu_manager;
     std::atomic_bool is_powered_on{};
     bool exit_locked = false;
     bool exit_requested = false;
 
-    bool nvdec_active{};
+    std::atomic<bool> nvdec_active{};
 
     Reporter reporter;
     std::array<u8, 0x20> build_id{};
@@ -273,10 +324,17 @@ struct System::Impl {
     /// Services
     std::unique_ptr<Service::Services> services;
 
+    /// Network instance
+    Network::NetworkInstance network_instance;
+
     std::unique_ptr<Core::PerfStats> perf_stats;
     Core::SpeedLimiter speed_limiter;
+    Core::FrameStep frame_step;
 
     bool is_multicore{};
+    bool cpu_hle_requested{};
+    bool cpu_hle_guest64{true}, cpu_hle_initialized_supported{true};
+    bool cpu_hle_initialized_native_clock{};
     bool is_async_gpu{};
 
     ::ExecuteProgramCallback execute_program_callback{};
@@ -289,6 +347,17 @@ struct System::Impl {
         gpu_dirty_memory_managers;
 
     std::deque<std::vector<u8>> user_channel;
+    std::vector<std::vector<u8>> general_channel;
+    std::mutex general_channel_mutex;
+    std::optional<Service::KernelHelpers::ServiceContext> general_channel_context;
+    std::optional<Service::Event> general_channel_event;
+
+    void EnsureGeneralChannelInitialized(System& system) {
+        if (!general_channel_event) {
+            general_channel_context.emplace(system, "GeneralChannel");
+            general_channel_event.emplace(*general_channel_context);
+        }
+    }
 
     Kernel::KProcess * current_process{nullptr};
 };
@@ -310,13 +379,18 @@ const CpuManager & System::GetCpuManager() const
     return impl->cpu_manager;
 }
 
-void System::InitializeKernel(uint64_t titleID)
+void System::InitializeKernel(uint64_t titleID, bool is_64_bit)
 {
-    impl->InitializeKernel(*this, titleID);
+    impl->InitializeKernel(*this, titleID, is_64_bit);
 }
 
 void System::Initialize() {
     impl->Initialize(*this);
+}
+
+void System::InitializeInput()
+{
+    impl->InitializeInput();
 }
 
 void System::Run()
@@ -347,6 +421,11 @@ void System::SetShuttingDown(bool shutting_down)
 void System::ShutdownMainProcess()
 {
     impl->ShutdownMainProcess();
+}
+
+std::stop_token System::GetShutdownToken() const
+{
+    return impl->stop_event.get_token();
 }
 
 std::unique_lock<std::mutex> System::StallApplication()
@@ -384,8 +463,12 @@ std::span<GPUDirtyMemoryManager> System::GetGPUDirtyMemoryManager()
     return impl->gpu_dirty_memory_managers;
 }
 
-void System::GatherGPUDirtyMemory(ICacheInvalidator * invalidator)
+void System::GatherGPUDirtyMemory(ICacheInvalidator * invalidator, bool rearm_native_reads)
 {
+    if (Kernel::KProcess * process = impl->kernel.ApplicationProcess())
+    {
+        process->GetCoreMemory().FlushNceWrites(rearm_native_reads);
+    }
     for (auto & manager : impl->gpu_dirty_memory_managers)
     {
         manager.Gather(invalidator);
@@ -532,6 +615,11 @@ Core::SpeedLimiter & System::SpeedLimiter()
 const Core::SpeedLimiter & System::SpeedLimiter() const
 {
     return impl->speed_limiter;
+}
+
+Core::FrameStep & System::FrameStep()
+{
+    return impl->frame_step;
 }
 
 std::shared_ptr<InputCommon::InputSubsystem> & System::InputSubsystem() const
@@ -692,7 +780,7 @@ const Network::RoomNetwork & System::GetRoomNetwork() const
     return impl->room_network;
 }
 
-void System::RunServer(std::unique_ptr<Service::ServerManager> && server_manager)
+bool System::RunServer(std::unique_ptr<Service::ServerManager> && server_manager)
 {
     return impl->kernel.RunServer(std::move(server_manager));
 }
@@ -718,6 +806,36 @@ void System::ExecuteProgram(std::size_t program_index)
 std::deque<std::vector<u8>> & System::GetUserChannel()
 {
     return impl->user_channel;
+}
+
+void System::PushGeneralChannelData(std::vector<u8>&& data) {
+    std::scoped_lock lk{impl->general_channel_mutex};
+    impl->EnsureGeneralChannelInitialized(*this);
+    const bool was_empty = impl->general_channel.empty();
+    impl->general_channel.push_back(std::move(data));
+    if (was_empty) {
+        impl->general_channel_event->Signal();
+    }
+}
+
+bool System::TryPopGeneralChannel(std::vector<u8>& out_data) {
+    std::scoped_lock lk{impl->general_channel_mutex};
+    if (!impl->general_channel_event || impl->general_channel.empty()) {
+        return false;
+    }
+
+    out_data = std::move(impl->general_channel.back());
+    impl->general_channel.pop_back();
+    if (impl->general_channel.empty()) {
+        impl->general_channel_event->Clear();
+    }
+    return true;
+}
+
+Service::Event& System::GetGeneralChannelEvent() {
+    std::scoped_lock lk{impl->general_channel_mutex};
+    impl->EnsureGeneralChannelInitialized(*this);
+    return *impl->general_channel_event;
 }
 
 void System::RegisterExitCallback(::ExitCallback callback, void * userData)

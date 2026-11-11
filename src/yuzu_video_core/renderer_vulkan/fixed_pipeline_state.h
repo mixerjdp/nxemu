@@ -4,7 +4,10 @@
 #pragma once
 
 #include <array>
+#include <optional>
+#include <span>
 #include <type_traits>
+#include <vector>
 
 #include "yuzu_common/bit_field.h"
 #include "yuzu_common/common_types.h"
@@ -24,10 +27,18 @@ struct DynamicFeatures {
     bool has_extended_dynamic_state_3_blend;
     bool has_extended_dynamic_state_3_enables;
     bool has_dynamic_vertex_input;
+    bool has_vertex_stride_workaround;
 };
 
 struct FixedPipelineState {
     static u32 PackComparisonOp(Maxwell::ComparisonOp op) noexcept;
+
+    /// Single-sample targets cannot represent the 2x2 alpha-to-coverage dither: the fragment
+    /// shader emulates it and host alpha-to-coverage is disabled.
+    bool EmulatesAlphaToCoverageDither() const noexcept {
+        return alpha_to_coverage_enabled != 0 && alpha_to_coverage_dither != 0 &&
+               msaa_mode == Tegra::Texture::MsaaMode::Msaa1x1;
+    }
     static Maxwell::ComparisonOp UnpackComparisonOp(u32 packed) noexcept;
 
     static u32 PackStencilOp(Maxwell::StencilOp::Op op) noexcept;
@@ -47,6 +58,8 @@ struct FixedPipelineState {
 
     static u32 PackBlendEquation(Maxwell::Blend::Equation equation) noexcept;
     static Maxwell::Blend::Equation UnpackBlendEquation(u32 packed) noexcept;
+
+    static bool UsesDualSourceBlend(const Maxwell& regs) noexcept;
 
     static u32 PackBlendFactor(Maxwell::Blend::Factor factor) noexcept;
     static Maxwell::Blend::Factor UnpackBlendFactor(u32 packed) noexcept;
@@ -202,6 +215,7 @@ struct FixedPipelineState {
     };
     union {
         u32 raw2;
+        BitField<0, 1, u32> dual_source_blend;
         BitField<1, 3, u32> alpha_test_func;
         BitField<4, 1, u32> early_z;
         BitField<5, 1, u32> depth_enabled;
@@ -213,6 +227,9 @@ struct FixedPipelineState {
         BitField<15, 1, u32> alpha_to_coverage_enabled;
         BitField<16, 1, u32> alpha_to_one_enabled;
         BitField<17, 3, Tegra::Engines::Maxwell3D::EngineHint> app_stage;
+        BitField<20, 1, u32> vertex_stride_workaround;
+        BitField<21, 1, u32> alpha_to_coverage_dither;
+        BitField<22, 1, u32> tir_resolve_color;
     };
     std::array<u8, Maxwell::NumRenderTargets> color_formats;
 
@@ -233,7 +250,35 @@ struct FixedPipelineState {
 
     VideoCommon::TransformFeedbackState xfb_state;
 
+    // Values and dirty-bit transitions can be evaluated without mutating a GPU engine.
+    // The existing rendering path uses exactly the same implementation.
+    struct RefreshFlags {
+        bool vertex_input;
+        bool viewport_swizzles;
+        bool blending;
+        bool blend_enable;
+    };
+
+    void RefreshFromRegisters(const Maxwell& regs, Maxwell::PrimitiveTopology topology,
+                              Tegra::Engines::Maxwell3D::EngineHint hint, const DynamicFeatures& features,
+                              RefreshFlags& dirty);
+
     void Refresh(Tegra::Engines::Maxwell3D& maxwell3d, DynamicFeatures& features);
+
+    // No depth attachment is created while depth is disabled. Its stale format must
+    // not distinguish otherwise identical local pipelines, including legacy records.
+    void NormalizeInactiveFields() noexcept {
+        if (depth_enabled == 0) {
+            depth_format.Assign(0);
+        }
+        const u32 func = alpha_test_func.Value();
+        if (func == PackComparisonOp(Maxwell::ComparisonOp::Never_GL) ||
+            func == PackComparisonOp(Maxwell::ComparisonOp::Always_GL)) {
+            // Never/Always do not consume the reference. Ignore animated values
+            // so they cannot split Vulkan pipelines or NXShader recipes.
+            alpha_test_ref = 0;
+        }
+    }
 
     size_t Hash() const noexcept;
 
@@ -256,13 +301,32 @@ struct FixedPipelineState {
             // Exclude dynamic state
             return offsetof(FixedPipelineState, attributes);
         }
-        if (extended_dynamic_state) {
+        if (extended_dynamic_state && !vertex_stride_workaround) {
             // Exclude dynamic state
             return offsetof(FixedPipelineState, vertex_strides);
         }
         // Default
         return offsetof(FixedPipelineState, xfb_state);
     }
+
+    /// Clears what cannot change a draw but is left over from earlier ones, so draws that differ
+    /// only there share a pipeline: the attributes the vertex shader does not declare (they compile
+    /// as disabled inputs), with static vertex input the streams no remaining attribute reads, and
+    /// the write masks and blending of render targets without a format.
+    /// type_mask has both type bits of each declared attribute set (VideoCommon::DeclaredInputTypeMask).
+    void MaskUnusedState(u64 type_mask) noexcept;
+
+    /// What Refresh keeps from draw to draw and MaskUnusedState may clear.
+    struct MaskedFields {
+        u64 attribute_types{};
+        std::array<BlendingAttachment, Maxwell::NumRenderTargets> attachments{};
+        std::array<VertexAttribute, Maxwell::NumVertexAttributes> attributes{};
+        std::array<u32, Maxwell::NumVertexArrays> binding_divisors{};
+    };
+
+    /// Refresh only updates what changed, so the previous draw's mask comes off first.
+    void RestoreMaskedFields(const MaskedFields& fields) noexcept;
+    void SaveMaskedFields(MaskedFields& fields) const noexcept;
 
     u32 DynamicAttributeType(size_t index) const noexcept {
         return (attribute_types >> (index * 2)) & 0b11;
@@ -271,6 +335,25 @@ struct FixedPipelineState {
 static_assert(std::has_unique_object_representations_v<FixedPipelineState>);
 static_assert(std::is_trivially_copyable_v<FixedPipelineState>);
 static_assert(std::is_trivially_constructible_v<FixedPipelineState>);
+
+// Prototype of the guest state needed by every current fixed-state projection.
+// `complete` always uses the all-static guest representation, with no host flags.
+// This is an in-memory model, NOT a serialized C++ struct or a frozen public V2 ABI.
+struct GuestPipelineState {
+    static constexpr size_t WordCount = 278;
+    enum Change : u8 { Scalar = 1, VertexInput = 2, Viewport = 4, Blend = 8, Strides = 16, Xfb = 32, Dynamic = 64, All = 127 };
+    FixedPipelineState complete{};
+    u32 enabled_vertex_streams{};
+
+    static void Track(Tegra::Engines::Maxwell3D::DirtyState& dirty);
+    static GuestPipelineState Capture(const Maxwell& regs, Maxwell::PrimitiveTopology topology,
+                                      Tegra::Engines::Maxwell3D::EngineHint hint);
+    [[nodiscard]] FixedPipelineState Project(const DynamicFeatures& features) const;
+    // Field-wise words; no pointers, addresses, padding or shader instructions.
+    [[nodiscard]] std::vector<u32> Words() const;
+    void WriteWords(std::span<u32, WordCount> words) const;
+    [[nodiscard]] static std::optional<GuestPipelineState> FromWords(std::span<const u32> words);
+};
 
 } // namespace Vulkan
 

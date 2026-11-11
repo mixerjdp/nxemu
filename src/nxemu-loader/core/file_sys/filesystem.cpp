@@ -19,48 +19,28 @@
 
 namespace
 {
-void CollectTitleIdModRoots(const std::filesystem::path & path, const std::string & title_id_hex, FileSys::VfsFilesystem & vfs, std::vector<FileSys::VirtualDir> & out, std::unordered_set<std::string> & seen_paths)
+// The mods that ship with NXEmu (the external/nxemu-switch-mods submodule): next to the executable, in the
+// bundle's resources on macOS, and on Android in the app's storage, where the app copies them from its assets.
+// BundledModsDirectory replaces that, as the development config does with the submodule.
+std::filesystem::path BundledModsPath()
 {
-    if (!Common::FS::IsDir(path))
+    if (!loaderSettings.bundledModsDirectory.empty())
     {
-        return;
+        const std::filesystem::path path(Common::FS::ToU8String(loaderSettings.bundledModsDirectory));
+        return path.is_absolute() ? path : (Common::FS::GetExeDirectory() / path).lexically_normal();
     }
-
-    const std::string folder_name = Common::FS::PathToUTF8String(path.filename());
-    bool TitleIdFolderNameEquals = folder_name.size() == title_id_hex.size();
-    if (TitleIdFolderNameEquals)
+#if defined(ANDROID)
+    return Common::FS::GetYuzuPath(Common::FS::YuzuPath::YuzuDir) / "bundled_mods";
+#else
+    const std::filesystem::path exe_dir = Common::FS::GetExeDirectory();
+#if defined(__APPLE__)
+    if (exe_dir.filename() == "MacOS" && exe_dir.parent_path().filename() == "Contents")
     {
-        for (size_t i = 0; i < folder_name.size(); ++i)
-        {
-            if (std::tolower((unsigned char)folder_name[i]) != std::tolower((unsigned char)title_id_hex[i]))
-            {
-                TitleIdFolderNameEquals = false;
-                break;
-            }
-        }
+        return exe_dir.parent_path() / "Resources" / "mods";
     }
-
-    if (TitleIdFolderNameEquals)
-    {
-        const std::string utf8 = Common::FS::PathToUTF8String(path);
-        FileSys::VirtualDir dir = vfs.OpenDirectory(utf8, VirtualFileOpenMode::Read);
-        if (dir != nullptr && seen_paths.insert(dir->GetFullPath()).second)
-        {
-            out.push_back(std::move(dir));
-        }
-        return;
-    }
-
-    std::error_code ec;
-    for (const auto & entry : std::filesystem::directory_iterator(path, ec))
-    {
-        std::error_code type_ec;
-        if (ec || !entry.is_directory(type_ec) || type_ec)
-        {
-            continue;
-        }
-        CollectTitleIdModRoots(entry.path(), title_id_hex, vfs, out, seen_paths);
-    }
+#endif
+    return exe_dir / "mods";
+#endif
 }
 
 } // namespace
@@ -108,13 +88,73 @@ IFileSysRegisteredCache & FileSystemController::GetSystemNANDContents() const
 
 uint64_t FileSystemController::GetFreeSpaceSize(StorageId id) const
 {
-    UNIMPLEMENTED();
+    switch (id)
+    {
+    case StorageId::None:
+    case StorageId::GameCard:
+        return 0;
+    case StorageId::SdCard:
+        if (sdmc_factory == nullptr)
+        {
+            return 0;
+        }
+        return sdmc_factory->GetSDMCFreeSpace();
+    case StorageId::Host:
+        if (bis_factory == nullptr)
+        {
+            return 0;
+        }
+        return bis_factory->GetSystemNANDFreeSpace() + bis_factory->GetUserNANDFreeSpace();
+    case StorageId::NandSystem:
+        if (bis_factory == nullptr)
+        {
+            return 0;
+        }
+        return bis_factory->GetSystemNANDFreeSpace();
+    case StorageId::NandUser:
+        if (bis_factory == nullptr)
+        {
+            return 0;
+        }
+        return bis_factory->GetUserNANDFreeSpace();
+    }
+
     return 0;
 }
 
 uint64_t FileSystemController::GetTotalSpaceSize(StorageId id) const
 {
-    UNIMPLEMENTED();
+    switch (id)
+    {
+    case StorageId::None:
+    case StorageId::GameCard:
+        return 0;
+    case StorageId::SdCard:
+        if (sdmc_factory == nullptr)
+        {
+            return 0;
+        }
+        return sdmc_factory->GetSDMCTotalSpace();
+    case StorageId::Host:
+        if (bis_factory == nullptr)
+        {
+            return 0;
+        }
+        return bis_factory->GetFullNANDTotalSpace();
+    case StorageId::NandSystem:
+        if (bis_factory == nullptr)
+        {
+            return 0;
+        }
+        return bis_factory->GetSystemNANDTotalSpace();
+    case StorageId::NandUser:
+        if (bis_factory == nullptr)
+        {
+            return 0;
+        }
+        return bis_factory->GetUserNANDTotalSpace();
+    }
+
     return 0;
 }
 
@@ -225,10 +265,10 @@ FileSys::VirtualDir FileSystemController::GetSDMCModificationLoadRoot(uint64_t t
     return sdmc_factory->GetSDMCModificationLoadRoot(title_id);
 }
 
-std::vector<FileSys::VirtualDir> FileSystemController::GetAddOnModificationLoadRoots(uint64_t title_id) const
+std::vector<FileSys::VirtualDir> FileSystemController::GetGameDirectoryModificationLoadRoots(uint64_t title_id) const
 {
     std::vector<FileSys::VirtualDir> roots;
-    if (title_id == 0 || (title_id & 0xFFF) == 0x800 || loaderSettings.addOnDirectories.empty())
+    if (title_id == 0 || (title_id & 0xFFF) == 0x800)
     {
         return roots;
     }
@@ -239,17 +279,48 @@ std::vector<FileSys::VirtualDir> FileSystemController::GetAddOnModificationLoadR
         return roots;
     }
 
-    const std::string title_id_hex = fmt::format("{:016X}", title_id);
     std::unordered_set<std::string> seen_paths;
-    for (const std::string & dir : loaderSettings.addOnDirectories)
+    for (const std::string & path : loader.ModFolders(title_id))
     {
-        if (dir.empty())
+        FileSys::VirtualDir dir = vfs->OpenDirectory(path, VirtualFileOpenMode::Read);
+        if (dir != nullptr && seen_paths.insert(dir->GetFullPath()).second)
         {
-            continue;
+            roots.push_back(std::move(dir));
         }
-        CollectTitleIdModRoots(std::filesystem::path(Common::FS::ToU8String(dir)), title_id_hex, *vfs, roots, seen_paths);
     }
     return roots;
+}
+
+FileSys::VirtualDir FileSystemController::GetBundledModificationLoadRoot(uint64_t title_id) const
+{
+    if (title_id == 0 || (title_id & 0xFFF) == 0x800)
+    {
+        return nullptr;
+    }
+    const std::filesystem::path path = BundledModsPath();
+    FileSys::VirtualFilesystem vfs = loader.GetFilesystem();
+    if (!vfs || !Common::FS::IsDir(path))
+    {
+        return nullptr;
+    }
+    const FileSys::VirtualDir root = vfs->OpenDirectory(Common::FS::PathToUTF8String(path), VirtualFileOpenMode::Read);
+    if (root == nullptr)
+    {
+        return nullptr;
+    }
+
+    // A game's folder is "<Game name> [<title id>]", as in the mods repository, or the title id, as in the load folder
+    const std::string title_id_hex = fmt::format("{:016X}", title_id);
+    const std::string suffix = " [" + title_id_hex + "]";
+    for (const FileSys::VirtualDir & game : root->GetSubdirectories())
+    {
+        const std::string name = game->GetName();
+        if (name == title_id_hex || (name.size() > suffix.size() && name.compare(name.size() - suffix.size(), suffix.size(), suffix) == 0))
+        {
+            return game;
+        }
+    }
+    return nullptr;
 }
 
 FileSys::VirtualDir FileSystemController::GetModificationDumpRoot(uint64_t title_id) const

@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <bit>
 #include <mutex>
 #include <span>
 #include <vector>
@@ -28,7 +29,9 @@ struct DescriptorBank {
 bool DescriptorBankInfo::IsSuperset(const DescriptorBankInfo& subset) const noexcept {
     return uniform_buffers >= subset.uniform_buffers && storage_buffers >= subset.storage_buffers &&
            texture_buffers >= subset.texture_buffers && image_buffers >= subset.image_buffers &&
-           textures >= subset.textures && images >= subset.image_buffers;
+           textures >= subset.textures && sampled_images >= subset.sampled_images &&
+           samplers >= subset.samplers && images >= subset.images &&
+           input_attachments >= subset.input_attachments;
 }
 
 template <typename Descriptors>
@@ -40,23 +43,31 @@ static u32 Accumulate(const Descriptors& descriptors) {
     return count;
 }
 
-static DescriptorBankInfo MakeBankInfo(std::span<const Shader::Info> infos) {
+static DescriptorBankInfo MakeBankInfo(std::span<const Shader::Info> infos,
+                                       u32 texel_buffer_views) {
     DescriptorBankInfo bank;
     for (const Shader::Info& info : infos) {
         bank.uniform_buffers += Accumulate(info.constant_buffer_descriptors);
         bank.storage_buffers += Accumulate(info.storage_buffers_descriptors);
-        bank.texture_buffers += Accumulate(info.texture_buffer_descriptors);
-        bank.image_buffers += Accumulate(info.image_buffer_descriptors);
-        bank.textures += Accumulate(info.texture_descriptors);
+        bank.storage_buffers += info.runtime_image_write_mask_words != 0 ? 1U : 0U;
+        bank.storage_buffers += info.write_tracking_slots != 0 ? 1U : 0U;
+        bank.texture_buffers += Accumulate(info.texture_buffer_descriptors) * texel_buffer_views;
+        bank.image_buffers += Accumulate(info.image_buffer_descriptors) * texel_buffer_views;
+        for (const auto& desc : info.texture_descriptors) {
+            // Texture tables are allocated from their own set
+            bank.textures += desc.is_direct || desc.in_table_set ? 0U : desc.count;
+        }
         bank.images += Accumulate(info.image_descriptors);
+        bank.input_attachments += static_cast<u32>(std::popcount(info.input_attachment_mask));
     }
     bank.score = bank.uniform_buffers + bank.storage_buffers + bank.texture_buffers +
-                 bank.image_buffers + bank.textures + bank.images;
+                 bank.image_buffers + bank.textures + bank.sampled_images + bank.samplers +
+                 bank.images + bank.input_attachments;
     return bank;
 }
 
 static void AllocatePool(const Device& device, DescriptorBank& bank) {
-    std::array<VkDescriptorPoolSize, 6> pool_sizes;
+    std::array<VkDescriptorPoolSize, 9> pool_sizes;
     size_t pool_cursor{};
     const u32 sets_per_pool = device.GetSetsPerPool();
     const auto add = [&](VkDescriptorType type, u32 count) {
@@ -73,11 +84,16 @@ static void AllocatePool(const Device& device, DescriptorBank& bank) {
     add(VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER, info.texture_buffers);
     add(VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER, info.image_buffers);
     add(VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, info.textures);
+    add(VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, info.sampled_images);
+    add(VK_DESCRIPTOR_TYPE_SAMPLER, info.samplers);
     add(VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, info.images);
+    add(VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT, info.input_attachments);
     bank.pools.push_back(device.GetLogical().CreateDescriptorPool({
         .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
         .pNext = nullptr,
-        .flags = 0,
+        .flags = device.UsesUpdateAfterBindDescriptorSets()
+                     ? VK_DESCRIPTOR_POOL_CREATE_UPDATE_AFTER_BIND_BIT
+                     : 0U,
         .maxSets = sets_per_pool,
         .poolSizeCount = static_cast<u32>(pool_cursor),
         .pPoolSizes = std::data(pool_sizes),
@@ -129,12 +145,12 @@ DescriptorPool::~DescriptorPool() = default;
 
 DescriptorAllocator DescriptorPool::Allocator(VkDescriptorSetLayout layout,
                                               std::span<const Shader::Info> infos) {
-    return Allocator(layout, MakeBankInfo(infos));
+    return Allocator(layout, MakeBankInfo(infos, device.GetTexelBufferViews()));
 }
 
 DescriptorAllocator DescriptorPool::Allocator(VkDescriptorSetLayout layout,
                                               const Shader::Info& info) {
-    return Allocator(layout, MakeBankInfo(std::array{info}));
+    return Allocator(layout, MakeBankInfo(std::array{info}, device.GetTexelBufferViews()));
 }
 
 DescriptorAllocator DescriptorPool::Allocator(VkDescriptorSetLayout layout,
@@ -153,6 +169,13 @@ DescriptorBank& DescriptorPool::Bank(const DescriptorBankInfo& reqs) {
     read_lock.unlock();
 
     std::unique_lock write_lock{banks_mutex};
+    // A compiler can have created the bank while this thread upgraded its lock.
+    const auto existing = std::ranges::find_if(bank_infos, [&reqs](const DescriptorBankInfo& bank) {
+        return std::abs(bank.score - reqs.score) < SCORE_THRESHOLD && bank.IsSuperset(reqs);
+    });
+    if (existing != bank_infos.end()) {
+        return *banks[std::distance(bank_infos.begin(), existing)];
+    }
     bank_infos.push_back(reqs);
 
     auto& bank = *banks.emplace_back(std::make_unique<DescriptorBank>());

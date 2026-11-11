@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include <memory>
 #include <set>
 
 #include "yuzu_common/common_types.h"
@@ -18,6 +19,7 @@ class KProcess;
 }
 
 namespace Service::VI {
+enum class CaptureKind : u32;
 class IApplicationDisplayService;
 class IManagerDisplayService;
 } // namespace Service::VI
@@ -29,7 +31,15 @@ public:
     explicit DisplayLayerManager();
     ~DisplayLayerManager();
 
-    void Initialize(Core::System& system, Kernel::KProcess* process, AppletId applet_id,
+    struct DisplayServices {
+        std::shared_ptr<VI::IApplicationDisplayService> display;
+        std::shared_ptr<VI::IManagerDisplayService> manager;
+    };
+
+    // Opening them may wait for vi to start: the applet lock must not be held meanwhile.
+    static DisplayServices OpenDisplayServices(Core::System& system);
+
+    void Initialize(DisplayServices services, Kernel::KProcess* process, AppletId applet_id,
                     LibraryAppletMode mode);
     void Finalize();
 
@@ -43,7 +53,9 @@ public:
     void SetWindowVisibility(bool visible);
     bool GetWindowVisibility() const;
 
-    Result WriteAppletCaptureBuffer(bool* out_was_written, s32* out_fbshare_layer_index);
+    Result WriteAppletCaptureBuffer(bool* out_was_written, s32* out_fbshare_layer_index,
+                                    VI::CaptureKind kind);
+    Result ClearAppletCaptureBuffer(s32 fbshare_layer_index, u32 color);
 
 private:
     Kernel::KProcess* m_process{};

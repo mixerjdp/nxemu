@@ -36,6 +36,7 @@ IUserLocalCommunicationService::IUserLocalCommunicationService(Core::System& sys
             {102, C<&IUserLocalCommunicationService::Scan>, "Scan"},
             {103, C<&IUserLocalCommunicationService::ScanPrivate>, "ScanPrivate"},
             {104, C<&IUserLocalCommunicationService::SetWirelessControllerRestriction>, "SetWirelessControllerRestriction"},
+            {106, C<&IUserLocalCommunicationService::SetProtocol>, "SetProtocol"},
             {200, C<&IUserLocalCommunicationService::OpenAccessPoint>, "OpenAccessPoint"},
             {201, C<&IUserLocalCommunicationService::CloseAccessPoint>, "CloseAccessPoint"},
             {202, C<&IUserLocalCommunicationService::CreateNetwork>, "CreateNetwork"},
@@ -45,7 +46,7 @@ IUserLocalCommunicationService::IUserLocalCommunicationService(Core::System& sys
             {206, C<&IUserLocalCommunicationService::SetAdvertiseData>, "SetAdvertiseData"},
             {207, C<&IUserLocalCommunicationService::SetStationAcceptPolicy>, "SetStationAcceptPolicy"},
             {208, C<&IUserLocalCommunicationService::AddAcceptFilterEntry>, "AddAcceptFilterEntry"},
-            {209, nullptr, "ClearAcceptFilter"},
+            {209, C<&IUserLocalCommunicationService::ClearAcceptFilter>, "ClearAcceptFilter"},
             {300, C<&IUserLocalCommunicationService::OpenStation>, "OpenStation"},
             {301, C<&IUserLocalCommunicationService::CloseStation>, "CloseStation"},
             {302, C<&IUserLocalCommunicationService::Connect>, "Connect"},
@@ -182,8 +183,13 @@ Result IUserLocalCommunicationService::ScanPrivate(
     LOG_INFO(Service_LDN, "called, channel={}, filter_scan_flag={}, filter_network_type={}",
              channel, scan_filter.flag, scan_filter.network_type);
 
-    R_UNLESS(out_network_info.empty(), ResultBadInput);
+    R_UNLESS(!out_network_info.empty(), ResultBadInput);
     R_RETURN(lan_discovery.Scan(out_network_info, *network_count, scan_filter));
+}
+
+Result IUserLocalCommunicationService::SetProtocol(u32 protocol) {
+    LOG_WARNING(Service_LDN, "(STUBBED) called, protocol={}", protocol);
+    R_SUCCEED();
 }
 
 Result IUserLocalCommunicationService::SetWirelessControllerRestriction(
@@ -239,6 +245,11 @@ Result IUserLocalCommunicationService::SetStationAcceptPolicy(AcceptPolicy accep
 }
 
 Result IUserLocalCommunicationService::AddAcceptFilterEntry(MacAddress mac_address) {
+    LOG_WARNING(Service_LDN, "(STUBBED) called");
+    R_SUCCEED();
+}
+
+Result IUserLocalCommunicationService::ClearAcceptFilter() {
     LOG_WARNING(Service_LDN, "(STUBBED) called");
     R_SUCCEED();
 }

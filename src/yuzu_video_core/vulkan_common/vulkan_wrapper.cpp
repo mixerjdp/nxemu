@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <cstring>
 #include <memory>
 #include <optional>
 #include <utility>
@@ -115,6 +116,7 @@ void Load(VkDevice device, DeviceDispatch& dld) noexcept {
     X(vkCmdDrawIndirectByteCountEXT);
     X(vkCmdEndConditionalRenderingEXT);
     X(vkCmdEndQuery);
+    X(vkCmdWriteTimestamp);
     X(vkCmdEndRenderPass);
     X(vkCmdEndTransformFeedbackEXT);
     X(vkCmdEndDebugUtilsLabelEXT);
@@ -173,6 +175,7 @@ void Load(VkDevice device, DeviceDispatch& dld) noexcept {
     X(vkCreatePipelineLayout);
     X(vkCreateQueryPool);
     X(vkCreateRenderPass);
+    X(vkCreateRenderPass2);
     X(vkCreateSampler);
     X(vkCreateSemaphore);
     X(vkCreateShaderModule);
@@ -421,9 +424,14 @@ VkResult Free(VkDevice device, VkCommandPool handle, Span<VkCommandBuffer> buffe
 }
 
 Instance Instance::Create(u32 version, Span<const char*> layers, Span<const char*> extensions,
-                          InstanceDispatch& dispatch) {
+                          InstanceDispatch& dispatch, const void* next) {
 #ifdef __APPLE__
-    constexpr VkFlags ci_flags{VK_INSTANCE_CREATE_ENUMERATE_PORTABILITY_BIT_KHR};
+    const bool enumerate_portability =
+        std::find_if(extensions.begin(), extensions.end(), [](const char* extension) {
+            return std::strcmp(extension, VK_KHR_PORTABILITY_ENUMERATION_EXTENSION_NAME) == 0;
+        }) != extensions.end();
+    const VkFlags ci_flags =
+        enumerate_portability ? VK_INSTANCE_CREATE_ENUMERATE_PORTABILITY_BIT_KHR : 0;
 #else
     constexpr VkFlags ci_flags{};
 #endif
@@ -439,7 +447,7 @@ Instance Instance::Create(u32 version, Span<const char*> layers, Span<const char
     };
     const VkInstanceCreateInfo ci{
         .sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO,
-        .pNext = nullptr,
+        .pNext = next,
         .flags = ci_flags,
         .pApplicationInfo = &application_info,
         .enabledLayerCount = layers.size(),
@@ -619,6 +627,42 @@ void PipelineCache::SetObjectNameEXT(const char* name) const {
     SetObjectName(dld, owner, handle, VK_OBJECT_TYPE_PIPELINE_CACHE, name);
 }
 
+std::vector<char> PipelineCache::ReadData() const {
+    // Adapted from Eden c9499a0f77. Asynchronous pipeline builds can grow the cache
+    // between the size query and the data query. VK_INCOMPLETE still returns valid
+    // cache data, so bounded retries can fall back to the final partial snapshot.
+    constexpr size_t MaxAttempts = 3;
+    std::vector<char> data;
+    size_t valid_size = 0;
+
+    for (size_t attempt = 0; attempt < MaxAttempts; ++attempt) {
+        size_t required_size = 0;
+        Check(Read(&required_size, nullptr));
+        if (required_size == 0) {
+            return {};
+        }
+
+        data.resize(required_size);
+        size_t written_size = data.size();
+        const VkResult result = Read(&written_size, data.data());
+        if (result == VK_SUCCESS) {
+            data.resize(written_size);
+            return data;
+        }
+        if (result != VK_INCOMPLETE) {
+            Check(result);
+        }
+        valid_size = written_size;
+    }
+
+    LOG_DEBUG(Render_Vulkan,
+              "Pipeline cache kept growing during {} read attempts; using a valid {}-byte partial "
+              "snapshot",
+              MaxAttempts, valid_size);
+    data.resize(valid_size);
+    return data;
+}
+
 void Semaphore::SetObjectNameEXT(const char* name) const {
     SetObjectName(dld, owner, handle, VK_OBJECT_TYPE_SEMAPHORE, name);
 }
@@ -692,6 +736,13 @@ DescriptorPool Device::CreateDescriptorPool(const VkDescriptorPoolCreateInfo& ci
 RenderPass Device::CreateRenderPass(const VkRenderPassCreateInfo& ci) const {
     VkRenderPass object;
     Check(dld->vkCreateRenderPass(handle, &ci, nullptr, &object));
+    return RenderPass(object, handle, *dld);
+}
+
+RenderPass Device::CreateRenderPass2(const VkRenderPassCreateInfo2 & ci) const
+{
+    VkRenderPass object;
+    Check(dld->vkCreateRenderPass2(handle, &ci, nullptr, &object));
     return RenderPass(object, handle, *dld);
 }
 

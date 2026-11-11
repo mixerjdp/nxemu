@@ -9,6 +9,7 @@
 #include <vector>
 
 #include "yuzu_common/common_types.h"
+#include "yuzu_shader_recompiler/frontend/ir/attribute.h"
 #include "yuzu_shader_recompiler/varying_state.h"
 
 namespace Shader {
@@ -28,6 +29,24 @@ enum class InputTopology {
     LinesAdjacency,
     Triangles,
     TrianglesAdjacency,
+};
+
+struct InputTopologyVertices {
+    static u32 vertices(InputTopology input_topology) {
+        switch (input_topology) {
+        case InputTopology::Lines:
+            return 2;
+        case InputTopology::LinesAdjacency:
+            return 4;
+        case InputTopology::Triangles:
+            return 3;
+        case InputTopology::TrianglesAdjacency:
+            return 6;
+        case InputTopology::Points:
+        default:
+            return 1;
+        }
+    }
 };
 
 enum class CompareFunction {
@@ -62,6 +81,8 @@ struct TransformFeedbackVarying {
 
 struct RuntimeInfo {
     std::array<AttributeType, 32> generic_input_types{};
+    /// Dense host locations for sparse guest vertex inputs on devices with limited slots.
+    std::optional<std::array<u32, 32>> vertex_input_locations;
     VaryingState previous_stage_stores;
     std::map<IR::Attribute, IR::Attribute> previous_stage_legacy_stores_mapping;
 
@@ -72,11 +93,17 @@ struct RuntimeInfo {
     TessSpacing tess_spacing{};
     bool tess_clockwise{};
 
+    /// Generic output copied into the layer at the end of the vertex stage, standing in for an
+    /// eliminated geometry shader
+    std::optional<IR::Attribute> forwarded_layer_attribute;
+
     InputTopology input_topology{};
 
     std::optional<float> fixed_state_point_size;
     std::optional<CompareFunction> alpha_test_func;
     float alpha_test_reference{};
+    /// Approximate single-sample alpha-to-coverage with stable host-pixel IGN coverage
+    bool alpha_to_coverage_dither{};
 
     /// Static Y negate value
     bool y_negate{};
@@ -86,6 +113,15 @@ struct RuntimeInfo {
     /// Transform feedback state for each varying
     std::array<TransformFeedbackVarying, 256> xfb_varyings{};
     u32 xfb_count{0};
+
+    // Vulkan requires fragment outputs to match the attachment scalar type.
+    // Float remains the default for other backends.
+    std::array<AttributeType, 8> color_output_types{};
+    /// Fragment outputs bound to 8-bit normalized color attachments.
+    std::array<bool, 8> color_output_unorm8{};
+
+    /// Whether fragment outputs 0 and 1 are the primary and secondary sources for attachment 0.
+    bool dual_source_blend{};
 };
 
 } // namespace Shader

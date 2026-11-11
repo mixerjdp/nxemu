@@ -47,6 +47,8 @@ public:
 
         s32 dupes{1};          //!< How many guest references there are to this handle
         s32 internal_dupes{0}; //!< How many emulator-internal references there are to this handle
+        // Non-owning keys; session closure removes all matching guest references.
+        std::unordered_map<const Session*, s32> guest_refs;
 
         using Id = u32;
         Id id; //!< A globally unique identifier for this handle
@@ -73,6 +75,9 @@ public:
         bool allocated{}; //!< If the handle has been allocated with `Alloc`
         bool in_heap{};
         NvCore::SessionId session_id{};
+        std::shared_ptr<NvCore::Session> owner_session;
+        Kernel::KProcess* owner_process{}; //!< Process whose page table owns the CPU-side lock
+        bool device_address_space_locked{}; //!< Whether IocAlloc marked the range DeviceShared
 
         DAddr d_address{}; //!< The memory location in the device's AS that this handle corresponds
                            //!< to, this can also be in the nvdrv tmem
@@ -84,12 +89,13 @@ public:
          * if a 0 address is passed
          */
         [[nodiscard]] NvResult Alloc(Flags pFlags, u32 pAlign, u8 pKind, u64 pAddress,
-                                     NvCore::SessionId pSessionId);
+                                     const std::shared_ptr<Session>& session);
 
         /**
          * @brief Increases the dupe counter of the handle for the given session
          */
-        [[nodiscard]] NvResult Duplicate(bool internal_session);
+        [[nodiscard]] NvResult Duplicate(bool internal_session,
+                                         const std::shared_ptr<Session>& session = {});
 
         /**
          * @brief Obtains a pointer to the handle's memory and marks the handle it as having been
@@ -112,7 +118,6 @@ public:
         u64 address;       //!< Address the handle referred to before deletion
         u64 size;          //!< Page-aligned handle size
         bool was_uncached; //!< If the handle was allocated as uncached
-        bool can_unlock;   //!< If the address region is ready to be unlocked
     };
 
     explicit NvMap(Container& core, IVideo & video);
@@ -120,7 +125,8 @@ public:
     /**
      * @brief Creates an unallocated handle of the given size
      */
-    [[nodiscard]] NvResult CreateHandle(u64 size, std::shared_ptr<NvMap::Handle>& result_out);
+    [[nodiscard]] NvResult CreateHandle(u64 size, std::shared_ptr<NvMap::Handle>& result_out,
+                                        const std::shared_ptr<Session>& session);
 
     std::shared_ptr<Handle> GetHandle(Handle::Id handle);
 
@@ -150,16 +156,18 @@ public:
      * @note If a handle has no dupes left and has no other users a FreeInfo struct will be returned
      * describing the prior state of the handle
      */
-    std::optional<FreeInfo> FreeHandle(Handle::Id handle, bool internal_session);
+    std::optional<FreeInfo> FreeHandle(Handle::Id handle, bool internal_session,
+                                      const std::shared_ptr<Session>& session = {});
 
-    void UnmapAllHandles(NvCore::SessionId session_id);
+    void UnmapAllHandles(const std::shared_ptr<NvCore::Session>& session);
 
 private:
+    typedef std::unordered_map<Handle::Id, std::shared_ptr<Handle>> HandleMap;
+
     std::list<std::shared_ptr<Handle>> unmap_queue{};
     std::mutex unmap_queue_lock{}; //!< Protects access to `unmap_queue`
 
-    std::unordered_map<Handle::Id, std::shared_ptr<Handle>>
-        handles{};           //!< Main owning map of handles
+    HandleMap handles{};     //!< Main owning map of handles
     std::mutex handles_lock; //!< Protects access to `handles`
 
     static constexpr u32 HandleIdIncrement{
@@ -181,6 +189,12 @@ private:
      * @return If the handle was removed from the map
      */
     bool TryRemoveHandle(const Handle& handle_description);
+
+    /**
+     * @brief Releases the device mapping/CPU DeviceShared lock when the final reference is gone.
+     * @note handle_description.mutex MUST be locked when calling this.
+     */
+    bool FinalizeHandleLocked(Handle& handle_description);
 
     Container& core;
 };

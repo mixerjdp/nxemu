@@ -17,7 +17,7 @@ if ($Runtime) {
     if (!$Rom) { throw '-Runtime requires -Rom.' }
     $libs = @('nxemu-core','common','yuzu_common','fmt') | ForEach-Object { Join-Path $out "lib\$_.lib" }
     $includes = @('src','src\3rd_party','external\fmt\include','external\boost') | ForEach-Object { '/I' + (Join-Path $repo $_) }
-    & cl.exe /nologo /std:c++20 /EHsc /MT /O2 /DNOMINMAX /DWIN32 /D_WIN32 /DBOOST_ALL_NO_LIB @includes (Join-Path $PSScriptRoot 'runtime_smoke.cpp') "/Fo$out\runtime_smoke.obj" "/Fe$out\runtime_smoke.exe" /link /OPT:REF /INCREMENTAL:NO @libs shell32.lib ole32.lib user32.lib advapi32.lib ws2_32.lib shlwapi.lib
+    & cl.exe /nologo /utf-8 /std:c++20 /EHsc /MT /O2 /DNOMINMAX /DWIN32 /D_WIN32 /DBOOST_ALL_NO_LIB @includes (Join-Path $PSScriptRoot 'runtime_smoke.cpp') "/Fo$out\runtime_smoke.obj" "/Fe$out\runtime_smoke.exe" /link /OPT:REF /INCREMENTAL:NO @libs shell32.lib ole32.lib user32.lib advapi32.lib ws2_32.lib shlwapi.lib
     if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
     if (!$env:NXEMU_KEYS_DIR) { $env:NXEMU_KEYS_DIR = Join-Path $out 'user\keys' }
     $scratch = Join-Path $repo ('build\runtime-smoke-' + [guid]::NewGuid().ToString('N'))
@@ -28,13 +28,22 @@ if ($Runtime) {
     Get-ChildItem -LiteralPath $out -Filter '*.dll' | Copy-Item -Destination $scratch
     Write-Host "Isolated runtime data and log: $scratchUser"
     & "$scratch\runtime_smoke.exe" $repo $scratchUser $Rom
-    exit $LASTEXITCODE
+    $runtimeExit = $LASTEXITCODE
+    $log = Join-Path $scratchUser 'log\nxemu_log.txt'
+    if (Test-Path -LiteralPath $log) {
+        $critical = Select-String -LiteralPath $log -SimpleMatch '<Critical>' | Select-Object -First 1
+        if ($critical) {
+            Write-Host "FAIL: critical runtime log entry: $($critical.Line)"
+            if ($runtimeExit -eq 0) { $runtimeExit = 8 }
+        }
+    }
+    exit $runtimeExit
 }
 $objects = @(Get-ChildItem (Join-Path $repo 'build\x64\Release\nxemu-loader') -Filter '*.obj' | ForEach-Object FullName)
 if (!$objects.Count) { throw 'Build Release x64 nxemu.sln first.' }
 $libs = @('common','yuzu_common','fmt','lz4','zlib') | ForEach-Object { Join-Path $out "lib\$_.lib" }
 $includes = @('src','src\nxemu-loader','src\3rd_party','external\fmt\include','external\boost','external\openssl\include') | ForEach-Object { '/I' + (Join-Path $repo $_) }
-& cl.exe /nologo /std:c++20 /EHsc /MT /O2 /DNOMINMAX /DWIN32 /D_WIN32 /D_CRT_SECURE_NO_WARNINGS /DBOOST_ALL_NO_LIB @includes (Join-Path $PSScriptRoot 'loader_crypto_tests.cpp') "/Fo$out\loader_crypto_tests.obj" "/Fe$out\loader_crypto_tests.exe" /link /OPT:REF /INCREMENTAL:NO @objects @libs (Join-Path $repo 'external\openssl\lib\libcrypto.lib') shell32.lib ole32.lib user32.lib advapi32.lib ws2_32.lib shlwapi.lib
+& cl.exe /nologo /utf-8 /std:c++20 /EHsc /MT /O2 /DNOMINMAX /DWIN32 /D_WIN32 /D_CRT_SECURE_NO_WARNINGS /DBOOST_ALL_NO_LIB @includes (Join-Path $PSScriptRoot 'loader_crypto_tests.cpp') "/Fo$out\loader_crypto_tests.obj" "/Fe$out\loader_crypto_tests.exe" /link /OPT:REF /INCREMENTAL:NO @objects @libs (Join-Path $repo 'external\openssl\lib\libcrypto.lib') shell32.lib ole32.lib user32.lib advapi32.lib ws2_32.lib shlwapi.lib
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 if ($Rom) { & "$out\loader_crypto_tests.exe" $Rom } else { & "$out\loader_crypto_tests.exe" }
 exit $LASTEXITCODE

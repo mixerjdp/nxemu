@@ -11,6 +11,11 @@ struct Profile {
     u32 supported_spirv{0x00010000};
     bool unified_descriptor_binding{};
     bool support_descriptor_aliasing{};
+    bool support_sampled_image_array_nonuniform_indexing{};
+    bool support_uniform_texel_buffer_array_nonuniform_indexing{};
+    bool support_storage_image_array_nonuniform_indexing{};
+    // MoltenVK needs one canonical uniform view; storage-buffer aliases remain available.
+    bool disable_uniform_buffer_descriptor_aliasing{};
     bool support_int8{};
     bool support_int16{};
     bool support_int64{};
@@ -27,6 +32,10 @@ struct Profile {
     bool support_fp64_signed_zero_nan_preserve{};
     bool support_explicit_workgroup_layout{};
     bool support_vote{};
+    /// Subgroup built-ins and operations are usable before the fragment stage
+    bool support_subgroup_in_vertex_stages{true};
+    /// Geometry shader subgroup operations can be unavailable even when vertex stages support them.
+    bool support_subgroup_in_geometry_stage{true};
     bool support_viewport_index_layer_non_geometry{};
     bool support_viewport_mask{};
     bool support_typeless_image_loads{};
@@ -52,6 +61,8 @@ struct Profile {
     /// Fragment outputs have to be declared even if they are not written to avoid undefined values.
     /// See Ori and the Blind Forest's main menu for reference.
     bool need_declared_frag_colors{};
+    /// The host rounds values halfway between two 8-bit normalized steps up instead of down
+    bool has_unorm8_round_half_up{};
     /// Prevents fast math optimizations that may cause inaccuracies
     bool need_fastmath_off{};
     /// Some GPU vendors use a different rounding precision when calculating texture pixel
@@ -77,10 +88,17 @@ struct Profile {
     bool has_gl_cbuf_ftou_bug{};
     /// Some drivers poorly optimize boolean variable references
     bool has_gl_bool_ref_bug{};
+    /// NoContraction makes fragment and compute shaders much slower to build
+    bool has_slow_fragment_no_contraction{};
+    /// Large global-memory dispatch helpers make Metal register allocation pathological when inlined.
+    bool avoid_global_memory_helper_inlining{};
     /// Ignores SPIR-V ordered vs unordered using GLSL semantics
     bool ignore_nan_fp_comparisons{};
     /// Some drivers have broken support for OpVectorExtractDynamic on subgroup mask inputs
     bool has_broken_spirv_subgroup_mask_vector_extract_dynamic{};
+    /// Some Qualcomm drivers miscompile SPIR-V's subgroup shuffle with a nonuniform lane index.
+    bool has_broken_spirv_subgroup_shuffle{};
+    u32 max_subgroup_size{};
 
     u32 gl_max_compute_smem_size{};
 
@@ -90,6 +108,23 @@ struct Profile {
     u64 min_ssbo_alignment{};
 
     u32 max_user_clip_distances{};
+
+    /// Largest compute shared memory the host accepts, in bytes. Zero means no limit.
+    u32 max_compute_shared_memory_size{};
+
+    /// The host cannot start a texel buffer view at an arbitrary offset: it rounds it down to
+    /// its alignment. Views are then created at the aligned offset, and every texel buffer
+    /// descriptor holds two views in an array of two: the one that is read, which can start before
+    /// the range the guest bound, and one whose element count is the size the guest bound. The
+    /// difference of their element counts is the number of leading elements to skip.
+    bool texel_buffer_size_view{};
+
+    /// Compute shaders mark the device pages they write in storage and image buffers
+    bool track_storage_writes{};
+
+    bool SupportsUniformBufferDescriptorAliasing() const {
+        return support_descriptor_aliasing && !disable_uniform_buffer_descriptor_aliasing;
+    }
 };
 
 } // namespace Shader

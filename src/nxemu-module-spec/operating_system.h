@@ -509,11 +509,16 @@ struct PerfStatsResults
     double frametime;
     /// Ratio of walltime / emulated time elapsed
     double emulation_speed;
+    /// Longest time between two game frames since the last reset, in seconds; 0 when not measured
+    double longest_game_frame;
 };
 
 nxinterface IDeviceMemory
 {
     virtual const uint8_t * BackingBasePointer() const = 0;
+    virtual uint64_t BackingSize() const = 0;
+    virtual uint8_t * VirtualBasePointer() = 0;
+    virtual void EnableDirectMappedAddress() = 0;
 };
 
 nxinterface ICacheInvalidator
@@ -524,6 +529,7 @@ nxinterface ICacheInvalidator
 typedef void (*DeviceEnumCallback)(const char * device, void * userData);
 typedef void (*ExecuteProgramCallback)(uint32_t program_index, void * userData);
 typedef void (*ExitCallback)(void * userData);
+typedef bool (*EmulationPrepareCallback)(void * userData);
 typedef void (*UserChannelEntryCallback)(const uint8_t * data, uint32_t size, void * userData);
 
 nxinterface IParamPackage
@@ -667,6 +673,8 @@ typedef struct HostProfileInfo
 nxinterface IOperatingSystem
 {
     virtual bool Initialize() = 0;
+    virtual void InitializeInput() = 0;
+    virtual void StartEmulationThread(EmulationPrepareCallback prepare, void * userData) = 0;
     virtual void ShutDown() = 0;
     virtual bool IsShuttingDown() const = 0;
     virtual bool IsPoweredOn() const = 0;
@@ -688,6 +696,9 @@ nxinterface IOperatingSystem
     virtual void RegisterHostThread() = 0;
     virtual IParamPackageList * GetInputDevices() const = 0;
     virtual IEmulatedController & GetEmulatedController(NpadIdType index) = 0;
+    virtual void AndroidRegisterController(void * j_input_device) = 0;
+    virtual void SetButtonState(const char * guid, int32_t port, int32_t button_id, bool pressed) = 0;
+    virtual void SetAxisPosition(const char * guid, int32_t port, int32_t axis_id, float value) = 0;
     virtual ButtonNames GetButtonName(const IParamPackage & param)  const = 0;
     virtual bool IsController(const IParamPackage & params)  const = 0;
     virtual NpadStyleSet GetSupportedStyleTag() const = 0;
@@ -699,6 +710,7 @@ nxinterface IOperatingSystem
     virtual IParamPackage * GetNextInput() const = 0;
     virtual void PumpInputEvents() const = 0;
     virtual PerfStatsResults GetAndResetPerfStats() = 0;
+    virtual void MeasureGameFrames(bool measure) = 0;
     virtual void SetEmulationPaused(bool paused) = 0;
     virtual bool IsEmulationPaused() const = 0;
     virtual void SetFrontendApplets(ICabinetApplet * cabinet, IControllerApplet * controller, IErrorApplet * error, IMiiEditApplet * mii_edit, IParentalControlsApplet * parental_controls, IPhotoViewerApplet * photo_viewer, IProfileSelectApplet * profile_select, ISoftwareKeyboardApplet * software_keyboard, IWebBrowserApplet * web_browser) = 0;
@@ -716,6 +728,12 @@ nxinterface IOperatingSystem
     virtual void RegisterExitCallback(ExitCallback callback, void * userData) = 0;
     virtual void ExportUserChannel(UserChannelEntryCallback callback, void * userData) = 0;
     virtual void PushUserChannelEntry(const uint8_t * data, uint32_t size) = 0;
+    virtual void SetFrameStepAddress(uint64_t address) = 0;
+    // Publish CPU writes without announcing a new GPU submission.
+    virtual void GatherGPUDirtyMemoryForReadback(ICacheInvalidator * invalidator)
+    {
+        GatherGPUDirtyMemory(invalidator);
+    }
 };
 
 EXPORT IOperatingSystem * CALL CreateOperatingSystem(ISystemModules & modules);

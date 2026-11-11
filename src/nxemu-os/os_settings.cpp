@@ -5,7 +5,10 @@
 #include <climits>
 #include <common/json_util.h>
 #include <cstring>
+#include <nxemu-core/settings/identifiers.h>
+#include <nxemu-core/settings/module_setting_table.h>
 #include <nxemu-module-spec/base.h>
+#include <nxemu-video/video_settings_identifiers.h>
 #include <yuzu_common/yuzu_assert.h>
 
 extern IModuleSettings * g_settings;
@@ -30,6 +33,7 @@ enum class SettingType
     Language,
     DockedMode,
     MemoryLayout,
+    AppletMode,
 };
 
 enum class RangedWidth
@@ -42,24 +46,36 @@ enum class RangedWidth
 class OsSetting
 {
 public:
-    OsSetting(const char * id, const char * path, bool * val, bool defaultValue);
-    OsSetting(const char * id, const char * path, float * val, float defaultValue);
-    OsSetting(const char * id, const char * path, std::string * val, const char * defaultValue);
-    OsSetting(const char * id, const char * path, ControllerType * val, ControllerType defaultValue);
-    OsSetting(const char * id, const char * path, AudioCore::Sink::AudioEngine * val, AudioCore::Sink::AudioEngine defaultValue);
-    OsSetting(const char * id, const char * path, AudioMode * val, AudioMode defaultValue);
-    OsSetting(const char * id, const char * path, Language * val, Language defaultValue);
-    OsSetting(const char * id, const char * path, DockedMode * val, DockedMode defaultValue);
-    OsSetting(const char * id, const char * path, MemoryLayout * val, MemoryLayout defaultValue);
-    OsSetting(const char * id, const char * path, u8 * val, int32_t defaultValue, int32_t minValue, int32_t maxValue);
-    OsSetting(const char * id, const char * path, u16 * val, int32_t defaultValue, int32_t minValue, int32_t maxValue);
-    OsSetting(const char * id, const char * path, s32 * val, s32 defaultValue);
-    OsSetting(const char * id, const char * path, u32 * val, u32 defaultValue);
-    OsSetting(const char * id, const char * path, s64 * val, s64 defaultValue, s64 minValue, s64 maxValue);
+    OsSetting(const char * id, const char * path, bool * val, bool defaultValue, bool debugSetting = false);
+    OsSetting(const char * id, const char * path, float * val, float defaultValue, bool debugSetting = false);
+    OsSetting(const char * id, const char * path, std::string * val, const char * defaultValue, bool debugSetting = false);
+    OsSetting(const char * id, const char * path, ControllerType * val, ControllerType defaultValue, bool debugSetting = false);
+    OsSetting(const char * id, const char * path, AudioCore::Sink::AudioEngine * val, AudioCore::Sink::AudioEngine defaultValue, bool debugSetting = false);
+    OsSetting(const char * id, const char * path, AudioMode * val, AudioMode defaultValue, bool debugSetting = false);
+    OsSetting(const char * id, const char * path, Language * val, Language defaultValue, bool debugSetting = false);
+    OsSetting(const char * id, const char * path, DockedMode * val, DockedMode defaultValue, bool debugSetting = false);
+    OsSetting(const char * id, const char * path, MemoryLayout * val, MemoryLayout defaultValue, bool debugSetting = false);
+    OsSetting(const char * id, const char * path, AppletMode * val, AppletMode defaultValue, bool debugSetting = false);
+    OsSetting(const char * id, const char * path, u8 * val, int32_t defaultValue, int32_t minValue, int32_t maxValue, bool debugSetting = false);
+    OsSetting(const char * id, const char * path, u16 * val, int32_t defaultValue, int32_t minValue, int32_t maxValue, bool debugSetting = false);
+    OsSetting(const char * id, const char * path, s32 * val, s32 defaultValue, bool debugSetting = false);
+    OsSetting(const char * id, const char * path, u32 * val, u32 defaultValue, bool debugSetting = false);
+    OsSetting(const char * id, const char * path, s64 * val, s64 defaultValue, s64 minValue, s64 maxValue, bool debugSetting = false);
+    OsSetting(const char * id, const char * path, bool * val, const char * fallbackId);
+    OsSetting(const char * id, const char * path, AudioMode * val, const char * fallbackId);
+    OsSetting(const char * id, const char * path, Language * val, const char * fallbackId);
+    OsSetting(const char * id, const char * path, DockedMode * val, const char * fallbackId);
+    OsSetting(const char * id, const char * path, MemoryLayout * val, const char * fallbackId);
+    OsSetting(const char * id, const char * path, u8 * val, const char * fallbackId);
+    OsSetting(const char * id, const char * path, u16 * val, const char * fallbackId);
+    OsSetting(const char * id, const char * path, s32 * val, const char * fallbackId);
 
     const char * identifier;
     const char * json_path;
     SettingType settingType;
+    bool debugSetting;
+    const char * fallback{nullptr};
+    bool gameValue{false};
     RangedWidth rangedWidth{RangedWidth::None};
     int32_t minValue{};
     int32_t maxValue{};
@@ -80,6 +96,7 @@ public:
         Language language;
         DockedMode dockedMode;
         MemoryLayout memoryLayout;
+        AppletMode appletMode;
     } defaults;
     union
     {
@@ -98,6 +115,7 @@ public:
         Language * language;
         DockedMode * dockedMode;
         MemoryLayout * memoryLayout;
+        AppletMode * appletMode;
     } value;
 };
 
@@ -472,29 +490,56 @@ static OsSetting settings[] = {
         {nullptr, "controller\\player_9\\ProfileName", &osSettings.players[9].profile_name, ""},
         {nullptr, "controller\\player_9\\Vibration\\UseSystem", &osSettings.players[9].use_system_vibrator, false},
 
-        {NXOsSetting::VibrationEnabled, "controller\\vibration_enabled", &osSettings.vibration_enabled, true},
-        {NXOsSetting::EnableAccurateVibrations, "controller\\enable_accurate_vibrations", &osSettings.enable_accurate_vibrations, false},
+        {NXOsSetting::SystemVibrationEnabled, "controller\\vibration_enabled", &osSettings.global_vibration_enabled, true},
+        {NXOsSetting::SystemEnableAccurateVibrations, "controller\\enable_accurate_vibrations", &osSettings.global_enable_accurate_vibrations, false},
         {NXOsSetting::AudioSinkId, "audio\\sink_id", &osSettings.sink_id, AudioCore::Sink::AudioEngine::Auto},
         {NXOsSetting::AudioOutputDeviceId, "audio\\output_device_id", &osSettings.audio_output_device_id, "auto"},
         {NXOsSetting::AudioInputDeviceId, "audio\\input_device_id", &osSettings.audio_input_device_id, "auto"},
-        {NXOsSetting::AudioMode, "audio\\mode", &osSettings.sound_index, AudioMode::Stereo},
+        {NXOsSetting::SystemAudioMode, "audio\\mode", &osSettings.global_sound_index, AudioMode::Stereo},
         {NXOsSetting::AudioVolume, "audio\\volume", &osSettings.volume, 100, 0, 200},
         {NXOsSetting::AudioMuted, "audio\\muted", &osSettings.audio_muted, false},
-        {NXOsSetting::SpeedLimit, "system\\speed_limit", &osSettings.speed_limit, 100, 0, 9999},
-        {NXOsSetting::UseMultiCore, "system\\use_multi_core", &osSettings.use_multi_core, true},
+        {NXOsSetting::SystemSpeedLimit, "system\\speed_limit", &osSettings.global_speed_limit, 100, 0, 9999},
+        {NXOsSetting::SystemUseMultiCore, "system\\use_multi_core", &osSettings.global_use_multi_core, true, true},
+        {NXOsSetting::SystemCpuHleSynchronization, "system\\cpu_hle_synchronization", &osSettings.global_cpu_hle_synchronization, true, true},
         {NXOsSetting::UseSpeedLimit, nullptr, &osSettings.use_speed_limit, true},
-        {NXOsSetting::MemoryLayout, "system\\memory_layout_mode", &osSettings.memory_layout_mode, MemoryLayout::Memory_4Gb},
-        {NXOsSetting::LanguageIndex, "system\\language_index", &osSettings.language_index, Language::EnglishAmerican},
+        {NXOsSetting::UncappedPresent, nullptr, &osSettings.uncapped_present, false},
+        {NXOsSetting::SystemMemoryLayout, "system\\memory_layout_mode", &osSettings.global_memory_layout_mode, MemoryLayout::Memory_4Gb},
+        {NXOsSetting::SystemRegion, "system\\region", &osSettings.global_region_setting, kRegionOfLanguage},
         {NXOsSetting::CurrentUser, "system\\current_user", &osSettings.current_user, 0},
         {NXOsSetting::RngSeedEnabled, "system\\rng_seed_enabled", &osSettings.rng_seed_enabled, false},
         {NXOsSetting::RngSeed, "system\\rng_seed", &osSettings.rng_seed, 0u},
         {NXOsSetting::CustomRtcEnabled, "system\\custom_rtc_enabled", &osSettings.custom_rtc_enabled, false},
         {NXOsSetting::CustomRtcOffset, "system\\custom_rtc_offset", &osSettings.custom_rtc_offset, 0, INT_MIN, INT_MAX},
+        {NXOsSetting::CabinetAppletMode, "applet\\cabinet_applet_mode", &osSettings.cabinet_applet_mode, AppletMode::LLE, true},
+        {NXOsSetting::ControllerAppletMode, "applet\\controller_applet_mode", &osSettings.controller_applet_mode, AppletMode::HLE, true},
+        {NXOsSetting::DataEraseAppletMode, "applet\\data_erase_applet_mode", &osSettings.data_erase_applet_mode, AppletMode::LLE, true},
+        {NXOsSetting::ErrorAppletMode, "applet\\error_applet_mode", &osSettings.error_applet_mode, AppletMode::LLE, true},
+        {NXOsSetting::NetConnectAppletMode, "applet\\net_connect_applet_mode", &osSettings.net_connect_applet_mode, AppletMode::HLE, true},
+        {NXOsSetting::PlayerSelectAppletMode, "applet\\player_select_applet_mode", &osSettings.player_select_applet_mode, AppletMode::HLE, true},
+        {NXOsSetting::SwkbdAppletMode, "applet\\swkbd_applet_mode", &osSettings.swkbd_applet_mode, AppletMode::LLE, true},
+        {NXOsSetting::MiiEditAppletMode, "applet\\mii_edit_applet_mode", &osSettings.mii_edit_applet_mode, AppletMode::LLE, true},
+        {NXOsSetting::WebAppletMode, "applet\\web_applet_mode", &osSettings.web_applet_mode, AppletMode::LLE, true},
+        {NXOsSetting::ShopAppletMode, "applet\\shop_applet_mode", &osSettings.shop_applet_mode, AppletMode::LLE, true},
+        {NXOsSetting::PhotoViewerAppletMode, "applet\\photo_viewer_applet_mode", &osSettings.photo_viewer_applet_mode, AppletMode::LLE, true},
+        {NXOsSetting::OfflineWebAppletMode, "applet\\offline_web_applet_mode", &osSettings.offline_web_applet_mode, AppletMode::LLE, true},
+        {NXOsSetting::LoginShareAppletMode, "applet\\login_share_applet_mode", &osSettings.login_share_applet_mode, AppletMode::LLE, true},
+        {NXOsSetting::WifiWebAuthAppletMode, "applet\\wifi_web_auth_applet_mode", &osSettings.wifi_web_auth_applet_mode, AppletMode::LLE, true},
+        {NXOsSetting::MyPageAppletMode, "applet\\my_page_applet_mode", &osSettings.my_page_applet_mode, AppletMode::LLE, true},
 #ifdef ANDROID
-        {NXOsSetting::DockedMode, "system\\docked_mode", &osSettings.use_docked_mode, DockedMode::Handheld},
+        {NXOsSetting::SystemDockedMode, "system\\docked_mode", &osSettings.global_docked_mode, DockedMode::Handheld},
 #else
-        {NXOsSetting::DockedMode, "system\\docked_mode", &osSettings.use_docked_mode, DockedMode::Docked},
+        {NXOsSetting::SystemDockedMode, "system\\docked_mode", &osSettings.global_docked_mode, DockedMode::Docked},
 #endif
+        {NXOsSetting::GameDockedMode, "system\\docked_mode", &osSettings.use_docked_mode, NXOsSetting::SystemDockedMode},
+        {NXOsSetting::GameMemoryLayout, "system\\memory_layout_mode", &osSettings.memory_layout_mode, NXOsSetting::SystemMemoryLayout},
+        {NXOsSetting::GameRegion, "system\\region", &osSettings.region_setting, NXOsSetting::SystemRegion},
+        {NXOsSetting::GameLanguageIndex, "system\\language_index", &osSettings.language_index, NXCoreSetting::SystemLanguageIndex},
+        {NXOsSetting::GameSpeedLimit, "system\\speed_limit", &osSettings.speed_limit, NXOsSetting::SystemSpeedLimit},
+        {NXOsSetting::GameUseMultiCore, "system\\use_multi_core", &osSettings.use_multi_core, NXOsSetting::SystemUseMultiCore},
+        {NXOsSetting::GameCpuHleSynchronization, "system\\cpu_hle_synchronization", &osSettings.cpu_hle_synchronization, NXOsSetting::SystemCpuHleSynchronization},
+        {NXOsSetting::GameAudioMode, "audio\\mode", &osSettings.sound_index, NXOsSetting::SystemAudioMode},
+        {NXOsSetting::GameVibrationEnabled, "controller\\vibration_enabled", &osSettings.vibration_enabled, NXOsSetting::SystemVibrationEnabled},
+        {NXOsSetting::GameEnableAccurateVibrations, "controller\\enable_accurate_vibrations", &osSettings.enable_accurate_vibrations, NXOsSetting::SystemEnableAccurateVibrations},
     };
 
 void ApplyRangedInt(OsSetting & osSetting, int32_t value)
@@ -517,67 +562,112 @@ void ApplyRangedS64(OsSetting & osSetting, s64 value)
 
 } // namespace
 
+void VideoSettingsChanged(const char * /*setting*/, void * /*userData*/)
+{
+    osSettings.use_reactive_flushing = g_settings->GetBool(NXVideoSetting::GameEnableReactiveFlushing);
+    osSettings.use_video_framerate = g_settings->GetBool(NXVideoSetting::GameSyncToFramerateOfVideoPlayback);
+}
+
+namespace
+{
+void LoadStoreSetting(const OsSetting & osSetting, const char * setting)
+{
+    switch (osSetting.settingType)
+    {
+    case SettingType::Boolean:
+        *osSetting.value.boolValue = g_settings->GetBool(setting);
+        break;
+    case SettingType::IntValue:
+        *osSetting.value.intValue = g_settings->GetInt(setting);
+        break;
+    case SettingType::IntValueRanged:
+        ApplyRangedInt(const_cast<OsSetting &>(osSetting), g_settings->GetInt(setting));
+        break;
+    case SettingType::S32:
+        *osSetting.value.s32Value = g_settings->GetInt(setting);
+        break;
+    case SettingType::S64Ranged:
+        ApplyRangedS64(const_cast<OsSetting &>(osSetting), static_cast<s64>(g_settings->GetInt(setting)));
+        break;
+    case SettingType::U32:
+        *osSetting.value.u32Value = static_cast<u32>(g_settings->GetInt(setting));
+        break;
+    case SettingType::Float:
+        *osSetting.value.floatValue = g_settings->GetFloat(setting);
+        break;
+    case SettingType::String:
+        *osSetting.value.stringValue = g_settings->GetString(setting);
+        break;
+    case SettingType::ControllerType:
+        *osSetting.value.controllerType = static_cast<ControllerType>(g_settings->GetInt(setting));
+        break;
+    case SettingType::AudioEngine:
+        *osSetting.value.audioEngine = static_cast<AudioCore::Sink::AudioEngine>(g_settings->GetInt(setting));
+        break;
+    case SettingType::AudioMode:
+        *osSetting.value.audioMode = static_cast<AudioMode>(g_settings->GetInt(setting));
+        break;
+    case SettingType::Language:
+        *osSetting.value.language = static_cast<Language>(g_settings->GetInt(setting));
+        break;
+    case SettingType::DockedMode:
+        *osSetting.value.dockedMode = static_cast<DockedMode>(g_settings->GetInt(setting));
+        break;
+    case SettingType::MemoryLayout:
+        *osSetting.value.memoryLayout = static_cast<MemoryLayout>(g_settings->GetInt(setting));
+        break;
+    case SettingType::AppletMode:
+        *osSetting.value.appletMode = static_cast<AppletMode>(g_settings->GetInt(setting));
+        break;
+    default:
+        UNIMPLEMENTED();
+    }
+}
+
+StoreKind StoreKindOf(const OsSetting & osSetting)
+{
+    switch (osSetting.settingType)
+    {
+    case SettingType::Boolean:
+        return StoreKind::Bool;
+    case SettingType::Float:
+        return StoreKind::Float;
+    case SettingType::String:
+        return StoreKind::String;
+    default:
+        return StoreKind::Int;
+    }
+}
+
+bool IsPersisted(const OsSetting & osSetting)
+{
+    return osSetting.json_path != nullptr;
+}
+
+JsonValue JsonSettingValue(const OsSetting & osSetting, const JsonValue & root)
+{
+    return osSetting.json_path != nullptr ? JsonGetNestedValue(root, osSetting.json_path) : JsonValue();
+}
+
+void SetJsonSettingValue(const OsSetting & osSetting, JsonValue & root, const JsonValue & value)
+{
+    JsonSetNestedValue(root, osSetting.json_path, value);
+}
+
+void InheritFallback(OsSetting & osSetting, const OsSetting & fallbackSetting)
+{
+    osSetting.defaults = fallbackSetting.defaults;
+    osSetting.debugSetting = fallbackSetting.debugSetting;
+    osSetting.minValue = fallbackSetting.minValue;
+    osSetting.maxValue = fallbackSetting.maxValue;
+    osSetting.minValueS64 = fallbackSetting.minValueS64;
+    osSetting.maxValueS64 = fallbackSetting.maxValueS64;
+}
+} // namespace
+
 void OsSettingChanged(const char * setting, void * /*userData*/)
 {
-    for (const OsSetting & osSetting : settings)
-    {
-        if (osSetting.identifier == nullptr)
-        {
-            continue;
-        }
-
-        if (strcmp(osSetting.identifier, setting) != 0)
-        {
-            continue;
-        }
-        switch (osSetting.settingType)
-        {
-        case SettingType::Boolean:
-            *osSetting.value.boolValue = g_settings->GetBool(setting);
-            break;
-        case SettingType::IntValue:
-            *osSetting.value.intValue = g_settings->GetInt(setting);
-            break;
-        case SettingType::IntValueRanged:
-            ApplyRangedInt(const_cast<OsSetting &>(osSetting), g_settings->GetInt(setting));
-            break;
-        case SettingType::S32:
-            *osSetting.value.s32Value = g_settings->GetInt(setting);
-            break;
-        case SettingType::S64Ranged:
-            ApplyRangedS64(const_cast<OsSetting &>(osSetting), static_cast<s64>(g_settings->GetInt(setting)));
-            break;
-        case SettingType::U32:
-            *osSetting.value.u32Value = static_cast<u32>(g_settings->GetInt(setting));
-            break;
-        case SettingType::Float:
-            *osSetting.value.floatValue = g_settings->GetFloat(setting);
-            break;
-        case SettingType::String:
-            *osSetting.value.stringValue = g_settings->GetString(setting);
-            break;
-        case SettingType::ControllerType:
-            *osSetting.value.controllerType = static_cast<ControllerType>(g_settings->GetInt(setting));
-            break;
-        case SettingType::AudioEngine:
-            *osSetting.value.audioEngine = static_cast<AudioCore::Sink::AudioEngine>(g_settings->GetInt(setting));
-            break;
-        case SettingType::AudioMode:
-            *osSetting.value.audioMode = static_cast<AudioMode>(g_settings->GetInt(setting));
-            break;
-        case SettingType::Language:
-            *osSetting.value.language = static_cast<Language>(g_settings->GetInt(setting));
-            break;
-        case SettingType::DockedMode:
-            *osSetting.value.dockedMode = static_cast<DockedMode>(g_settings->GetInt(setting));
-            break;
-        case SettingType::MemoryLayout:
-            *osSetting.value.memoryLayout = static_cast<MemoryLayout>(g_settings->GetInt(setting));
-            break;
-        default:
-            UNIMPLEMENTED();
-        }
-    }
+    ModuleSettingTable::SettingChanged(settings, setting);
 }
 
 namespace
@@ -585,24 +675,7 @@ namespace
 
 void InitializeOsSettingDefaults()
 {
-    osSettings.cabinet_applet_mode = AppletMode::LLE;
-    osSettings.controller_applet_mode = AppletMode::HLE;
-    osSettings.data_erase_applet_mode = AppletMode::HLE;
-    osSettings.error_applet_mode = AppletMode::LLE;
-    osSettings.net_connect_applet_mode = AppletMode::HLE;
-    osSettings.player_select_applet_mode = AppletMode::HLE;
-    osSettings.swkbd_applet_mode = AppletMode::LLE;
-    osSettings.mii_edit_applet_mode = AppletMode::LLE;
-    osSettings.web_applet_mode = AppletMode::HLE;
-    osSettings.shop_applet_mode = AppletMode::HLE;
-    osSettings.photo_viewer_applet_mode = AppletMode::LLE;
-    osSettings.offline_web_applet_mode = AppletMode::LLE;
-    osSettings.login_share_applet_mode = AppletMode::HLE;
-    osSettings.wifi_web_auth_applet_mode = AppletMode::HLE;
-    osSettings.my_page_applet_mode = AppletMode::LLE;
-
     osSettings.dump_audio_commands = false;
-    osSettings.region_index = Region::Usa;
     osSettings.time_zone_index = TimeZone::Auto;
     osSettings.custom_rtc = 0;
     osSettings.device_name = "NxEmu";
@@ -638,455 +711,476 @@ void InitializeOsSettingDefaults()
     osSettings.random_amiibo_id = false;
 }
 
+void ApplyDefault(const OsSetting & osSetting)
+{
+    switch (osSetting.settingType)
+    {
+    case SettingType::Boolean:
+        *osSetting.value.boolValue = osSetting.defaults.boolValue;
+        break;
+    case SettingType::IntValue:
+        *osSetting.value.intValue = osSetting.defaults.intValue;
+        break;
+    case SettingType::IntValueRanged:
+        ApplyRangedInt(const_cast<OsSetting &>(osSetting), osSetting.defaults.intValue);
+        break;
+    case SettingType::S32:
+        *osSetting.value.s32Value = osSetting.defaults.s32Value;
+        break;
+    case SettingType::S64Ranged:
+        ApplyRangedS64(const_cast<OsSetting &>(osSetting), osSetting.defaults.s64Value);
+        break;
+    case SettingType::U32:
+        *osSetting.value.u32Value = osSetting.defaults.u32Value;
+        break;
+    case SettingType::Float:
+        *osSetting.value.floatValue = osSetting.defaults.floatValue;
+        break;
+    case SettingType::String:
+        *osSetting.value.stringValue = osSetting.defaults.stringValue;
+        break;
+    case SettingType::ControllerType:
+        *osSetting.value.controllerType = osSetting.defaults.controllerType;
+        break;
+    case SettingType::AudioEngine:
+        *osSetting.value.audioEngine = osSetting.defaults.audioEngine;
+        break;
+    case SettingType::AudioMode:
+        *osSetting.value.audioMode = osSetting.defaults.audioMode;
+        break;
+    case SettingType::Language:
+        *osSetting.value.language = osSetting.defaults.language;
+        break;
+    case SettingType::DockedMode:
+        *osSetting.value.dockedMode = osSetting.defaults.dockedMode;
+        break;
+    case SettingType::MemoryLayout:
+        *osSetting.value.memoryLayout = osSetting.defaults.memoryLayout;
+        break;
+    case SettingType::AppletMode:
+        *osSetting.value.appletMode = osSetting.defaults.appletMode;
+        break;
+    default:
+        UNIMPLEMENTED();
+    }
+}
+
+void ReadJsonSetting(const OsSetting & osSetting, const JsonValue & root)
+{
+    JsonValue value = JsonGetNestedValue(root, osSetting.json_path);
+    switch (osSetting.settingType)
+    {
+    case SettingType::Boolean:
+        if (value.isBool())
+        {
+            *osSetting.value.boolValue = value.asBool();
+        }
+        break;
+    case SettingType::IntValue:
+        if (value.isInt())
+        {
+            *osSetting.value.intValue = static_cast<int32_t>(value.asInt64());
+        }
+        break;
+    case SettingType::IntValueRanged:
+        if (value.isInt())
+        {
+            ApplyRangedInt(const_cast<OsSetting &>(osSetting), static_cast<int32_t>(value.asInt64()));
+        }
+        break;
+    case SettingType::S32:
+        if (value.isInt())
+        {
+            *osSetting.value.s32Value = static_cast<s32>(value.asInt64());
+        }
+        break;
+    case SettingType::S64Ranged:
+        if (value.isInt())
+        {
+            ApplyRangedS64(const_cast<OsSetting &>(osSetting), static_cast<s64>(value.asInt64()));
+        }
+        break;
+    case SettingType::U32:
+        if (value.isInt())
+        {
+            *osSetting.value.u32Value = static_cast<u32>(value.asUInt64());
+        }
+        break;
+    case SettingType::Float:
+        if (value.isDouble())
+        {
+            *osSetting.value.floatValue = static_cast<float>(value.asDouble());
+        }
+        else if (value.isInt())
+        {
+            *osSetting.value.floatValue = static_cast<float>(value.asInt64());
+        }
+        break;
+    case SettingType::String:
+        if (value.isString())
+        {
+            *osSetting.value.stringValue = value.asString();
+        }
+        break;
+    case SettingType::ControllerType:
+        if (value.isString())
+        {
+            *osSetting.value.controllerType = ControllerTypeFromString(value.asString());
+        }
+        break;
+    case SettingType::AudioEngine:
+        if (value.isString())
+        {
+            *osSetting.value.audioEngine = AudioEngineFromString(value.asString());
+        }
+        break;
+    case SettingType::AudioMode:
+        if (value.isString())
+        {
+            *osSetting.value.audioMode = AudioModeFromString(value.asString());
+        }
+        break;
+    case SettingType::Language:
+        if (value.isString())
+        {
+            *osSetting.value.language = LanguageFromString(value.asString());
+        }
+        break;
+    case SettingType::DockedMode:
+        if (value.isString())
+        {
+            *osSetting.value.dockedMode = DockedModeFromString(value.asString());
+        }
+        break;
+    case SettingType::MemoryLayout:
+        if (value.isString())
+        {
+            *osSetting.value.memoryLayout = MemoryLayoutFromString(value.asString());
+        }
+        break;
+    case SettingType::AppletMode:
+        if (value.isString())
+        {
+            *osSetting.value.appletMode = AppletModeFromString(value.asString(), osSetting.defaults.appletMode);
+        }
+        break;
+    default:
+        UNIMPLEMENTED();
+    }
+}
+
+void StoreSetting(const OsSetting & osSetting)
+{
+    switch (osSetting.settingType)
+    {
+    case SettingType::Boolean:
+        g_settings->SetDefaultBool(osSetting.identifier, osSetting.defaults.boolValue);
+        g_settings->SetBool(osSetting.identifier, *osSetting.value.boolValue);
+        break;
+    case SettingType::IntValue:
+        g_settings->SetDefaultInt(osSetting.identifier, osSetting.defaults.intValue);
+        g_settings->SetInt(osSetting.identifier, *osSetting.value.intValue);
+        break;
+    case SettingType::IntValueRanged:
+        g_settings->SetDefaultInt(osSetting.identifier, osSetting.defaults.intValue);
+        ApplyRangedInt(const_cast<OsSetting &>(osSetting),
+                         osSetting.rangedWidth == RangedWidth::U8 ? static_cast<int32_t>(*osSetting.value.u8Value)
+                                                                  : static_cast<int32_t>(*osSetting.value.u16Value));
+        g_settings->SetInt(osSetting.identifier,
+                           osSetting.rangedWidth == RangedWidth::U8 ? static_cast<int32_t>(*osSetting.value.u8Value)
+                                                                   : static_cast<int32_t>(*osSetting.value.u16Value));
+        break;
+    case SettingType::S32:
+        g_settings->SetDefaultInt(osSetting.identifier, osSetting.defaults.s32Value);
+        g_settings->SetInt(osSetting.identifier, *osSetting.value.s32Value);
+        break;
+    case SettingType::S64Ranged:
+        g_settings->SetDefaultInt(osSetting.identifier, static_cast<int32_t>(osSetting.defaults.s64Value));
+        ApplyRangedS64(const_cast<OsSetting &>(osSetting), *osSetting.value.s64Value);
+        g_settings->SetInt(osSetting.identifier, static_cast<int32_t>(*osSetting.value.s64Value));
+        break;
+    case SettingType::U32:
+        g_settings->SetDefaultInt(osSetting.identifier, static_cast<int32_t>(osSetting.defaults.u32Value));
+        g_settings->SetInt(osSetting.identifier, static_cast<int32_t>(*osSetting.value.u32Value));
+        break;
+    case SettingType::Float:
+        g_settings->SetDefaultFloat(osSetting.identifier, osSetting.defaults.floatValue);
+        g_settings->SetFloat(osSetting.identifier, *osSetting.value.floatValue);
+        break;
+    case SettingType::String:
+        g_settings->SetDefaultString(osSetting.identifier, osSetting.defaults.stringValue);
+        g_settings->SetString(osSetting.identifier, osSetting.value.stringValue->c_str());
+        break;
+    case SettingType::ControllerType:
+        g_settings->SetDefaultInt(osSetting.identifier, static_cast<int32_t>(osSetting.defaults.controllerType));
+        g_settings->SetInt(osSetting.identifier, static_cast<int32_t>(*osSetting.value.controllerType));
+        break;
+    case SettingType::AudioEngine:
+        g_settings->SetDefaultInt(osSetting.identifier, static_cast<int32_t>(osSetting.defaults.audioEngine));
+        g_settings->SetInt(osSetting.identifier, static_cast<int32_t>(*osSetting.value.audioEngine));
+        break;
+    case SettingType::AudioMode:
+        g_settings->SetDefaultInt(osSetting.identifier, static_cast<int32_t>(osSetting.defaults.audioMode));
+        g_settings->SetInt(osSetting.identifier, static_cast<int32_t>(*osSetting.value.audioMode));
+        break;
+    case SettingType::Language:
+        g_settings->SetDefaultInt(osSetting.identifier, static_cast<int32_t>(osSetting.defaults.language));
+        g_settings->SetInt(osSetting.identifier, static_cast<int32_t>(*osSetting.value.language));
+        break;
+    case SettingType::DockedMode:
+        g_settings->SetDefaultInt(osSetting.identifier, static_cast<int32_t>(osSetting.defaults.dockedMode));
+        g_settings->SetInt(osSetting.identifier, static_cast<int32_t>(*osSetting.value.dockedMode));
+        break;
+    case SettingType::MemoryLayout:
+        g_settings->SetDefaultInt(osSetting.identifier, static_cast<int32_t>(osSetting.defaults.memoryLayout));
+        g_settings->SetInt(osSetting.identifier, static_cast<int32_t>(*osSetting.value.memoryLayout));
+        break;
+    case SettingType::AppletMode:
+        g_settings->SetDefaultInt(osSetting.identifier, static_cast<int32_t>(osSetting.defaults.appletMode));
+        g_settings->SetInt(osSetting.identifier, static_cast<int32_t>(*osSetting.value.appletMode));
+        break;
+    default:
+        UNIMPLEMENTED();
+    }
+}
+
+void WriteJsonSetting(const OsSetting & osSetting, JsonValue & root, bool always)
+{
+    switch (osSetting.settingType)
+    {
+    case SettingType::Boolean:
+        if (always || *osSetting.value.boolValue != osSetting.defaults.boolValue)
+        {
+            JsonSetNestedValue(root, osSetting.json_path, *osSetting.value.boolValue);
+        }
+        break;
+    case SettingType::IntValue:
+        if (always || *osSetting.value.intValue != osSetting.defaults.intValue)
+        {
+            JsonSetNestedValue(root, osSetting.json_path, *osSetting.value.intValue);
+        }
+        break;
+    case SettingType::IntValueRanged:
+        if (always || (osSetting.rangedWidth == RangedWidth::U8 && *osSetting.value.u8Value != static_cast<u8>(osSetting.defaults.intValue)) ||
+            (osSetting.rangedWidth == RangedWidth::U16 && *osSetting.value.u16Value != static_cast<u16>(osSetting.defaults.intValue)))
+        {
+            JsonSetNestedValue(root, osSetting.json_path,
+                               osSetting.rangedWidth == RangedWidth::U8 ? static_cast<int32_t>(*osSetting.value.u8Value)
+                                                                        : static_cast<int32_t>(*osSetting.value.u16Value));
+        }
+        break;
+    case SettingType::S32:
+        if (always || *osSetting.value.s32Value != osSetting.defaults.s32Value)
+        {
+            JsonSetNestedValue(root, osSetting.json_path, *osSetting.value.s32Value);
+        }
+        break;
+    case SettingType::S64Ranged:
+        if (always || *osSetting.value.s64Value != osSetting.defaults.s64Value)
+        {
+            JsonSetNestedValue(root, osSetting.json_path, static_cast<int32_t>(*osSetting.value.s64Value));
+        }
+        break;
+    case SettingType::U32:
+        if (always || *osSetting.value.u32Value != osSetting.defaults.u32Value)
+        {
+            JsonSetNestedValue(root, osSetting.json_path, *osSetting.value.u32Value);
+        }
+        break;
+    case SettingType::Float:
+        if (always || *osSetting.value.floatValue != osSetting.defaults.floatValue)
+        {
+            JsonSetNestedValue(root, osSetting.json_path, *osSetting.value.floatValue);
+        }
+        break;
+    case SettingType::String:
+        if (always || *osSetting.value.stringValue != osSetting.defaults.stringValue)
+        {
+            JsonSetNestedValue(root, osSetting.json_path, *osSetting.value.stringValue);
+        }
+        break;
+    case SettingType::ControllerType:
+        if (always || *osSetting.value.controllerType != osSetting.defaults.controllerType)
+        {
+            JsonSetNestedValue(root, osSetting.json_path, ControllerTypeToString(*osSetting.value.controllerType));
+        }
+        break;
+    case SettingType::AudioEngine:
+        if (always || *osSetting.value.audioEngine != osSetting.defaults.audioEngine)
+        {
+            JsonSetNestedValue(root, osSetting.json_path, AudioEngineToString(*osSetting.value.audioEngine));
+        }
+        break;
+    case SettingType::AudioMode:
+        if (always || *osSetting.value.audioMode != osSetting.defaults.audioMode)
+        {
+            JsonSetNestedValue(root, osSetting.json_path, AudioModeToString(*osSetting.value.audioMode));
+        }
+        break;
+    case SettingType::Language:
+        if (always || *osSetting.value.language != osSetting.defaults.language)
+        {
+            JsonSetNestedValue(root, osSetting.json_path, LanguageToString(*osSetting.value.language));
+        }
+        break;
+    case SettingType::DockedMode:
+        if (always || *osSetting.value.dockedMode != osSetting.defaults.dockedMode)
+        {
+            JsonSetNestedValue(root, osSetting.json_path, DockedModeToString(*osSetting.value.dockedMode));
+        }
+        break;
+    case SettingType::MemoryLayout:
+        if (always || *osSetting.value.memoryLayout != osSetting.defaults.memoryLayout)
+        {
+            JsonSetNestedValue(root, osSetting.json_path, MemoryLayoutToString(*osSetting.value.memoryLayout));
+        }
+        break;
+    case SettingType::AppletMode:
+        if (always || *osSetting.value.appletMode != osSetting.defaults.appletMode)
+        {
+            JsonSetNestedValue(root, osSetting.json_path, AppletModeToString(*osSetting.value.appletMode));
+        }
+        break;
+    default:
+        UNIMPLEMENTED();
+    }
+}
+
+void GameSettingsChanged(const char * /*setting*/, void * /*userData*/)
+{
+    ModuleSettingTable::LoadGameSettings(settings, "nxemu-os");
+}
+
 } // namespace
 
 void SetupOsSetting(void)
 {
     InitializeOsSettingDefaults();
-
-    for (const OsSetting & osSetting : settings)
-    {
-        switch (osSetting.settingType)
-        {
-        case SettingType::Boolean:
-            *osSetting.value.boolValue = osSetting.defaults.boolValue;
-            break;
-        case SettingType::IntValue:
-            *osSetting.value.intValue = osSetting.defaults.intValue;
-            break;
-        case SettingType::IntValueRanged:
-            ApplyRangedInt(const_cast<OsSetting &>(osSetting), osSetting.defaults.intValue);
-            break;
-        case SettingType::S32:
-            *osSetting.value.s32Value = osSetting.defaults.s32Value;
-            break;
-        case SettingType::S64Ranged:
-            ApplyRangedS64(const_cast<OsSetting &>(osSetting), osSetting.defaults.s64Value);
-            break;
-        case SettingType::U32:
-            *osSetting.value.u32Value = osSetting.defaults.u32Value;
-            break;
-        case SettingType::Float:
-            *osSetting.value.floatValue = osSetting.defaults.floatValue;
-            break;
-        case SettingType::String:
-            *osSetting.value.stringValue = osSetting.defaults.stringValue;
-            break;
-        case SettingType::ControllerType:
-            *osSetting.value.controllerType = osSetting.defaults.controllerType;
-            break;
-        case SettingType::AudioEngine:
-            *osSetting.value.audioEngine = osSetting.defaults.audioEngine;
-            break;
-        case SettingType::AudioMode:
-            *osSetting.value.audioMode = osSetting.defaults.audioMode;
-            break;
-        case SettingType::Language:
-            *osSetting.value.language = osSetting.defaults.language;
-            break;
-        case SettingType::DockedMode:
-            *osSetting.value.dockedMode = osSetting.defaults.dockedMode;
-            break;
-        case SettingType::MemoryLayout:
-            *osSetting.value.memoryLayout = osSetting.defaults.memoryLayout;
-            break;
-        default:
-            UNIMPLEMENTED();
-        }
-    }
-
-    JsonValue root;
-    JsonReader reader;
-    std::string json = g_settings->GetSectionSettings("nxemu-os");
-
-    if (!json.empty() && reader.Parse(json.data(), json.data() + json.size(), root))
-    {
-        for (const OsSetting & osSetting : settings)
-        {
-            if (osSetting.json_path == nullptr)
-            {
-                continue;
-            }
-            JsonValue value = JsonGetNestedValue(root, osSetting.json_path);
-            switch (osSetting.settingType)
-            {
-            case SettingType::Boolean:
-                if (value.isBool())
-                {
-                    *osSetting.value.boolValue = value.asBool();
-                }
-                break;
-            case SettingType::IntValue:
-                if (value.isInt())
-                {
-                    *osSetting.value.intValue = static_cast<int32_t>(value.asInt64());
-                }
-                break;
-            case SettingType::IntValueRanged:
-                if (value.isInt())
-                {
-                    ApplyRangedInt(const_cast<OsSetting &>(osSetting), static_cast<int32_t>(value.asInt64()));
-                }
-                break;
-            case SettingType::S32:
-                if (value.isInt())
-                {
-                    *osSetting.value.s32Value = static_cast<s32>(value.asInt64());
-                }
-                break;
-            case SettingType::S64Ranged:
-                if (value.isInt())
-                {
-                    ApplyRangedS64(const_cast<OsSetting &>(osSetting), static_cast<s64>(value.asInt64()));
-                }
-                break;
-            case SettingType::U32:
-                if (value.isInt())
-                {
-                    *osSetting.value.u32Value = static_cast<u32>(value.asUInt64());
-                }
-                break;
-            case SettingType::Float:
-                if (value.isDouble())
-                {
-                    *osSetting.value.floatValue = static_cast<float>(value.asDouble());
-                }
-                else if (value.isInt())
-                {
-                    *osSetting.value.floatValue = static_cast<float>(value.asInt64());
-                }
-                break;
-            case SettingType::String:
-                if (value.isString())
-                {
-                    *osSetting.value.stringValue = value.asString();
-                }
-                break;
-            case SettingType::ControllerType:
-                if (value.isString())
-                {
-                    *osSetting.value.controllerType = ControllerTypeFromString(value.asString());
-                }
-                break;
-            case SettingType::AudioEngine:
-                if (value.isString())
-                {
-                    *osSetting.value.audioEngine = AudioEngineFromString(value.asString());
-                }
-                break;
-            case SettingType::AudioMode:
-                if (value.isString())
-                {
-                    *osSetting.value.audioMode = AudioModeFromString(value.asString());
-                }
-                break;
-            case SettingType::Language:
-                if (value.isString())
-                {
-                    *osSetting.value.language = LanguageFromString(value.asString());
-                }
-                break;
-            case SettingType::DockedMode:
-                if (value.isString())
-                {
-                    *osSetting.value.dockedMode = DockedModeFromString(value.asString());
-                }
-                break;
-            case SettingType::MemoryLayout:
-                if (value.isString())
-                {
-                    *osSetting.value.memoryLayout = MemoryLayoutFromString(value.asString());
-                }
-                break;
-            default:
-                UNIMPLEMENTED();
-            }
-        }
-    }
-
-    for (const OsSetting & osSetting : settings)
-    {
-        if (osSetting.identifier == nullptr)
-        {
-            continue;
-        }
-
-        switch (osSetting.settingType)
-        {
-        case SettingType::Boolean:
-            g_settings->SetDefaultBool(osSetting.identifier, osSetting.defaults.boolValue);
-            g_settings->SetBool(osSetting.identifier, *osSetting.value.boolValue);
-            break;
-        case SettingType::IntValue:
-            g_settings->SetDefaultInt(osSetting.identifier, osSetting.defaults.intValue);
-            g_settings->SetInt(osSetting.identifier, *osSetting.value.intValue);
-            break;
-        case SettingType::IntValueRanged:
-            g_settings->SetDefaultInt(osSetting.identifier, osSetting.defaults.intValue);
-            ApplyRangedInt(const_cast<OsSetting &>(osSetting),
-                             osSetting.rangedWidth == RangedWidth::U8 ? static_cast<int32_t>(*osSetting.value.u8Value)
-                                                                      : static_cast<int32_t>(*osSetting.value.u16Value));
-            g_settings->SetInt(osSetting.identifier,
-                               osSetting.rangedWidth == RangedWidth::U8 ? static_cast<int32_t>(*osSetting.value.u8Value)
-                                                                       : static_cast<int32_t>(*osSetting.value.u16Value));
-            break;
-        case SettingType::S32:
-            g_settings->SetDefaultInt(osSetting.identifier, osSetting.defaults.s32Value);
-            g_settings->SetInt(osSetting.identifier, *osSetting.value.s32Value);
-            break;
-        case SettingType::S64Ranged:
-            g_settings->SetDefaultInt(osSetting.identifier, static_cast<int32_t>(osSetting.defaults.s64Value));
-            ApplyRangedS64(const_cast<OsSetting &>(osSetting), *osSetting.value.s64Value);
-            g_settings->SetInt(osSetting.identifier, static_cast<int32_t>(*osSetting.value.s64Value));
-            break;
-        case SettingType::U32:
-            g_settings->SetDefaultInt(osSetting.identifier, static_cast<int32_t>(osSetting.defaults.u32Value));
-            g_settings->SetInt(osSetting.identifier, static_cast<int32_t>(*osSetting.value.u32Value));
-            break;
-        case SettingType::Float:
-            g_settings->SetDefaultFloat(osSetting.identifier, osSetting.defaults.floatValue);
-            g_settings->SetFloat(osSetting.identifier, *osSetting.value.floatValue);
-            break;
-        case SettingType::String:
-            g_settings->SetDefaultString(osSetting.identifier, osSetting.defaults.stringValue);
-            g_settings->SetString(osSetting.identifier, osSetting.value.stringValue->c_str());
-            break;
-        case SettingType::ControllerType:
-            g_settings->SetDefaultInt(osSetting.identifier, static_cast<int32_t>(osSetting.defaults.controllerType));
-            g_settings->SetInt(osSetting.identifier, static_cast<int32_t>(*osSetting.value.controllerType));
-            break;
-        case SettingType::AudioEngine:
-            g_settings->SetDefaultInt(osSetting.identifier, static_cast<int32_t>(osSetting.defaults.audioEngine));
-            g_settings->SetInt(osSetting.identifier, static_cast<int32_t>(*osSetting.value.audioEngine));
-            break;
-        case SettingType::AudioMode:
-            g_settings->SetDefaultInt(osSetting.identifier, static_cast<int32_t>(osSetting.defaults.audioMode));
-            g_settings->SetInt(osSetting.identifier, static_cast<int32_t>(*osSetting.value.audioMode));
-            break;
-        case SettingType::Language:
-            g_settings->SetDefaultInt(osSetting.identifier, static_cast<int32_t>(osSetting.defaults.language));
-            g_settings->SetInt(osSetting.identifier, static_cast<int32_t>(*osSetting.value.language));
-            break;
-        case SettingType::DockedMode:
-            g_settings->SetDefaultInt(osSetting.identifier, static_cast<int32_t>(osSetting.defaults.dockedMode));
-            g_settings->SetInt(osSetting.identifier, static_cast<int32_t>(*osSetting.value.dockedMode));
-            break;
-        case SettingType::MemoryLayout:
-            g_settings->SetDefaultInt(osSetting.identifier, static_cast<int32_t>(osSetting.defaults.memoryLayout));
-            g_settings->SetInt(osSetting.identifier, static_cast<int32_t>(*osSetting.value.memoryLayout));
-            break;
-        default:
-            UNIMPLEMENTED();
-        }
-        g_settings->RegisterCallback(osSetting.identifier, OsSettingChanged, nullptr);
-    }
+    ModuleSettingTable::SetupSettings(settings, "nxemu-os", OsSettingChanged, GameSettingsChanged);
+    VideoSettingsChanged(nullptr, nullptr);
+    g_settings->RegisterCallback(NXVideoSetting::GameEnableReactiveFlushing, VideoSettingsChanged, nullptr);
+    g_settings->RegisterCallback(NXVideoSetting::GameSyncToFramerateOfVideoPlayback, VideoSettingsChanged, nullptr);
 }
 
 void CleanupOsSetting(void)
 {
-    for (const OsSetting & osSetting : settings)
-    {
-        if (osSetting.identifier == nullptr)
-        {
-            continue;
-        }
-        g_settings->UnregisterCallback(osSetting.identifier, OsSettingChanged, nullptr);
-    }
+    g_settings->UnregisterCallback(NXVideoSetting::GameEnableReactiveFlushing, VideoSettingsChanged, nullptr);
+    g_settings->UnregisterCallback(NXVideoSetting::GameSyncToFramerateOfVideoPlayback, VideoSettingsChanged, nullptr);
+    ModuleSettingTable::CleanupSettings(settings, OsSettingChanged, GameSettingsChanged);
 }
 
 void SaveOsSettings(void)
 {
-    JsonValue root;
-
-    for (const OsSetting & osSetting : settings)
-    {
-        if (osSetting.json_path == nullptr)
-        {
-            continue;
-        }
-        switch (osSetting.settingType)
-        {
-        case SettingType::Boolean:
-            if (*osSetting.value.boolValue != osSetting.defaults.boolValue)
-            {
-                JsonSetNestedValue(root, osSetting.json_path, *osSetting.value.boolValue);
-            }
-            break;
-        case SettingType::IntValue:
-            if (*osSetting.value.intValue != osSetting.defaults.intValue)
-            {
-                JsonSetNestedValue(root, osSetting.json_path, *osSetting.value.intValue);
-            }
-            break;
-        case SettingType::IntValueRanged:
-            if ((osSetting.rangedWidth == RangedWidth::U8 && *osSetting.value.u8Value != static_cast<u8>(osSetting.defaults.intValue)) ||
-                (osSetting.rangedWidth == RangedWidth::U16 && *osSetting.value.u16Value != static_cast<u16>(osSetting.defaults.intValue)))
-            {
-                JsonSetNestedValue(root, osSetting.json_path,
-                                   osSetting.rangedWidth == RangedWidth::U8 ? static_cast<int32_t>(*osSetting.value.u8Value)
-                                                                            : static_cast<int32_t>(*osSetting.value.u16Value));
-            }
-            break;
-        case SettingType::S32:
-            if (*osSetting.value.s32Value != osSetting.defaults.s32Value)
-            {
-                JsonSetNestedValue(root, osSetting.json_path, *osSetting.value.s32Value);
-            }
-            break;
-        case SettingType::S64Ranged:
-            if (*osSetting.value.s64Value != osSetting.defaults.s64Value)
-            {
-                JsonSetNestedValue(root, osSetting.json_path, static_cast<int32_t>(*osSetting.value.s64Value));
-            }
-            break;
-        case SettingType::U32:
-            if (*osSetting.value.u32Value != osSetting.defaults.u32Value)
-            {
-                JsonSetNestedValue(root, osSetting.json_path, *osSetting.value.u32Value);
-            }
-            break;
-        case SettingType::Float:
-            if (*osSetting.value.floatValue != osSetting.defaults.floatValue)
-            {
-                JsonSetNestedValue(root, osSetting.json_path, *osSetting.value.floatValue);
-            }
-            break;
-        case SettingType::String:
-            if (*osSetting.value.stringValue != osSetting.defaults.stringValue)
-            {
-                JsonSetNestedValue(root, osSetting.json_path, *osSetting.value.stringValue);
-            }
-            break;
-        case SettingType::ControllerType:
-            if (*osSetting.value.controllerType != osSetting.defaults.controllerType)
-            {
-                JsonSetNestedValue(root, osSetting.json_path, ControllerTypeToString(*osSetting.value.controllerType));
-            }
-            break;
-        case SettingType::AudioEngine:
-            if (*osSetting.value.audioEngine != osSetting.defaults.audioEngine)
-            {
-                JsonSetNestedValue(root, osSetting.json_path, AudioEngineToString(*osSetting.value.audioEngine));
-            }
-            break;
-        case SettingType::AudioMode:
-            if (*osSetting.value.audioMode != osSetting.defaults.audioMode)
-            {
-                JsonSetNestedValue(root, osSetting.json_path, AudioModeToString(*osSetting.value.audioMode));
-            }
-            break;
-        case SettingType::Language:
-            if (*osSetting.value.language != osSetting.defaults.language)
-            {
-                JsonSetNestedValue(root, osSetting.json_path, LanguageToString(*osSetting.value.language));
-            }
-            break;
-        case SettingType::DockedMode:
-            if (*osSetting.value.dockedMode != osSetting.defaults.dockedMode)
-            {
-                JsonSetNestedValue(root, osSetting.json_path, DockedModeToString(*osSetting.value.dockedMode));
-            }
-            break;
-        case SettingType::MemoryLayout:
-            if (*osSetting.value.memoryLayout != osSetting.defaults.memoryLayout)
-            {
-                JsonSetNestedValue(root, osSetting.json_path, MemoryLayoutToString(*osSetting.value.memoryLayout));
-            }
-            break;
-        default:
-            UNIMPLEMENTED();
-        }
-    }
-    g_settings->SetSectionSettings("nxemu-os", root.isNull() ? "" : JsonStyledWriter().write(root).c_str());
+    ModuleSettingTable::SaveSettings(settings, "nxemu-os");
 }
 
 namespace
 {
-OsSetting::OsSetting(const char * id, const char * path, bool * val, bool defaultValue) :
+OsSetting::OsSetting(const char * id, const char * path, bool * val, bool defaultValue, bool debugSetting) :
     identifier(id),
     json_path(path),
-    settingType(SettingType::Boolean)
+    settingType(SettingType::Boolean),
+    debugSetting(debugSetting)
 {
     defaults.boolValue = defaultValue;
     value.boolValue = val;
 }
 
-OsSetting::OsSetting(const char * id, const char * path, float * val, float defaultValue) :
+OsSetting::OsSetting(const char * id, const char * path, float * val, float defaultValue, bool debugSetting) :
     identifier(id),
     json_path(path),
-    settingType(SettingType::Float)
+    settingType(SettingType::Float),
+    debugSetting(debugSetting)
 {
     defaults.floatValue = defaultValue;
     value.floatValue = val;
 }
 
-OsSetting::OsSetting(const char * id, const char * path, std::string * val, const char * defaultValue) :
+OsSetting::OsSetting(const char * id, const char * path, std::string * val, const char * defaultValue, bool debugSetting) :
     identifier(id),
     json_path(path),
-    settingType(SettingType::String)
+    settingType(SettingType::String),
+    debugSetting(debugSetting)
 {
     defaults.stringValue = defaultValue;
     value.stringValue = val;
 }
 
-OsSetting::OsSetting(const char * id, const char * path, ControllerType * val, ControllerType defaultValue) :
+OsSetting::OsSetting(const char * id, const char * path, ControllerType * val, ControllerType defaultValue, bool debugSetting) :
     identifier(id),
     json_path(path),
-    settingType(SettingType::ControllerType)
+    settingType(SettingType::ControllerType),
+    debugSetting(debugSetting)
 {
     defaults.controllerType = defaultValue;
     value.controllerType = val;
 }
 
-OsSetting::OsSetting(const char * id, const char * path, AudioCore::Sink::AudioEngine * val, AudioCore::Sink::AudioEngine defaultValue) :
+OsSetting::OsSetting(const char * id, const char * path, AudioCore::Sink::AudioEngine * val, AudioCore::Sink::AudioEngine defaultValue, bool debugSetting) :
     identifier(id),
     json_path(path),
-    settingType(SettingType::AudioEngine)
+    settingType(SettingType::AudioEngine),
+    debugSetting(debugSetting)
 {
     defaults.audioEngine = defaultValue;
     value.audioEngine = val;
 }
 
-OsSetting::OsSetting(const char * id, const char * path, AudioMode * val, AudioMode defaultValue) :
+OsSetting::OsSetting(const char * id, const char * path, AudioMode * val, AudioMode defaultValue, bool debugSetting) :
     identifier(id),
     json_path(path),
-    settingType(SettingType::AudioMode)
+    settingType(SettingType::AudioMode),
+    debugSetting(debugSetting)
 {
     defaults.audioMode = defaultValue;
     value.audioMode = val;
 }
 
-OsSetting::OsSetting(const char * id, const char * path, Language * val, Language defaultValue) :
+OsSetting::OsSetting(const char * id, const char * path, Language * val, Language defaultValue, bool debugSetting) :
     identifier(id),
     json_path(path),
-    settingType(SettingType::Language)
+    settingType(SettingType::Language),
+    debugSetting(debugSetting)
 {
     defaults.language = defaultValue;
     value.language = val;
 }
 
-OsSetting::OsSetting(const char * id, const char * path, DockedMode * val, DockedMode defaultValue) :
+OsSetting::OsSetting(const char * id, const char * path, DockedMode * val, DockedMode defaultValue, bool debugSetting) :
     identifier(id),
     json_path(path),
-    settingType(SettingType::DockedMode)
+    settingType(SettingType::DockedMode),
+    debugSetting(debugSetting)
 {
     defaults.dockedMode = defaultValue;
     value.dockedMode = val;
 }
 
-OsSetting::OsSetting(const char * id, const char * path, MemoryLayout * val, MemoryLayout defaultValue) :
+OsSetting::OsSetting(const char * id, const char * path, MemoryLayout * val, MemoryLayout defaultValue, bool debugSetting) :
     identifier(id),
     json_path(path),
-    settingType(SettingType::MemoryLayout)
+    settingType(SettingType::MemoryLayout),
+    debugSetting(debugSetting)
 {
     defaults.memoryLayout = defaultValue;
     value.memoryLayout = val;
 }
 
-OsSetting::OsSetting(const char * id, const char * path, u8 * val, int32_t defaultValue, int32_t minValue, int32_t maxValue) :
+OsSetting::OsSetting(const char * id, const char * path, AppletMode * val, AppletMode defaultValue, bool debugSetting) :
+    identifier(id),
+    json_path(path),
+    settingType(SettingType::AppletMode),
+    debugSetting(debugSetting)
+{
+    defaults.appletMode = defaultValue;
+    value.appletMode = val;
+}
+
+OsSetting::OsSetting(const char * id, const char * path, u8 * val, int32_t defaultValue, int32_t minValue, int32_t maxValue, bool debugSetting) :
     identifier(id),
     json_path(path),
     settingType(SettingType::IntValueRanged),
+    debugSetting(debugSetting),
     rangedWidth(RangedWidth::U8),
     minValue(minValue),
     maxValue(maxValue)
@@ -1095,10 +1189,11 @@ OsSetting::OsSetting(const char * id, const char * path, u8 * val, int32_t defau
     value.u8Value = val;
 }
 
-OsSetting::OsSetting(const char * id, const char * path, u16 * val, int32_t defaultValue, int32_t minValue, int32_t maxValue) :
+OsSetting::OsSetting(const char * id, const char * path, u16 * val, int32_t defaultValue, int32_t minValue, int32_t maxValue, bool debugSetting) :
     identifier(id),
     json_path(path),
     settingType(SettingType::IntValueRanged),
+    debugSetting(debugSetting),
     rangedWidth(RangedWidth::U16),
     minValue(minValue),
     maxValue(maxValue)
@@ -1107,32 +1202,93 @@ OsSetting::OsSetting(const char * id, const char * path, u16 * val, int32_t defa
     value.u16Value = val;
 }
 
-OsSetting::OsSetting(const char * id, const char * path, s32 * val, s32 defaultValue) :
+OsSetting::OsSetting(const char * id, const char * path, s32 * val, s32 defaultValue, bool debugSetting) :
     identifier(id),
     json_path(path),
-    settingType(SettingType::S32)
+    settingType(SettingType::S32),
+    debugSetting(debugSetting)
 {
     defaults.s32Value = defaultValue;
     value.s32Value = val;
 }
 
-OsSetting::OsSetting(const char * id, const char * path, u32 * val, u32 defaultValue) :
+OsSetting::OsSetting(const char * id, const char * path, u32 * val, u32 defaultValue, bool debugSetting) :
     identifier(id),
     json_path(path),
-    settingType(SettingType::U32)
+    settingType(SettingType::U32),
+    debugSetting(debugSetting)
 {
     defaults.u32Value = defaultValue;
     value.u32Value = val;
 }
 
-OsSetting::OsSetting(const char * id, const char * path, s64 * val, s64 defaultValue, s64 minValue, s64 maxValue) :
+OsSetting::OsSetting(const char * id, const char * path, s64 * val, s64 defaultValue, s64 minValue, s64 maxValue, bool debugSetting) :
     identifier(id),
     json_path(path),
     settingType(SettingType::S64Ranged),
+    debugSetting(debugSetting),
     minValueS64(minValue),
     maxValueS64(maxValue)
 {
     defaults.s64Value = defaultValue;
     value.s64Value = val;
 }
+
+OsSetting::OsSetting(const char * id, const char * path, bool * val, const char * fallbackId) :
+    OsSetting(id, path, val, false)
+{
+    fallback = fallbackId;
+}
+
+OsSetting::OsSetting(const char * id, const char * path, AudioMode * val, const char * fallbackId) :
+    OsSetting(id, path, val, AudioMode::Stereo)
+{
+    fallback = fallbackId;
+}
+
+OsSetting::OsSetting(const char * id, const char * path, Language * val, const char * fallbackId) :
+    OsSetting(id, path, val, Language::EnglishAmerican)
+{
+    fallback = fallbackId;
+}
+
+OsSetting::OsSetting(const char * id, const char * path, DockedMode * val, const char * fallbackId) :
+    OsSetting(id, path, val, DockedMode::Handheld)
+{
+    fallback = fallbackId;
+}
+
+OsSetting::OsSetting(const char * id, const char * path, MemoryLayout * val, const char * fallbackId) :
+    OsSetting(id, path, val, MemoryLayout::Memory_4Gb)
+{
+    fallback = fallbackId;
+}
+
+OsSetting::OsSetting(const char * id, const char * path, u8 * val, const char * fallbackId) :
+    OsSetting(id, path, val, 0, 0, UCHAR_MAX)
+{
+    fallback = fallbackId;
+}
+
+OsSetting::OsSetting(const char * id, const char * path, u16 * val, const char * fallbackId) :
+    OsSetting(id, path, val, 0, 0, USHRT_MAX)
+{
+    fallback = fallbackId;
+}
+
+OsSetting::OsSetting(const char * id, const char * path, s32 * val, const char * fallbackId) :
+    OsSetting(id, path, val, 0)
+{
+    fallback = fallbackId;
+}
 } // namespace
+
+Region ConsoleRegion()
+{
+    const s32 chosen = osSettings.region_setting;
+    if (chosen >= static_cast<s32>(Region::Japan) && chosen <= static_cast<s32>(Region::Taiwan))
+    {
+        return static_cast<Region>(chosen);
+    }
+    return RegionOfLanguage(osSettings.language_index);
+}

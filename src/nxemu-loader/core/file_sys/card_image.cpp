@@ -28,7 +28,7 @@ constexpr std::array partition_names{
     "logo",
 };
 
-XCI::XCI(VirtualFile file_, uint64_t program_id, size_t program_index) :
+XCI::XCI(VirtualFile file_, uint64_t program_id, size_t program_index, uint64_t content_filter_base_id) :
     file(std::move(file_)), program_nca_status{LoaderResultStatus::ErrorXCIMissingProgramNCA},
     partitions(partition_names.size()),
     partitions_raw(partition_names.size())
@@ -69,7 +69,7 @@ XCI::XCI(VirtualFile file_, uint64_t program_id, size_t program_index) :
         status = LoaderResultStatus::ErrorXCIMissingPartition;
         return;
     }
-    secure_partition = std::make_shared<NSP>(secure, program_id, program_index);
+    secure_partition = std::make_shared<NSP>(secure, program_id, program_index, content_filter_base_id);
     if (secure_partition->GetStatus() != LoaderResultStatus::Success) {
         status = secure_partition->GetStatus();
         return;

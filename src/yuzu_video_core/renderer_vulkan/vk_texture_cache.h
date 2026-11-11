@@ -3,12 +3,17 @@
 
 #pragma once
 
+#include <compare>
+#include <optional>
 #include <span>
+#include <unordered_map>
+#include <vector>
 
 #include "yuzu_video_core/texture_cache/texture_cache_base.h"
 
 #include "yuzu_shader_recompiler/shader_info.h"
 #include "yuzu_video_core/renderer_vulkan/vk_compute_pass.h"
+#include "yuzu_video_core/renderer_vulkan/vk_render_pass_cache.h"
 #include "yuzu_video_core/renderer_vulkan/vk_staging_buffer_pool.h"
 #include "yuzu_video_core/texture_cache/image_view_base.h"
 #include "yuzu_video_core/vulkan_common/vulkan_memory_allocator.h"
@@ -48,6 +53,10 @@ public:
                                  ComputePassDescriptorQueue& compute_pass_descriptor_queue);
 
     void Finish();
+    u64 GetReadbackTick() const;
+    bool IsReadbackReady(u64 tick) const;
+    void WaitReadback(u64 tick);
+    void SubmitReadbacks();
 
     StagingBufferRef UploadStagingBuffer(size_t size);
 
@@ -82,10 +91,19 @@ public:
         return false;
     }
 
-    bool CanUploadMSAA() const noexcept {
-        // TODO: Implement buffer to MSAA uploads
-        return false;
-    }
+    bool CanUploadMSAA(const Image& image) const noexcept;
+
+    [[nodiscard]] VkImage AcquireMsaaScratchImage(const VkImageCreateInfo& image_ci);
+
+    void ReleaseMsaaScratchImage(VkImage image);
+
+    /// Multisampled stand-in for a 1x color target drawn with a TIR depth buffer. It is kept
+    /// per target so pixels a pass does not draw keep their earlier contents.
+    [[nodiscard]] VkImageView GetOrCreateTirColorScratch(VkImage color_image, VkFormat format,
+                                                         VkExtent2D extent, u32 layers,
+                                                         VkSampleCountFlagBits samples);
+
+    void ReleaseTirColorScratch(VkImage color_image);
 
     void AccelerateImageUpload(Image&, const StagingBufferRef&,
                                std::span<const VideoCommon::SwizzleParameters>);
@@ -112,6 +130,9 @@ public:
 
     void BarrierFeedbackLoop();
 
+    /// Changes each time render target writes become visible to sampled reads.
+    u64 AttachmentBarrierTick() const noexcept;
+
     const Device& device;
     Scheduler& scheduler;
     MemoryAllocator& memory_allocator;
@@ -119,9 +140,44 @@ public:
     BlitImageHelper& blit_image_helper;
     RenderPassCache& render_pass_cache;
     std::optional<ASTCDecoderPass> astc_decoder_pass;
+    std::optional<BlockLinearUnswizzle2DBufferPass> bl2d_buffer_unswizzle_pass;
     std::unique_ptr<MSAACopyPass> msaa_copy_pass;
     const Settings::ResolutionScalingInfo& resolution;
     std::array<std::vector<VkFormat>, VideoCore::Surface::MaxPixelFormat> view_formats;
+
+    struct MsaaScratchKey {
+        VkFormat format{};
+        VkImageType type{};
+        u32 width{};
+        u32 height{};
+        u32 depth{};
+        u32 levels{};
+        u32 layers{};
+        VkImageUsageFlags usage{};
+        VkImageCreateFlags flags{};
+
+        auto operator<=>(const MsaaScratchKey&) const = default;
+    };
+
+    struct MsaaScratchImage {
+        MsaaScratchKey key;
+        vk::Image image;
+        u64 tick{};
+        u32 unused_frames{};
+    };
+
+    std::vector<MsaaScratchImage> msaa_scratch_images;
+
+    struct TirColorScratch {
+        vk::Image image;
+        vk::ImageView view;
+        VkFormat format{};
+        VkExtent2D extent{};
+        u32 layers{};
+        VkSampleCountFlagBits samples{};
+    };
+    std::unordered_map<VkImage, TirColorScratch> tir_color_scratch;
+    size_t msaa_scratch_last = static_cast<size_t>(-1);
 
     static constexpr size_t indexing_slots = 8 * sizeof(size_t);
     std::array<vk::Buffer, indexing_slots> buffers{};
@@ -143,6 +199,10 @@ public:
 
     void UploadMemory(VkBuffer buffer, VkDeviceSize offset,
                       std::span<const VideoCommon::BufferImageCopy> copies);
+
+    /// Upload an image produced by a guest compute shader writing its raw swizzled bytes.
+    /// Unsupported formats return false without modifying the image.
+    bool UploadSwizzledFromBuffer(VkBuffer buffer, VkDeviceSize offset);
 
     void UploadMemory(const StagingBufferRef& map,
                       std::span<const VideoCommon::BufferImageCopy> copies);
@@ -213,8 +273,8 @@ public:
     ImageView(const ImageView&) = delete;
     ImageView& operator=(const ImageView&) = delete;
 
-    ImageView(ImageView&&) = default;
-    ImageView& operator=(ImageView&&) = default;
+    ImageView(ImageView&&) noexcept = default;
+    ImageView& operator=(ImageView&&) noexcept;
 
     [[nodiscard]] VkImageView DepthView();
 
@@ -235,6 +295,11 @@ public:
         return image_handle;
     }
 
+    /// True when the view reads the channels of the image as they are stored
+    [[nodiscard]] bool HasIdentitySwizzle() const noexcept {
+        return identity_swizzle;
+    }
+
     [[nodiscard]] VkImageView RenderTarget() const noexcept {
         return render_target;
     }
@@ -253,21 +318,29 @@ public:
 
 private:
     struct StorageViews {
-        std::array<vk::ImageView, Shader::NUM_TEXTURE_TYPES> signeds;
-        std::array<vk::ImageView, Shader::NUM_TEXTURE_TYPES> unsigneds;
+        std::unordered_map<u64, vk::ImageView> by_format;
     };
 
-    [[nodiscard]] vk::ImageView MakeView(VkFormat vk_format, VkImageAspectFlags aspect_mask);
+    [[nodiscard]] vk::ImageView MakeView(
+        VkFormat vk_format, VkImageAspectFlags aspect_mask,
+        std::optional<Shader::TextureType> texture_type = std::nullopt,
+        VkImageUsageFlags usage = 0);
 
     const Device* device = nullptr;
     const SlotVector<Image>* slot_images = nullptr;
+    bool identity_swizzle = false;
 
+    // Declared before the views so Vulkan destroys views before their backing images.
+    // One allocation per image dimension: 1D, 2D (including cube/array) and 3D.
+    std::array<vk::Image, 3> null_images;
+    struct NullStorageImage { vk::Image image; vk::ImageView view; };
+    std::unordered_map<u64, NullStorageImage> null_storage_images;
+    TextureCacheRuntime* null_runtime = nullptr;
     std::array<vk::ImageView, Shader::NUM_TEXTURE_TYPES> image_views;
     std::unique_ptr<StorageViews> storage_views;
     vk::ImageView depth_view;
     vk::ImageView stencil_view;
     vk::ImageView color_view;
-    vk::Image null_image;
     VkImage image_handle = VK_NULL_HANDLE;
     VkImageView render_target = VK_NULL_HANDLE;
     VkSampleCountFlagBits samples = VK_SAMPLE_COUNT_1_BIT;
@@ -311,7 +384,7 @@ public:
     Framebuffer& operator=(const Framebuffer&) = delete;
 
     Framebuffer(Framebuffer&&) = default;
-    Framebuffer& operator=(Framebuffer&&) = default;
+    Framebuffer& operator=(Framebuffer&&) noexcept;
 
     void CreateFramebuffer(TextureCacheRuntime& runtime,
                            std::span<ImageView*, NUM_RT> color_buffers, ImageView* depth_buffer,
@@ -323,6 +396,19 @@ public:
 
     [[nodiscard]] VkRenderPass RenderPass() const noexcept {
         return renderpass;
+    }
+
+    [[nodiscard]] VkFramebuffer HandleVariant(u32 color_scratch_mask) const;
+    [[nodiscard]] VkRenderPass RenderPassVariant(u32 color_scratch_mask) const;
+
+    [[nodiscard]] u32 DuplicateColorAttachmentMask() const noexcept {
+        return duplicate_color_attachment_mask;
+    }
+
+    [[nodiscard]] u32 ColorScratchMask(u32 color_write_mask) const;
+
+    [[nodiscard]] u32 ColorAttachmentAliasMask(size_t slot) const noexcept {
+        return color_attachment_alias_masks[slot];
     }
 
     [[nodiscard]] VkExtent2D RenderArea() const noexcept {
@@ -337,20 +423,22 @@ public:
         return num_color_buffers;
     }
 
+    // Number of subpass color slots, including gaps before the last valid attachment.
+    [[nodiscard]] u32 NumColorAttachments() const noexcept {
+        return num_color_attachments;
+    }
+
     [[nodiscard]] u32 NumImages() const noexcept {
         return num_images;
     }
 
-    [[nodiscard]] const std::array<VkImage, 9>& Images() const noexcept {
-        return images;
-    }
-
-    [[nodiscard]] const std::array<VkImageSubresourceRange, 9>& ImageRanges() const noexcept {
-        return image_ranges;
-    }
+    [[nodiscard]] std::array<VkImage, 9> Images(u32 color_scratch_mask = 0) const noexcept;
+    [[nodiscard]] std::array<VkImageSubresourceRange, 9> ImageRanges(
+        u32 color_scratch_mask = 0) const noexcept;
 
     [[nodiscard]] bool HasAspectColorBit(size_t index) const noexcept {
-        return (image_ranges.at(rt_map[index]).aspectMask & VK_IMAGE_ASPECT_COLOR_BIT) != 0;
+        return render_pass_key.color_formats.at(index) != PixelFormat::Invalid &&
+               (image_ranges.at(rt_map[index]).aspectMask & VK_IMAGE_ASPECT_COLOR_BIT) != 0;
     }
 
     [[nodiscard]] bool HasAspectDepthBit() const noexcept {
@@ -366,11 +454,31 @@ public:
     }
 
 private:
+    struct ScratchColorAttachment {
+        vk::Image image;
+        vk::ImageView view;
+    };
+
+    void EnsureScratchColorAttachment(size_t slot) const;
+
+    // Framebuffers must be destroyed before the scratch views and images they reference.
+    mutable std::array<ScratchColorAttachment, NUM_RT> scratch_color_attachments{};
+    mutable std::vector<std::pair<u32, vk::Framebuffer>> scratch_framebuffers;
+    mutable std::vector<std::pair<u32, VkRenderPass>> scratch_renderpasses;
+    TextureCacheRuntime* runtime_ptr{};
+    std::array<VkImageView, NUM_RT * 2 + 1> framebuffer_attachments{};
+    u32 framebuffer_layers{1};
+    u32 duplicate_color_attachment_mask{};
+    std::array<u32, NUM_RT> color_attachment_alias_masks{};
+    mutable std::array<u32, NUM_RT> warned_color_attachment_aliases{};
+    mutable u32 last_checked_color_write_mask{~u32{0}};
+    RenderPassKey render_pass_key{};
     vk::Framebuffer framebuffer;
     VkRenderPass renderpass{};
     VkExtent2D render_area{};
     VkSampleCountFlagBits samples = VK_SAMPLE_COUNT_1_BIT;
     u32 num_color_buffers = 0;
+    u32 num_color_attachments = 0;
     u32 num_images = 0;
     std::array<VkImage, 9> images{};
     std::array<VkImageSubresourceRange, 9> image_ranges{};

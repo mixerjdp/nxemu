@@ -1,11 +1,13 @@
 // SPDX-FileCopyrightText: Copyright 2023 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
+#include <chrono>
 #include <cstddef>
 #include <limits>
 #include <map>
 #include <memory>
 #include <span>
+#include <thread>
 #include <type_traits>
 #include <unordered_map>
 #include <utility>
@@ -16,6 +18,7 @@
 #include "yuzu_video_core/engines/draw_manager.h"
 #include "yuzu_video_core/host1x/gpu_device_memory_manager.h"
 #include "yuzu_video_core/query_cache/query_cache.h"
+#include "yuzu_video_core/query_cache/query_bank_operations.h"
 #include "yuzu_video_core/rasterizer_interface.h"
 #include "yuzu_video_core/renderer_vulkan/vk_buffer_cache.h"
 #include "yuzu_video_core/renderer_vulkan/vk_compute_pass.h"
@@ -39,8 +42,8 @@ class SamplesQueryBank : public VideoCommon::BankBase {
 public:
     static constexpr size_t BANK_SIZE = 256;
     static constexpr size_t QUERY_SIZE = 8;
-    explicit SamplesQueryBank(const Device& device_, size_t index_)
-        : BankBase(BANK_SIZE), device{device_}, index{index_} {
+    explicit SamplesQueryBank(const Device& device_, Scheduler& scheduler_, size_t index_)
+        : BankBase(BANK_SIZE), device{device_}, scheduler{scheduler_}, index{index_} {
         const auto& dev = device.GetLogical();
         query_pool = dev.CreateQueryPool({
             .sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO,
@@ -64,19 +67,44 @@ public:
         next_bank = 0;
     }
 
+    // CPU references do not cover commands recorded for an abandoned counter.
+    // Do not host-reset its queries before their GPU submission has completed.
+    void DeferReuseUntil(u64 tick) {
+        reuse_after_tick = std::max(reuse_after_tick, tick);
+    }
+
+    bool IsDead() const {
+        return VideoCommon::BankBase::IsDead() && scheduler.IsFree(reuse_after_tick);
+    }
+
     void Sync(size_t start, size_t size) {
         const auto& dev = device.GetLogical();
-        const VkResult query_result = dev.GetQueryResults(
-            *query_pool, static_cast<u32>(start), static_cast<u32>(size), sizeof(u64) * size,
-            &host_results[start], sizeof(u64), VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT);
-        switch (query_result) {
-        case VK_SUCCESS:
-            return;
-        case VK_ERROR_DEVICE_LOST:
-            device.ReportLoss();
-            [[fallthrough]];
-        default:
-            throw vk::Exception(query_result);
+        // Some drivers record a submitted command buffer on their own thread, and only wait for
+        // the queries recorded so far. Until then the others are not ready.
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds{1};
+        while (true) {
+            const VkResult query_result = dev.GetQueryResults(
+                *query_pool, static_cast<u32>(start), static_cast<u32>(size),
+                sizeof(u64) * size, &host_results[start], sizeof(u64),
+                VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT);
+            switch (query_result) {
+            case VK_SUCCESS:
+                return;
+            case VK_NOT_READY:
+                if (std::chrono::steady_clock::now() < deadline) {
+                    std::this_thread::sleep_for(std::chrono::microseconds{100});
+                    continue;
+                }
+                // Never written: the available results were stored, the others stay as they were.
+                LOG_WARNING(Render_Vulkan, "Occlusion query results never became available");
+                return;
+            case VK_ERROR_DEVICE_LOST:
+                // The queries will never finish, so their results stay empty.
+                device.ReportLoss();
+                return;
+            default:
+                throw vk::Exception(query_result);
+            }
         }
     }
 
@@ -96,7 +124,9 @@ public:
 
 private:
     const Device& device;
+    Scheduler& scheduler;
     const size_t index;
+    u64 reuse_after_tick{};
     vk::QueryPool query_pool;
     std::array<u64, BANK_SIZE> host_results;
 };
@@ -148,9 +178,12 @@ public:
     ~SamplesStreamer() = default;
 
     void StartCounter() override {
-        if (has_started) {
+        counter_enabled = true;
+        if (has_started || !scheduler.IsInsideRenderPass()) {
             return;
         }
+        // A host query stays within one render pass. The existing query accumulator
+        // sums its segments when a guest counter spans several passes.
         ReserveHostQuery();
         scheduler.Record([query_pool = current_query_pool,
                           query_index = current_bank_slot](vk::CommandBuffer cmdbuf) {
@@ -162,9 +195,25 @@ public:
     }
 
     void PauseCounter() override {
+        counter_enabled = false;
+        EndQuery();
+    }
+
+    void NotifyRenderPass(bool begin) override {
+        if (begin) {
+            if (counter_enabled) {
+                StartCounter();
+            }
+        } else {
+            EndQuery();
+        }
+    }
+
+    void EndQuery() {
         if (!has_started) {
             return;
         }
+        ASSERT(scheduler.IsInsideRenderPass());
         scheduler.Record([query_pool = current_query_pool,
                           query_index = current_bank_slot](vk::CommandBuffer cmdbuf) {
             cmdbuf.EndQuery(query_pool, static_cast<u32>(query_index));
@@ -175,6 +224,12 @@ public:
     void ResetCounter() override {
         if (has_started) {
             PauseCounter();
+        }
+        if (current_query) {
+            const u64 tick = scheduler.CurrentTick();
+            ApplyBankOp(current_query, [tick](SamplesQueryBank* bank, size_t, size_t) {
+                bank->DeferReuseUntil(tick);
+            });
         }
         AbandonCurrentQuery();
         std::function<void()> func([this, counts = pending_flush_queries.size()] {
@@ -192,7 +247,7 @@ public:
     }
 
     bool HasPendingSync() const override {
-        return !pending_sync.empty();
+        return !pending_sync.empty() || NeedsCheckpoint();
     }
 
     void SyncWrites() override {
@@ -209,7 +264,8 @@ public:
     }
 
     void PresyncWrites() override {
-        if (pending_sync.empty()) {
+        const bool checkpoint = pending_sync.empty() && NeedsCheckpoint();
+        if (pending_sync.empty() && !checkpoint) {
             return;
         }
         PauseCounter();
@@ -219,6 +275,12 @@ public:
             pending_sync.clear();
             sync_values_stash.clear();
             return;
+        }
+        if (checkpoint) {
+            // Reduce the live counter without publishing a guest write. The
+            // replicated query below pins the banks until their fence completes.
+            num_slots_used = current_query->size_slots;
+            pending_sync.push_back(current_query_id);
         }
         sync_values_stash.clear();
         sync_values_stash.emplace_back();
@@ -232,6 +294,10 @@ public:
 
         ApplyBanksWideOp<true>(pending_sync, [&](SamplesQueryBank* bank, size_t start,
                                                  size_t amount) {
+            // CPU result availability is not GPU copy completion. Keep the pool
+            // alive until this CopyQueryPoolResults submission finishes, even if
+            // the readback thread releases its last logical query reference.
+            bank->DeferReuseUntil(scheduler.CurrentTick());
             size_t bank_id = bank->GetIndex();
             auto& resolve_buffer = buffers[resolve_buffer_index];
             VkQueryPool query_pool = bank->GetInnerPool();
@@ -279,6 +345,9 @@ public:
                 }
                 sync_value_slot = 1;
             }
+            if (True(query->flags & VideoCommon::QueryFlagBits::IsOrphan)) {
+                continue;
+            }
             query->flags |= VideoCommon::QueryFlagBits::IsHostSynced;
             auto loc_data = offsets[query->start_bank_id];
             sync_values_stash[sync_value_slot].emplace_back(HostSyncValues{
@@ -292,9 +361,15 @@ public:
 
         if (has_multi_queries) {
             const size_t min_accumulation_limit =
-                std::min(first_accumulation_checkpoint, num_slots_used);
+                checkpoint ? num_slots_used : std::min(first_accumulation_checkpoint, num_slots_used);
             const size_t max_accumulation_limit =
-                std::max(last_accumulation_checkpoint, num_slots_used);
+                checkpoint ? num_slots_used : std::max(last_accumulation_checkpoint, num_slots_used);
+            if (checkpoint && !accumulation_since_last_sync) {
+                scheduler.RequestOutsideRenderPassOperationContext();
+                scheduler.Record([buffer = *accumulation_buffer](vk::CommandBuffer cmdbuf) {
+                    cmdbuf.FillBuffer(buffer, 0, 8, 0);
+                });
+            }
             const size_t intermediary_buffer_index = ObtainBuffer<false>(num_slots_used);
             resolve_buffers.push_back(intermediary_buffer_index);
             queries_prefix_scan_pass->Run(*accumulation_buffer, *buffers[intermediary_buffer_index],
@@ -384,23 +459,23 @@ public:
     }
 
 private:
+    bool NeedsCheckpoint() const {
+        // An enabled counter can span arbitrarily many render passes without a
+        // guest report. Periodically fold its segments into the existing sum.
+        static constexpr size_t MAX_RETAINED_SLOTS = 8192;
+        const auto driver = device.GetDriverID();
+        return driver != VK_DRIVER_ID_QUALCOMM_PROPRIETARY &&
+               driver != VK_DRIVER_ID_ARM_PROPRIETARY && driver != VK_DRIVER_ID_MESA_TURNIP &&
+               device.IsSubgroupFeatureSupported(VK_SUBGROUP_FEATURE_BASIC_BIT) &&
+               device.IsSubgroupFeatureSupported(VK_SUBGROUP_FEATURE_ARITHMETIC_BIT) &&
+               device.IsSubgroupFeatureSupported(VK_SUBGROUP_FEATURE_SHUFFLE_BIT) &&
+               device.IsSubgroupFeatureSupported(VK_SUBGROUP_FEATURE_SHUFFLE_RELATIVE_BIT) &&
+               current_query && current_query->size_slots >= MAX_RETAINED_SLOTS;
+    }
+
     template <typename Func>
     void ApplyBankOp(VideoCommon::HostQueryBase* query, Func&& func) {
-        size_t size_slots = query->size_slots;
-        if (size_slots == 0) {
-            return;
-        }
-        size_t bank_id = query->start_bank_id;
-        size_t banks_set = query->size_banks;
-        size_t start_slot = query->start_slot;
-        for (size_t i = 0; i < banks_set; i++) {
-            auto& the_bank = bank_pool.GetBank(bank_id);
-            size_t amount = std::min(the_bank.Size() - start_slot, size_slots);
-            func(&the_bank, start_slot, amount);
-            bank_id = the_bank.next_bank - 1;
-            start_slot = 0;
-            size_slots -= amount;
-        }
+        VideoCommon::ApplyQueryBankOp(*query, bank_pool, std::forward<Func>(func));
     }
 
     template <bool is_ordered, typename Func>
@@ -428,7 +503,7 @@ private:
     void ReserveBank() {
         current_bank_id =
             bank_pool.ReserveBank([this](std::deque<SamplesQueryBank>& queue, size_t index) {
-                queue.emplace_back(device, index);
+                queue.emplace_back(device, scheduler, index);
             });
         if (current_bank) {
             current_bank->next_bank = current_bank_id + 1;
@@ -447,20 +522,15 @@ private:
     }
 
     void ReserveHostQuery() {
+        const bool starts_new_bank = !current_bank || current_bank->IsClosed();
         size_t new_slot = ReserveBankSlot();
         current_bank->AddReference(1);
         num_slots_used++;
         if (current_query) {
-            size_t bank_id = current_query->start_bank_id;
-            size_t banks_set = current_query->size_banks - 1;
-            bool found = bank_id == current_bank_id;
-            while (!found && banks_set > 0) {
-                SamplesQueryBank& some_bank = bank_pool.GetBank(bank_id);
-                bank_id = some_bank.next_bank - 1;
-                found = bank_id == current_bank_id;
-                banks_set--;
-            }
-            if (!found) {
+            // Reservations append to the current query, so its last bank is always
+            // current_bank before ReserveBankSlot. Only a bank rollover extends
+            // the chain; walking it on every render pass makes long counters quadratic.
+            if (starts_new_bank) {
                 current_query->size_banks++;
             }
             current_query->size_slots++;
@@ -585,6 +655,7 @@ private:
     bool accumulation_since_last_sync{};
     VideoCommon::HostQueryBase* current_query;
     bool has_started{};
+    bool counter_enabled{};
     std::mutex flush_guard;
 
     std::unique_ptr<QueriesPrefixScanPass> queries_prefix_scan_pass;
@@ -651,9 +722,10 @@ class TFBCounterStreamer : public BaseStreamer {
 public:
     explicit TFBCounterStreamer(size_t id_, QueryCacheRuntime& runtime_, const Device& device_,
                                 Scheduler& scheduler_, const MemoryAllocator& memory_allocator_,
-                                StagingBufferPool& staging_pool_)
+                                StagingBufferPool& staging_pool_, BufferCacheRuntime& buffer_runtime_)
         : BaseStreamer(id_), runtime{runtime_}, device{device_}, scheduler{scheduler_},
-          memory_allocator{memory_allocator_}, staging_pool{staging_pool_} {
+          memory_allocator{memory_allocator_}, staging_pool{staging_pool_},
+          buffer_runtime{buffer_runtime_} {
         buffers_count = 0;
         current_bank = nullptr;
         counter_buffers.fill(VK_NULL_HANDLE);
@@ -755,6 +827,13 @@ public:
             return index;
         }
         const size_t subreport = static_cast<size_t>(*subreport_);
+        if (!device.IsExtTransformFeedbackSupported()) {
+            // The pipelines writing what transform feedback captures count its bytes on the CPU
+            const auto& buffers{buffer_runtime.EmulatedTransformFeedbackBuffers()};
+            new_query->value = subreport < buffers.size() ? buffers[subreport].written : 0;
+            new_query->flags |= VideoCommon::QueryFlagBits::IsFinalValueSynced;
+            return index;
+        }
         last_queries[subreport] = address;
         if ((streams_mask & (1ULL << subreport)) == 0) {
             new_query->flags |= VideoCommon::QueryFlagBits::IsFinalValueSynced;
@@ -955,6 +1034,7 @@ private:
     Scheduler& scheduler;
     const MemoryAllocator& memory_allocator;
     StagingBufferPool& staging_pool;
+    BufferCacheRuntime& buffer_runtime;
     VideoCommon::BankPool<TFBQueryBank> bank_pool;
     size_t current_bank_id;
     TFBQueryBank* current_bank;
@@ -1170,7 +1250,7 @@ struct QueryCacheRuntimeImpl {
                           device, scheduler, memory_allocator, compute_pass_descriptor_queue,
                           descriptor_pool),
           tfb_streamer(static_cast<size_t>(QueryType::StreamingByteCount), runtime, device,
-                       scheduler, memory_allocator, staging_pool),
+                       scheduler, memory_allocator, staging_pool, buffer_cache_.runtime),
           primitives_succeeded_streamer(
               static_cast<size_t>(QueryType::StreamingPrimitivesSucceeded), runtime, tfb_streamer,
               device_memory_),
@@ -1298,9 +1378,11 @@ void QueryCacheRuntime::HostConditionalRenderingCompareValueImpl(VideoCommon::Lo
         impl->hcr_buffer = buffer->Handle();
         impl->hcr_offset = offset;
     }
+    const VkConditionalRenderingFlagsEXT flags =
+        is_equal ? VK_CONDITIONAL_RENDERING_INVERTED_BIT_EXT : 0;
     if (impl->hcr_is_set) {
         if (impl->hcr_setup.buffer == impl->hcr_buffer &&
-            impl->hcr_setup.offset == impl->hcr_offset) {
+            impl->hcr_setup.offset == impl->hcr_offset && impl->hcr_setup.flags == flags) {
             ResumeHostConditionalRendering();
             return;
         }
@@ -1308,7 +1390,7 @@ void QueryCacheRuntime::HostConditionalRenderingCompareValueImpl(VideoCommon::Lo
     }
     impl->hcr_setup.buffer = impl->hcr_buffer;
     impl->hcr_setup.offset = impl->hcr_offset;
-    impl->hcr_setup.flags = is_equal ? VK_CONDITIONAL_RENDERING_INVERTED_BIT_EXT : 0;
+    impl->hcr_setup.flags = flags;
     impl->hcr_is_set = true;
     impl->is_hcr_running = false;
     ResumeHostConditionalRendering();
@@ -1391,13 +1473,12 @@ bool QueryCacheRuntime::HostConditionalRenderingCompareValues(VideoCommon::Looku
     }
 
     const bool is_gpu_high = Settings::IsGPULevelHigh();
-    if (!is_gpu_high && impl->device.GetDriverID() == VK_DRIVER_ID_INTEL_PROPRIETARY_WINDOWS) {
-        return true;
-    }
-
-    auto driver_id = impl->device.GetDriverID();
-    if (driver_id == VK_DRIVER_ID_QUALCOMM_PROPRIETARY ||
+    const auto driver_id = impl->device.GetDriverID();
+    if ((!is_gpu_high && driver_id == VK_DRIVER_ID_INTEL_PROPRIETARY_WINDOWS) ||
+        driver_id == VK_DRIVER_ID_QUALCOMM_PROPRIETARY ||
         driver_id == VK_DRIVER_ID_ARM_PROPRIETARY || driver_id == VK_DRIVER_ID_MESA_TURNIP) {
+        // Do not let an earlier host condition leak into the guest's fast path.
+        EndHostConditionalRendering();
         return true;
     }
 
@@ -1414,11 +1495,13 @@ bool QueryCacheRuntime::HostConditionalRenderingCompareValues(VideoCommon::Looku
     }
 
     if (!is_gpu_high) {
+        EndHostConditionalRendering();
         return true;
     }
 
     if (!is_in_bc[0] && !is_in_bc[1]) {
         // Both queries are in query cache, it's best to just flush.
+        EndHostConditionalRendering();
         return true;
     }
     HostConditionalRenderingCompareBCImpl(object_1.address, equal_check);
@@ -1446,7 +1529,8 @@ VideoCommon::StreamerInterface* QueryCacheRuntime::GetStreamerInterface(QueryTyp
     }
 }
 
-void QueryCacheRuntime::Barriers(bool is_prebarrier) {
+namespace {
+void QueryCopyBarrier(vk::CommandBuffer cmdbuf, bool is_prebarrier) {
     static constexpr VkMemoryBarrier READ_BARRIER{
         .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
         .pNext = nullptr,
@@ -1459,18 +1543,21 @@ void QueryCacheRuntime::Barriers(bool is_prebarrier) {
         .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
         .dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT,
     };
-    impl->scheduler.RequestOutsideRenderPassOperationContext();
     if (is_prebarrier) {
-        impl->scheduler.Record([](vk::CommandBuffer cmdbuf) {
-            cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
-                                   VK_PIPELINE_STAGE_TRANSFER_BIT, 0, READ_BARRIER);
-        });
+        cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                               0, READ_BARRIER);
     } else {
-        impl->scheduler.Record([](vk::CommandBuffer cmdbuf) {
-            cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_TRANSFER_BIT,
-                                   VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, WRITE_BARRIER);
-        });
+        cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                               0, WRITE_BARRIER);
     }
+}
+} // namespace
+
+void QueryCacheRuntime::Barriers(bool is_prebarrier) {
+    impl->scheduler.RequestOutsideRenderPassOperationContext();
+    impl->scheduler.Record([is_prebarrier](vk::CommandBuffer cmdbuf) {
+        QueryCopyBarrier(cmdbuf, is_prebarrier);
+    });
 }
 
 template <typename SyncValuesType>
@@ -1522,6 +1609,7 @@ void QueryCacheRuntime::SyncValues(std::span<SyncValuesType> values, VkBuffer ba
             const auto post_op = VideoCommon::ObtainBufferOperation::DoNothing;
             const auto [buffer, offset] = impl->buffer_cache.ObtainCPUBuffer(
                 pair.first, static_cast<u32>(pair.second - pair.first), sync_info, post_op);
+            buffer->MarkUsage(offset, pair.second - pair.first);
             impl->buffers_to_upload_to.emplace_back(buffer->Handle(), offset);
         }
     });
@@ -1560,13 +1648,22 @@ void QueryCacheRuntime::SyncValues(std::span<SyncValuesType> values, VkBuffer ba
         src_buffer = base_src_buffer;
     }
 
+    for (const auto& [buffer, offset] : impl->buffers_to_upload_to) {
+        impl->scheduler.MarkBufferWrite(buffer);
+    }
+    // Query destinations may still be in use by shaders or indirect draws. Order that
+    // usage before overwriting them, then make the copied results visible to consumers.
+    // Keep the barrier/copy/barrier sequence in one worker command. Nothing can be
+    // interleaved between these operations, and the memory dependencies stay identical.
     impl->scheduler.RequestOutsideRenderPassOperationContext();
     impl->scheduler.Record([src_buffer, dst_buffers = std::move(impl->buffers_to_upload_to),
                             vk_copies = std::move(impl->copies_setup)](vk::CommandBuffer cmdbuf) {
+        QueryCopyBarrier(cmdbuf, true);
         size_t size = dst_buffers.size();
         for (size_t i = 0; i < size; i++) {
             cmdbuf.CopyBuffer(src_buffer, dst_buffers[i].first, vk_copies[i]);
         }
+        QueryCopyBarrier(cmdbuf, false);
     });
 }
 

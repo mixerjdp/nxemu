@@ -3,8 +3,10 @@
 
 #pragma once
 
+#include <deque>
+#include <list>
 #include <mutex>
-
+#include <stack>
 #include "yuzu_common/math_util.h"
 #include "core/hle/service/apm/apm_controller.h"
 #include "core/hle/service/caps/caps_types.h"
@@ -13,15 +15,18 @@
 #include "core/hle/service/service.h"
 
 #include "core/hle/service/am/am_types.h"
-#include "core/hle/service/am/applet_message_queue.h"
+#include "core/hle/service/am/lifecycle_manager.h"
 #include "core/hle/service/am/display_layer_manager.h"
 #include "core/hle/service/am/hid_registration.h"
 #include "core/hle/service/am/process.h"
 
 namespace Service::AM {
 
+class IStorage;
+
 struct Applet {
-    explicit Applet(Core::System& system, std::unique_ptr<Process> process_);
+    explicit Applet(Core::System& system, std::unique_ptr<Process> process_, bool is_application,
+                    Kernel::KProcess* lifecycle_process_ = nullptr);
     ~Applet();
 
     // Lock
@@ -30,11 +35,16 @@ struct Applet {
     // Event creation helper
     KernelHelpers::ServiceContext context;
 
-    // Applet message queue
-    AppletMessageQueue message_queue;
+    LifecycleManager lifecycle_manager;
 
     // Process
     std::unique_ptr<Process> process;
+    Kernel::KProcess* lifecycle_process{};
+    bool is_activity_runnable{true};
+    bool is_activity_state_applied{};
+    bool is_pad_interactible{true};
+    bool is_touch_interactible{true};
+    bool window_visible{true};
 
     // Creation state
     AppletId applet_id{};
@@ -43,6 +53,7 @@ struct Applet {
     AppletType type{};
     ProgramId program_id{};
     LibraryAppletMode library_applet_mode{};
+    s32 program_index{};
     s32 previous_program_index{-1};
     ScreenshotPermission previous_screenshot_permission{ScreenshotPermission::Enable};
 
@@ -62,6 +73,8 @@ struct Applet {
     Common::Rectangle<f32> display_magnification{0, 0, 1, 1};
     bool home_button_double_click_enabled{};
     bool home_button_short_pressed_blocked{};
+    bool overlay_watching_short_home_button{};
+    bool overlay_handling_touch_input{};
     bool home_button_long_pressed_blocked{};
     bool vr_mode_curtain_required{};
     bool sleep_required_by_high_temperature{};
@@ -74,12 +87,13 @@ struct Applet {
     // Application functions
     bool game_play_recording_supported{};
     GamePlayRecordingState game_play_recording_state{GamePlayRecordingState::Disabled};
+    bool media_playback_state{};
     bool jit_service_launched{};
     bool is_running{};
     bool application_crash_report_enabled{};
+    s32 hdcp_authentication_state{};
 
     // Common state
-    FocusState focus_state{};
     bool sleep_lock_enabled{};
     bool vr_mode_enabled{};
     bool lcd_backlight_off_enabled{};
@@ -89,19 +103,16 @@ struct Applet {
     // Channels
     std::deque<std::vector<u8>> user_channel_launch_parameter{};
     std::deque<std::vector<u8>> preselected_user_launch_parameter{};
+    std::stack<std::shared_ptr<IStorage>> context_stack{};
 
     // Caller applet
     std::weak_ptr<Applet> caller_applet{};
     std::shared_ptr<AppletDataBroker> caller_applet_broker{};
+    std::list<std::shared_ptr<Applet>> child_applets{};
 
     // Self state
     bool exit_locked{};
     s32 fatal_section_count{};
-    bool operation_mode_changed_notification_enabled{true};
-    bool performance_mode_changed_notification_enabled{true};
-    FocusHandlingMode focus_handling_mode{};
-    bool restart_message_enabled{};
-    bool out_of_focus_suspension_enabled{true};
     Capture::AlbumImageOrientation album_image_orientation{};
     bool handles_request_to_display{};
     ScreenshotPermission screenshot_permission{};
@@ -116,6 +127,8 @@ struct Applet {
     Event friend_invitation_storage_channel_event;
     Event notification_storage_channel_event;
     Event health_warning_disappeared_system_event;
+    Event hdcp_authentication_state_changed_event;
+    Event unknown_event;
     Event acquired_sleep_lock_event;
     Event pop_from_general_channel_event;
     Event library_applet_launchable_event;
@@ -124,6 +137,10 @@ struct Applet {
 
     // Frontend state
     std::shared_ptr<Frontend::FrontendApplet> frontend{};
+
+    void UpdateSuspensionStateLocked(bool force_message);
+    void SetInteractibleLocked(bool pad_interactible, bool touch_interactible);
+    void SetAppletResourceUserId(AppletResourceUserId new_aruid);
 };
 
 } // namespace Service::AM

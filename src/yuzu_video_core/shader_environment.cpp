@@ -1,11 +1,17 @@
 // SPDX-FileCopyrightText: Copyright 2021 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include "yuzu_video_core/shader_profile_sph.h"
+#include "yuzu_video_core/shader_profile_hash.h"
 #include <algorithm>
+#include <boost/container/static_vector.hpp>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <memory>
 #include <optional>
+#include <sstream>
+#include "yuzu_video_core/pipeline_cache_store.h"
 #include <utility>
 
 #include "yuzu_common/yuzu_assert.h"
@@ -17,6 +23,7 @@
 #include "yuzu_common/logging/log.h"
 #include "yuzu_common/polyfill_ranges.h"
 #include "yuzu_shader_recompiler/environment.h"
+#include "yuzu_shader_recompiler/exception.h"
 #include "yuzu_video_core/engines/kepler_compute.h"
 #include "yuzu_video_core/memory_manager.h"
 #include "yuzu_video_core/shader_environment.h"
@@ -35,7 +42,47 @@ static u64 MakeCbufKey(u32 index, u32 offset) {
     return (static_cast<u64>(index) << 32) | offset;
 }
 
-static Shader::TextureType ConvertTextureType(const Tegra::Texture::TICEntry& entry) {
+// Reserved keys outside the guest address space; they keep the cache layout unchanged.
+constexpr u64 POOL_TEXTURES_KEY = (u64{UINT32_MAX} << 32) | (UINT32_MAX - 1);
+constexpr u64 POOL_SAMPLERS_KEY = (u64{UINT32_MAX} << 32) | (UINT32_MAX - 2);
+constexpr u32 POOL_LINKED_SAMPLERS_BIT = 1U << 31;
+
+Shader::TexturePoolInfo GraphicsTexturePoolInfo(const Maxwell& regs) {
+    // Handles hold a 20 bit texture index and a 12 bit sampler index.
+    const u32 num_textures = std::min(regs.tex_header.limit + 1U, 1U << 20);
+    const bool linked = regs.sampler_binding == Maxwell::SamplerBinding::ViaHeaderBinding;
+    return {
+        .num_textures = num_textures,
+        .num_samplers = linked ? num_textures : std::min(regs.tex_sampler.limit + 1U, 1U << 12),
+        .linked_samplers = linked,
+    };
+}
+
+static u32 CbufSizeQueryMask(const std::unordered_map<u64, u32>& values) {
+    u32 mask{values.contains(POOL_TEXTURES_KEY) ? TEXTURE_POOL_SIZE_BIT : 0U};
+    for (const auto& [key, value] : values) {
+        const u32 bank = static_cast<u32>(key >> 32);
+        if (static_cast<u32>(key) == UINT32_MAX && bank < 32) {
+            mask |= 1U << bank;
+        }
+    }
+    return mask;
+}
+
+u32 GenericEnvironment::CbufSizeMask() const noexcept {
+    return CbufSizeQueryMask(cbuf_values);
+}
+
+u32 FileEnvironment::CbufSizeMask() const noexcept {
+    return CbufSizeQueryMask(cbuf_values);
+}
+
+static Shader::TextureType ConvertTextureType(
+    const std::optional<Tegra::Texture::TICEntry>& optional_entry) {
+    if (!optional_entry) {
+        return Shader::TextureType::Color2D;
+    }
+    const Tegra::Texture::TICEntry& entry{*optional_entry};
     switch (entry.texture_type) {
     case Tegra::Texture::TextureType::Texture1D:
         return Shader::TextureType::Color1D;
@@ -61,7 +108,12 @@ static Shader::TextureType ConvertTextureType(const Tegra::Texture::TICEntry& en
     }
 }
 
-static Shader::TexturePixelFormat ConvertTexturePixelFormat(const Tegra::Texture::TICEntry& entry) {
+static Shader::TexturePixelFormat ConvertTexturePixelFormat(
+    const std::optional<Tegra::Texture::TICEntry>& optional_entry) {
+    if (!optional_entry) {
+        return Shader::TexturePixelFormat::A8B8G8R8_UNORM;
+    }
+    const Tegra::Texture::TICEntry& entry{*optional_entry};
     return static_cast<Shader::TexturePixelFormat>(
         PixelFormatFromTextureInfo(entry.format, entry.r_type, entry.g_type, entry.b_type,
                                    entry.a_type, entry.srgb_conversion));
@@ -142,8 +194,13 @@ u64 GenericEnvironment::ReadInstruction(u32 address) {
     read_lowest = std::min(read_lowest, address);
     read_highest = std::max(read_highest, address);
 
-    if (address >= cached_lowest && address < cached_highest) {
-        return code[(address - cached_lowest) / INST_SIZE];
+    if (address >= cached_lowest &&
+        address <= cached_highest) {
+        return Code()[(address - cached_lowest) / INST_SIZE];
+    }
+    if (frozen) {
+        throw Shader::LogicError("Frozen shader environment requested uncached instruction 0x{:x}",
+                                 address);
     }
     has_unbound_instructions = true;
     return gpu_memory->Read<u64>(program_base + address);
@@ -161,9 +218,26 @@ std::optional<u64> GenericEnvironment::Analyze() {
 
 void GenericEnvironment::SetCachedSize(size_t size_bytes) {
     cached_lowest = start_address;
-    cached_highest = start_address + static_cast<u32>(size_bytes);
+    ASSERT(size_bytes >= INST_SIZE && size_bytes % INST_SIZE == 0);
+    cached_highest = start_address + static_cast<u32>(size_bytes - INST_SIZE);
     code.resize(CachedSizeWords());
     gpu_memory->ReadBlock(program_base + cached_lowest, code.data(), code.size() * sizeof(u64));
+}
+
+void GenericEnvironment::SetCachedCode(std::shared_ptr<const std::vector<u64>> code_,
+                                       size_t size_bytes) {
+    cached_lowest = start_address;
+    ASSERT(size_bytes >= INST_SIZE && size_bytes % INST_SIZE == 0);
+    cached_highest = start_address + static_cast<u32>(size_bytes - INST_SIZE);
+    shared_code = std::move(code_);
+}
+
+std::shared_ptr<const std::vector<u64>> GenericEnvironment::ShareCachedCode(size_t size_bytes) {
+    // size_bytes includes the final instruction. Share exactly this range
+    // until ShaderCache invalidates this ShaderInfo.
+    SetCachedSize(size_bytes);
+    shared_code = std::make_shared<const std::vector<u64>>(std::move(code));
+    return shared_code;
 }
 
 size_t GenericEnvironment::CachedSizeWords() const noexcept {
@@ -190,10 +264,10 @@ u64 GenericEnvironment::CalculateHash() const {
 }
 
 void GenericEnvironment::Dump(u64 pipeline_hash, u64 shader_hash) {
-    DumpImpl(pipeline_hash, shader_hash, code, read_highest, read_lowest, initial_offset, stage);
+    DumpImpl(pipeline_hash, shader_hash, Code(), read_highest, read_lowest, initial_offset, stage);
 }
 
-void GenericEnvironment::Serialize(std::ofstream& file) const {
+void GenericEnvironment::Serialize(std::ostream& file) const {
     const u64 code_size{static_cast<u64>(CachedSizeBytes())};
     const u64 num_texture_types{static_cast<u64>(texture_types.size())};
     const u64 num_texture_pixel_formats{static_cast<u64>(texture_pixel_formats.size())};
@@ -215,7 +289,7 @@ void GenericEnvironment::Serialize(std::ofstream& file) const {
         .write(reinterpret_cast<const char*>(&viewport_transform_state),
                sizeof(viewport_transform_state))
         .write(reinterpret_cast<const char*>(&stage), sizeof(stage))
-        .write(reinterpret_cast<const char*>(code.data()), code_size);
+        .write(reinterpret_cast<const char*>(Code().data()), code_size);
     for (const auto& [key, type] : texture_types) {
         file.write(reinterpret_cast<const char*>(&key), sizeof(key))
             .write(reinterpret_cast<const char*>(&type), sizeof(type));
@@ -271,10 +345,14 @@ std::optional<u64> GenericEnvironment::TryFindSize() {
     return std::nullopt;
 }
 
-Tegra::Texture::TICEntry GenericEnvironment::ReadTextureInfo(GPUVAddr tic_addr, u32 tic_limit,
-                                                             bool via_header_index, u32 raw) {
+std::optional<Tegra::Texture::TICEntry> GenericEnvironment::ReadTextureInfo(
+    GPUVAddr tic_addr, u32 tic_limit, bool via_header_index, u32 raw) {
     const auto handle{Tegra::Texture::TexturePair(raw, via_header_index)};
-    ASSERT(handle.first <= tic_limit);
+    if (handle.first > tic_limit) {
+        // Games leave unused sampler slots with an invalid handle, such as 0xFFFFFFFF
+        LOG_DEBUG(HW_GPU, "Invalid texture handle=0x{:08x}", raw);
+        return std::nullopt;
+    }
     const GPUVAddr descriptor_addr{tic_addr + handle.first * sizeof(Tegra::Texture::TICEntry)};
     Tegra::Texture::TICEntry entry;
     gpu_memory->ReadBlock(descriptor_addr, &entry, sizeof(entry));
@@ -284,9 +362,21 @@ Tegra::Texture::TICEntry GenericEnvironment::ReadTextureInfo(GPUVAddr tic_addr, 
 GraphicsEnvironment::GraphicsEnvironment(Tegra::Engines::Maxwell3D& maxwell3d_,
                                          Tegra::MemoryManager& gpu_memory_,
                                          Maxwell::ShaderType program, GPUVAddr program_base_,
-                                         u32 start_address_)
+                                         u32 start_address_,
+                                         std::shared_ptr<const std::vector<u64>> cached_code,
+                                         size_t cached_size)
     : GenericEnvironment{gpu_memory_, program_base_, start_address_}, maxwell3d{&maxwell3d_} {
-    gpu_memory->ReadBlock(program_base + start_address, &sph, sizeof(sph));
+    if (cached_code && cached_code->size() * sizeof(u64) >= sizeof(sph)) {
+        // ShaderCache owns validated immutable bytecode. Re-reading its header
+        // through ReadBlock could synchronize guest memory on every variant.
+        std::memcpy(&sph, cached_code->data(), sizeof(sph));
+        SetCachedCode(std::move(cached_code), cached_size);
+    } else {
+        gpu_memory->ReadBlock(program_base + start_address, &sph, sizeof(sph));
+        if (cached_code) {
+            SetCachedCode(std::move(cached_code), cached_size);
+        }
+    }
     initial_offset = sizeof(sph);
     gp_passthrough_mask = maxwell3d->regs.post_vtg_shader_attrib_skip_mask;
     switch (program) {
@@ -327,15 +417,244 @@ GraphicsEnvironment::GraphicsEnvironment(Tegra::Engines::Maxwell3D& maxwell3d_,
         maxwell3d->engine_state == Tegra::Engines::Maxwell3D::EngineHint::OnHLEMacro;
 }
 
-u32 GraphicsEnvironment::ReadCbufValue(u32 cbuf_index, u32 cbuf_offset) {
-    const auto& cbuf{maxwell3d->state.shader_stages[stage_index].const_buffers[cbuf_index]};
-    ASSERT(cbuf.enabled);
-    u32 value{};
-    if (cbuf_offset < cbuf.size) {
-        value = gpu_memory->Read<u32>(cbuf.address + cbuf_offset);
+u32 GraphicsEnvironment::ReadCbufSize(u32 cbuf_index) {
+    const u32 size = snapshot
+        ? (snapshot->constant_buffers[stage_index][cbuf_index].enabled
+               ? snapshot->constant_buffers[stage_index][cbuf_index].size : 0)
+        : (maxwell3d->state.shader_stages[stage_index].const_buffers[cbuf_index].enabled
+               ? maxwell3d->state.shader_stages[stage_index].const_buffers[cbuf_index].size : 0);
+    // Reserved offset outside the guest address space; keeps cache layout unchanged.
+    if (recording_queries) cbuf_values.emplace(MakeCbufKey(cbuf_index, UINT32_MAX), size);
+    return size;
+}
+
+namespace {
+// Compares guest memory with a previous copy without allocating.
+bool GuestMemoryEquals(Tegra::MemoryManager& gpu_memory, GPUVAddr address, const void* data,
+                       size_t size) {
+    std::array<u8, 4096> chunk;
+    const u8* expected = static_cast<const u8*>(data);
+    for (size_t offset = 0; offset < size; offset += chunk.size()) {
+        const size_t chunk_size = std::min(chunk.size(), size - offset);
+        gpu_memory.ReadBlockUnsafe(address + offset, chunk.data(), chunk_size);
+        if (std::memcmp(chunk.data(), expected + offset, chunk_size) != 0) {
+            return false;
+        }
     }
-    cbuf_values.emplace(MakeCbufKey(cbuf_index, cbuf_offset), value);
+    return true;
+}
+
+// A bound constant buffer can extend past the memory mapped behind it. Read only the
+// backed pages and zero the rest, as a synchronous read of those offsets returns zero.
+void ReadBackedBlock(Tegra::MemoryManager& gpu_memory, GPUVAddr address, u8* dest,
+                     size_t size) {
+    constexpr size_t page_size = 4096;
+    size_t offset = 0;
+    while (offset < size) {
+        const bool backed = gpu_memory.GetPointer(address + offset) != nullptr;
+        size_t run = 0;
+        do {
+            const GPUVAddr page_addr = address + offset + run;
+            run += std::min(size - offset - run,
+                            page_size - static_cast<size_t>(page_addr & (page_size - 1)));
+        } while (offset + run < size &&
+                 (gpu_memory.GetPointer(address + offset + run) != nullptr) == backed);
+        if (backed) {
+            gpu_memory.ReadBlockUnsafe(address + offset, dest + offset, run);
+        } else {
+            std::memset(dest + offset, 0, run);
+        }
+        offset += run;
+    }
+}
+} // namespace
+
+std::shared_ptr<const GraphicsEnvironment::Snapshot> GraphicsEnvironment::CaptureSnapshot(
+    Tegra::Engines::Maxwell3D& maxwell3d, Tegra::MemoryManager& gpu_memory,
+    u32 active_stage_mask, SnapshotCache& cache) {
+    constexpr size_t MaxConstantBufferSnapshotBytes = 16 * 1024 * 1024;
+    constexpr size_t MaxTextureSnapshotBytes = 16 * 1024 * 1024;
+    Snapshot layout;
+    struct Copy {
+        GPUVAddr address;
+        size_t size;
+        size_t offset;
+    };
+    boost::container::static_vector<Copy, Maxwell::MaxShaderStage * Maxwell::MaxConstBuffers> copies;
+    size_t total_cbuf_size{};
+    for (size_t stage_index = 0; stage_index < maxwell3d.state.shader_stages.size(); ++stage_index) {
+        if ((active_stage_mask & (1U << stage_index)) == 0) {
+            continue;
+        }
+        const auto& stage = maxwell3d.state.shader_stages[stage_index];
+        for (size_t index = 0; index < stage.const_buffers.size(); ++index) {
+            const auto& cbuf = stage.const_buffers[index];
+            auto& dest = layout.constant_buffers[stage_index][index];
+            dest.enabled = cbuf.enabled;
+            dest.size = cbuf.size;
+            if (!cbuf.enabled || cbuf.size == 0) {
+                continue;
+            }
+            const size_t size = static_cast<size_t>(cbuf.size) + sizeof(u32) - 1;
+            // Games commonly bind the same constants to multiple shader stages.
+            const auto it = std::ranges::find_if(copies, [&](const Copy& copy) {
+                return copy.address == cbuf.address && copy.size >= size;
+            });
+            if (it != copies.end()) {
+                dest.data_offset = it->offset;
+                continue;
+            }
+            if (size > MaxConstantBufferSnapshotBytes - total_cbuf_size) {
+                return {};
+            }
+            // The synchronous path reads constant buffers straight from guest
+            // memory too (GraphicsEnvironment::ReadCbufValue), so a buffer the
+            // host GPU has modified gives the same result here. Rejecting such
+            // buffers sent most new pipelines back to synchronous translation.
+            dest.data_offset = total_cbuf_size;
+            copies.push_back({cbuf.address, size, total_cbuf_size});
+            total_cbuf_size += size;
+        }
+    }
+    const size_t texture_count = static_cast<size_t>(maxwell3d.regs.tex_header.limit) + 1;
+    if (texture_count > MaxTextureSnapshotBytes / sizeof(Tegra::Texture::TICEntry)) {
+        return {};
+    }
+    const size_t texture_bytes = texture_count * sizeof(Tegra::Texture::TICEntry);
+    const GPUVAddr texture_address = maxwell3d.regs.tex_header.Address();
+    const bool is_hle = maxwell3d.engine_state == Tegra::Engines::Maxwell3D::EngineHint::OnHLEMacro;
+    const size_t replacement_bytes = is_hle ? maxwell3d.replace_table.size() * 64 : 0;
+    auto result = cache.memory.TryMakeShared<Snapshot>(
+        sizeof(Snapshot) + total_cbuf_size + replacement_bytes, std::move(layout));
+    if (!result) {
+        return {};
+    }
+    // The synchronous path reads descriptors with a flushing ReadBlock. Flush
+    // once here instead of giving up on the asynchronous build.
+    const bool textures_dirty = gpu_memory.IsMemoryDirty(texture_address, texture_bytes);
+    result->constant_buffer_data.resize(total_cbuf_size);
+    for (const auto& copy : copies) {
+        ReadBackedBlock(gpu_memory, copy.address,
+                        result->constant_buffer_data.data() + copy.offset, copy.size);
+    }
+
+    const auto& regs = maxwell3d.regs;
+    result->via_header_index =
+        regs.sampler_binding == Maxwell::SamplerBinding::ViaHeaderBinding;
+    result->texture_pool = GraphicsTexturePoolInfo(regs);
+    result->texture_limit = regs.tex_header.limit;
+    result->viewport_transform_state = regs.viewport_scale_offset_enabled;
+
+    if (textures_dirty) {
+        cache.texture_descriptors.reset();
+    }
+    if (!textures_dirty && cache.texture_descriptors && cache.texture_address == texture_address &&
+        cache.texture_descriptors->size() == texture_count &&
+        GuestMemoryEquals(gpu_memory, texture_address, cache.texture_descriptors->data(),
+                          texture_bytes)) {
+        // New pipelines arrive in bursts with the same descriptor table; sharing
+        // it keeps one copy alive instead of one per queued build.
+        result->texture_descriptors = cache.texture_descriptors;
+    } else {
+        // Stop retaining a stale table before reserving its replacement. Jobs still
+        // using it keep both its storage and its charge alive through shared ownership.
+        cache.texture_descriptors.reset();
+        auto descriptors = cache.memory.TryMakeShared<std::vector<Tegra::Texture::TICEntry>>(
+            texture_bytes, texture_count);
+        if (!descriptors) {
+            return {};
+        }
+        if (textures_dirty) {
+            gpu_memory.ReadBlock(texture_address, descriptors->data(), texture_bytes);
+        } else {
+            gpu_memory.ReadBlockUnsafe(texture_address, descriptors->data(), texture_bytes);
+        }
+        cache.texture_address = texture_address;
+        cache.texture_descriptors = descriptors;
+        result->texture_descriptors = std::move(descriptors);
+    }
+
+    if (is_hle) {
+        result->cbuf_replacements.reserve(maxwell3d.replace_table.size());
+        for (const auto& [key, value] : maxwell3d.replace_table) {
+            const auto converted = [&] {
+                using Type = Tegra::Engines::Maxwell3D::HLEReplacementAttributeType;
+                switch (value) {
+                case Type::BaseVertex:
+                    return Shader::ReplaceConstant::BaseVertex;
+                case Type::BaseInstance:
+                    return Shader::ReplaceConstant::BaseInstance;
+                case Type::DrawID:
+                    return Shader::ReplaceConstant::DrawID;
+                default:
+                    UNREACHABLE();
+                }
+            }();
+            result->cbuf_replacements.emplace(key, converted);
+        }
+    }
+    return result;
+}
+
+void GraphicsEnvironment::SetSnapshot(std::shared_ptr<const Snapshot> snapshot_) {
+    snapshot = std::move(snapshot_);
+    frozen = snapshot != nullptr;
+    if (frozen) {
+        // Workers must never dereference live engine state or guest memory.
+        maxwell3d = nullptr;
+        gpu_memory = nullptr;
+    }
+}
+
+void GraphicsEnvironment::ReleaseSnapshot() {
+    // Only serialization is allowed after this point. Keep the environment frozen.
+    snapshot.reset();
+}
+
+std::optional<Tegra::Texture::TICEntry> GraphicsEnvironment::ReadSnapshotTextureInfo(u32 raw) const {
+    ASSERT(snapshot);
+    const auto handle = Tegra::Texture::TexturePair(raw, snapshot->via_header_index);
+    if (handle.first > snapshot->texture_limit || !snapshot->texture_descriptors ||
+        handle.first >= snapshot->texture_descriptors->size()) {
+        return std::nullopt;
+    }
+    return (*snapshot->texture_descriptors)[handle.first];
+}
+
+u32 GraphicsEnvironment::ReadCbufValue(u32 cbuf_index, u32 cbuf_offset) {
+    u32 value{};
+    if (snapshot) {
+        if (stage_index >= snapshot->constant_buffers.size() ||
+            cbuf_index >= snapshot->constant_buffers[stage_index].size()) {
+            throw Shader::LogicError("Frozen shader requested invalid constant buffer {}", cbuf_index);
+        }
+        const auto& cbuf = snapshot->constant_buffers[stage_index][cbuf_index];
+        if (!cbuf.enabled) {
+            throw Shader::LogicError("Frozen shader requested disabled constant buffer {}", cbuf_index);
+        }
+        if (cbuf_offset < cbuf.size) {
+            std::memcpy(&value,
+                        snapshot->constant_buffer_data.data() + cbuf.data_offset + cbuf_offset,
+                        sizeof(value));
+        }
+    } else {
+        const auto& cbuf{maxwell3d->state.shader_stages[stage_index].const_buffers[cbuf_index]};
+        ASSERT(cbuf.enabled);
+        if (cbuf_offset < cbuf.size) {
+            value = gpu_memory->Read<u32>(cbuf.address + cbuf_offset);
+        }
+    }
+    if (recording_queries) cbuf_values.emplace(MakeCbufKey(cbuf_index, cbuf_offset), value);
     return value;
+}
+
+std::optional<Shader::TexturePoolInfo> GraphicsEnvironment::ReadTexturePoolInfo() {
+    const Shader::TexturePoolInfo pool{snapshot ? snapshot->texture_pool
+                                              : GraphicsTexturePoolInfo(maxwell3d->regs)};
+    if (recording_queries) cbuf_values.emplace(POOL_TEXTURES_KEY, pool.num_textures);
+    if (recording_queries) cbuf_values.emplace(POOL_SAMPLERS_KEY,
+                        pool.num_samplers | (pool.linked_samplers ? POOL_LINKED_SAMPLERS_BIT : 0U));
+    return pool;
 }
 
 std::optional<Shader::ReplaceConstant> GraphicsEnvironment::GetReplaceConstBuffer(u32 bank,
@@ -344,6 +663,14 @@ std::optional<Shader::ReplaceConstant> GraphicsEnvironment::GetReplaceConstBuffe
         return std::nullopt;
     }
     const u64 key = (static_cast<u64>(bank) << 32) | static_cast<u64>(offset);
+    if (snapshot) {
+        const auto it = snapshot->cbuf_replacements.find(key);
+        if (it == snapshot->cbuf_replacements.end()) {
+            return std::nullopt;
+        }
+        if (recording_queries) cbuf_replacements.emplace(key, it->second);
+        return it->second;
+    }
     auto it = maxwell3d->replace_table.find(key);
     if (it == maxwell3d->replace_table.end()) {
         return std::nullopt;
@@ -360,27 +687,29 @@ std::optional<Shader::ReplaceConstant> GraphicsEnvironment::GetReplaceConstBuffe
             UNREACHABLE();
         }
     }(it->second);
-    cbuf_replacements.emplace(key, converted_value);
+    if (recording_queries) cbuf_replacements.emplace(key, converted_value);
     return converted_value;
 }
 
 Shader::TextureType GraphicsEnvironment::ReadTextureType(u32 handle) {
-    const auto& regs{maxwell3d->regs};
-    const bool via_header_index{regs.sampler_binding == Maxwell::SamplerBinding::ViaHeaderBinding};
-    auto entry =
-        ReadTextureInfo(regs.tex_header.Address(), regs.tex_header.limit, via_header_index, handle);
+    const auto entry = snapshot
+        ? ReadSnapshotTextureInfo(handle)
+        : ReadTextureInfo(maxwell3d->regs.tex_header.Address(), maxwell3d->regs.tex_header.limit,
+                          maxwell3d->regs.sampler_binding == Maxwell::SamplerBinding::ViaHeaderBinding,
+                          handle);
     const Shader::TextureType result{ConvertTextureType(entry)};
-    texture_types.emplace(handle, result);
+    if (recording_queries) texture_types.emplace(handle, result);
     return result;
 }
 
 Shader::TexturePixelFormat GraphicsEnvironment::ReadTexturePixelFormat(u32 handle) {
-    const auto& regs{maxwell3d->regs};
-    const bool via_header_index{regs.sampler_binding == Maxwell::SamplerBinding::ViaHeaderBinding};
-    auto entry =
-        ReadTextureInfo(regs.tex_header.Address(), regs.tex_header.limit, via_header_index, handle);
+    const auto entry = snapshot
+        ? ReadSnapshotTextureInfo(handle)
+        : ReadTextureInfo(maxwell3d->regs.tex_header.Address(), maxwell3d->regs.tex_header.limit,
+                          maxwell3d->regs.sampler_binding == Maxwell::SamplerBinding::ViaHeaderBinding,
+                          handle);
     const Shader::TexturePixelFormat result(ConvertTexturePixelFormat(entry));
-    texture_pixel_formats.emplace(handle, result);
+    if (recording_queries) texture_pixel_formats.emplace(handle, result);
     return result;
 }
 
@@ -390,8 +719,8 @@ bool GraphicsEnvironment::IsTexturePixelFormatInteger(u32 handle) {
 }
 
 u32 GraphicsEnvironment::ReadViewportTransformState() {
-    const auto& regs{maxwell3d->regs};
-    viewport_transform_state = regs.viewport_scale_offset_enabled;
+    viewport_transform_state =
+        snapshot ? snapshot->viewport_transform_state : maxwell3d->regs.viewport_scale_offset_enabled;
     return viewport_transform_state;
 }
 
@@ -409,6 +738,43 @@ ComputeEnvironment::ComputeEnvironment(Tegra::Engines::KeplerCompute& kepler_com
     workgroup_size = {qmd.block_dim_x, qmd.block_dim_y, qmd.block_dim_z};
 }
 
+u32 ComputeEnvironment::ReadCbufSize(u32 cbuf_index) {
+    const auto& qmd{kepler_compute->launch_description};
+    const bool enabled = ((qmd.const_buffer_enable_mask.Value() >> cbuf_index) & 1) != 0;
+    const u32 size = enabled ? qmd.const_buffer_config[cbuf_index].size.Value() : 0;
+    if (recording_queries) cbuf_values.emplace(MakeCbufKey(cbuf_index, UINT32_MAX), size);
+    return size;
+}
+
+u32 ComputeEnvironment::ReadTextureTableSize() {
+    const u32 size = std::min(kepler_compute->regs.tic.limit + 1U, 1U << 20);
+    if (recording_queries) cbuf_values.emplace(MakeCbufKey(UINT32_MAX, UINT32_MAX), size);
+    return size;
+}
+
+u32 FileEnvironment::ReadTextureTableSize() {
+    const auto key=MakeCbufKey(UINT32_MAX, UINT32_MAX);
+    if(asked)asked->constants.insert(key);
+    if(reuse_hle.has_value())return cbuf_values.try_emplace(key,0).first->second;
+    const auto it = cbuf_values.find(key);
+    return it != cbuf_values.end() ? it->second : 0;
+}
+
+std::optional<Shader::TexturePoolInfo> FileEnvironment::ReadTexturePoolInfo() {
+    if(asked)asked->constants.insert({POOL_TEXTURES_KEY,POOL_SAMPLERS_KEY});
+    const auto textures = cbuf_values.find(POOL_TEXTURES_KEY);
+    const auto samplers = cbuf_values.find(POOL_SAMPLERS_KEY);
+    if (textures == cbuf_values.end() || samplers == cbuf_values.end()) {
+        if(reuse_hle.has_value())reuse_missing_pool=true;
+        return std::nullopt;
+    }
+    return Shader::TexturePoolInfo{
+        .num_textures = textures->second,
+        .num_samplers = samplers->second & ~POOL_LINKED_SAMPLERS_BIT,
+        .linked_samplers = (samplers->second & POOL_LINKED_SAMPLERS_BIT) != 0,
+    };
+}
+
 u32 ComputeEnvironment::ReadCbufValue(u32 cbuf_index, u32 cbuf_offset) {
     const auto& qmd{kepler_compute->launch_description};
     ASSERT(((qmd.const_buffer_enable_mask.Value() >> cbuf_index) & 1) != 0);
@@ -417,7 +783,7 @@ u32 ComputeEnvironment::ReadCbufValue(u32 cbuf_index, u32 cbuf_offset) {
     if (cbuf_offset < cbuf.size) {
         value = gpu_memory->Read<u32>(cbuf.Address() + cbuf_offset);
     }
-    cbuf_values.emplace(MakeCbufKey(cbuf_index, cbuf_offset), value);
+    if (recording_queries) cbuf_values.emplace(MakeCbufKey(cbuf_index, cbuf_offset), value);
     return value;
 }
 
@@ -426,7 +792,7 @@ Shader::TextureType ComputeEnvironment::ReadTextureType(u32 handle) {
     const auto& qmd{kepler_compute->launch_description};
     auto entry = ReadTextureInfo(regs.tic.Address(), regs.tic.limit, qmd.linked_tsc != 0, handle);
     const Shader::TextureType result{ConvertTextureType(entry)};
-    texture_types.emplace(handle, result);
+    if (recording_queries) texture_types.emplace(handle, result);
     return result;
 }
 
@@ -435,7 +801,7 @@ Shader::TexturePixelFormat ComputeEnvironment::ReadTexturePixelFormat(u32 handle
     const auto& qmd{kepler_compute->launch_description};
     auto entry = ReadTextureInfo(regs.tic.Address(), regs.tic.limit, qmd.linked_tsc != 0, handle);
     const Shader::TexturePixelFormat result(ConvertTexturePixelFormat(entry));
-    texture_pixel_formats.emplace(handle, result);
+    if (recording_queries) texture_pixel_formats.emplace(handle, result);
     return result;
 }
 
@@ -448,7 +814,8 @@ u32 ComputeEnvironment::ReadViewportTransformState() {
     return viewport_transform_state;
 }
 
-void FileEnvironment::Deserialize(std::ifstream& file) {
+void FileEnvironment::Deserialize(std::istream& file, std::shared_ptr<const std::vector<u64>> shared_program,
+                                  std::string_view program_fingerprint) {
     u64 code_size{};
     u64 num_texture_types{};
     u64 num_texture_pixel_formats{};
@@ -468,35 +835,75 @@ void FileEnvironment::Deserialize(std::ifstream& file) {
         .read(reinterpret_cast<char*>(&read_highest), sizeof(read_highest))
         .read(reinterpret_cast<char*>(&viewport_transform_state), sizeof(viewport_transform_state))
         .read(reinterpret_cast<char*>(&stage), sizeof(stage));
-    code.resize(Common::DivCeil(code_size, sizeof(u64)));
-    file.read(reinterpret_cast<char*>(code.data()), code_size);
+    // A crash can leave the last cache entry incomplete. Validate serialized sizes before
+    // allocating memory; otherwise arbitrary bytes can turn into a huge allocation request.
+    if (!file || stage > Shader::Stage::VertexA || code_size % sizeof(u64) != 0) {
+        throw std::ios_base::failure("Invalid shader cache environment header");
+    }
+    const auto position = file.tellg();
+    file.seekg(0, std::ios::end);
+    const auto end = file.tellg();
+    file.seekg(position);
+    if (!file || position < 0 || end < position) {
+        throw std::ios_base::failure("Invalid shader cache file bounds");
+    }
+    u64 remaining = static_cast<u64>(end - position);
+    if (code_size > remaining) {
+        throw std::ios_base::failure("Invalid shader cache code size");
+    }
+    remaining -= code_size;
+    const auto consume_entries = [&remaining](u64 count, size_t entry_size) {
+        if (count > remaining / entry_size) {
+            throw std::ios_base::failure("Invalid shader cache entry count");
+        }
+        remaining -= count * entry_size;
+    };
+    consume_entries(num_texture_types, sizeof(u32) + sizeof(Shader::TextureType));
+    consume_entries(num_texture_pixel_formats, sizeof(u32) + sizeof(Shader::TexturePixelFormat));
+    consume_entries(num_cbuf_values, sizeof(u64) + sizeof(u32));
+    consume_entries(num_cbuf_replacement_values, sizeof(u64) + sizeof(Shader::ReplaceConstant));
+    if (shared_program) {
+        if (shared_program->size()*sizeof(u64) != code_size) throw std::ios_base::failure("Shared shader size mismatch");
+        file.seekg(static_cast<std::streamoff>(code_size),std::ios::cur);
+        code=std::move(shared_program);
+    } else {
+        auto instructions = std::make_shared<std::vector<u64>>(Common::DivCeil(code_size, sizeof(u64)));
+        file.read(reinterpret_cast<char*>(instructions->data()), code_size);
+        code = std::move(instructions);
+    }
     for (size_t i = 0; i < num_texture_types; ++i) {
         u32 key;
         Shader::TextureType type;
         file.read(reinterpret_cast<char*>(&key), sizeof(key))
             .read(reinterpret_cast<char*>(&type), sizeof(type));
-        texture_types.emplace(key, type);
+        if(static_cast<u32>(type)>=Shader::NUM_TEXTURE_TYPES || !texture_types.emplace(key, type).second)
+            throw std::ios_base::failure("Invalid cached texture type");
     }
     for (size_t i = 0; i < num_texture_pixel_formats; ++i) {
         u32 key;
         Shader::TexturePixelFormat format;
         file.read(reinterpret_cast<char*>(&key), sizeof(key))
             .read(reinterpret_cast<char*>(&format), sizeof(format));
-        texture_pixel_formats.emplace(key, format);
+        if(static_cast<u32>(format)>static_cast<u32>(Shader::TexturePixelFormat::D32_FLOAT_S8_UINT) ||
+           !texture_pixel_formats.emplace(key, format).second)
+            throw std::ios_base::failure("Invalid cached texture format");
     }
     for (size_t i = 0; i < num_cbuf_values; ++i) {
         u64 key;
         u32 value;
         file.read(reinterpret_cast<char*>(&key), sizeof(key))
             .read(reinterpret_cast<char*>(&value), sizeof(value));
-        cbuf_values.emplace(key, value);
+        if(!cbuf_values.emplace(key, value).second)
+            throw std::ios_base::failure("Duplicate cached constant buffer query");
     }
     for (size_t i = 0; i < num_cbuf_replacement_values; ++i) {
         u64 key;
         Shader::ReplaceConstant value;
         file.read(reinterpret_cast<char*>(&key), sizeof(key))
             .read(reinterpret_cast<char*>(&value), sizeof(value));
-        cbuf_replacements.emplace(key, value);
+        if(static_cast<u32>(value)>static_cast<u32>(Shader::ReplaceConstant::DrawID) ||
+           !cbuf_replacements.emplace(key, value).second)
+            throw std::ios_base::failure("Invalid cached HLE replacement");
     }
     if (stage == Shader::Stage::Compute) {
         file.read(reinterpret_cast<char*>(&workgroup_size), sizeof(workgroup_size))
@@ -509,40 +916,219 @@ void FileEnvironment::Deserialize(std::ifstream& file) {
             file.read(reinterpret_cast<char*>(&gp_passthrough_mask), sizeof(gp_passthrough_mask));
         }
     }
+    if (!file) {
+        throw std::ios_base::failure("Truncated shader cache environment");
+    }
+    // Stable per-environment compiler input identity, independent of unordered-map
+    // iteration order and unrelated pipelines appended to the local cache.
+    std::string identity;
+    const auto put = [&](u64 n) { for (size_t i=0;i<8;++i) identity += static_cast<char>(n >> (8*i)); };
+    program_bytes=SharedCodeBytes();
+    program_digest=program_fingerprint.empty() ? ShaderProfile::ResourceSha256({reinterpret_cast<const char*>(code->data()), program_bytes}) : std::string(program_fingerprint);
+    identity += program_digest;
+    for (u64 n : {u64(stage), u64(start_address), u64(read_lowest), u64(read_highest),
+        u64(initial_offset), u64(local_memory_size), u64(shared_memory_size), u64(texture_bound), u64(viewport_transform_state)}) put(n);
+    const auto map = [&](const auto& values) {
+        std::vector<std::pair<u64,u64>> sorted;
+        for (const auto& [key,value] : values) sorted.emplace_back(static_cast<u64>(key), static_cast<u64>(value));
+        std::sort(sorted.begin(), sorted.end()); put(sorted.size());
+        for (const auto& [key,value] : sorted) { put(key); put(value); }
+    };
+    map(texture_types); map(texture_pixel_formats); map(cbuf_values); map(cbuf_replacements);
+    for (auto n : workgroup_size) put(n);
+    if (stage != Shader::Stage::Compute) {
+        for (auto n : ShaderProfile::CanonicalGuestHeader(sph)) put(n);
+        if (stage == Shader::Stage::Geometry) for (auto n : gp_passthrough_mask) put(n);
+    }
+    compilation_identity = ShaderProfile::ResourceSha256(identity);
     is_proprietary_driver = texture_bound == 2;
 }
 
 void FileEnvironment::Dump(u64 pipeline_hash, u64 shader_hash) {
-    DumpImpl(pipeline_hash, shader_hash, code, read_highest, read_lowest, initial_offset, stage);
+    DumpImpl(pipeline_hash, shader_hash, *code, read_highest, read_lowest, initial_offset, stage);
+}
+
+bool FileEnvironment::HasSameCompilationInputs(const FileEnvironment& o) const noexcept {
+    return CompilationDifferenceMask(o) == 0;
+}
+
+u32 FileEnvironment::CompilationDifferenceMask(const FileEnvironment& o) const noexcept {
+    u32 mask{};
+    if(code != o.code && (!code || !o.code || *code != *o.code))mask|=1;
+    if(texture_types!=o.texture_types)mask|=2;
+    if(texture_pixel_formats!=o.texture_pixel_formats)mask|=4;
+    if(cbuf_values!=o.cbuf_values)mask|=8;
+    if(cbuf_replacements!=o.cbuf_replacements)mask|=16;
+    if(workgroup_size!=o.workgroup_size)mask|=32;
+    if(local_memory_size!=o.local_memory_size || shared_memory_size!=o.shared_memory_size ||
+       texture_bound!=o.texture_bound || read_lowest!=o.read_lowest || read_highest!=o.read_highest ||
+       initial_offset!=o.initial_offset || viewport_transform_state!=o.viewport_transform_state ||
+       stage!=o.stage || start_address!=o.start_address || is_proprietary_driver!=o.is_proprietary_driver)mask|=64;
+    if(gp_passthrough_mask!=o.gp_passthrough_mask || ShaderProfile::CanonicalGuestHeader(sph)!=ShaderProfile::CanonicalGuestHeader(o.sph))mask|=128;
+    return mask;
+}
+
+size_t FileEnvironment::CompilationInputBytes() const noexcept {
+    // Include a conservative allowance for hash nodes/buckets, not just code bytes.
+    return sizeof(*this) + SharedCodeBytes() +
+        (texture_types.size() + texture_pixel_formats.size() + cbuf_values.size() +
+         cbuf_replacements.size()) * 64;
+}
+
+std::optional<FileEnvironment> FileEnvironment::AnswerLive(Shader::Environment& live, bool relocatable,
+                                                          const ShaderProfile::AskedQuestions& questions,
+                                                          const char*& mismatch) const {
+    auto answers = ShaderProfile::AnswerSynthetic(ReuseProof(), questions, live, relocatable, mismatch);
+    if (!answers) return std::nullopt;
+    FileEnvironment answered(*this);
+    answered.cbuf_values = std::move(answers->constants);
+    answered.texture_types = std::move(answers->texture_types);
+    answered.texture_pixel_formats = std::move(answers->pixel_formats);
+    const u32 start = live.StartAddress();
+    answered.read_lowest = start + (read_lowest - start_address);
+    answered.read_highest = start + (read_highest - start_address);
+    answered.start_address = start;
+    return answered;
+}
+
+void FileEnvironment::Serialize(std::ostream& file) const {
+    const auto put = [&](const auto& value) { file.write(reinterpret_cast<const char*>(&value), sizeof(value)); };
+    put(static_cast<u64>(SharedCodeBytes()));
+    put(static_cast<u64>(texture_types.size()));
+    put(static_cast<u64>(texture_pixel_formats.size()));
+    put(static_cast<u64>(cbuf_values.size()));
+    put(static_cast<u64>(cbuf_replacements.size()));
+    put(local_memory_size);
+    put(texture_bound);
+    put(start_address);
+    put(read_lowest);
+    put(read_highest);
+    put(viewport_transform_state);
+    put(stage);
+    if (code) file.write(reinterpret_cast<const char*>(code->data()), static_cast<std::streamsize>(SharedCodeBytes()));
+    for (const auto& [key, type] : texture_types) { put(key); put(type); }
+    for (const auto& [key, format] : texture_pixel_formats) { put(key); put(format); }
+    for (const auto& [key, value] : cbuf_values) { put(key); put(value); }
+    for (const auto& [key, value] : cbuf_replacements) { put(key); put(value); }
+    if (stage == Shader::Stage::Compute) {
+        put(workgroup_size);
+        put(shared_memory_size);
+    } else {
+        put(sph);
+        if (stage == Shader::Stage::Geometry) put(gp_passthrough_mask);
+    }
+}
+
+StoredEnvironment StoredEnvironment::Decode(SharedShaderBytes bytes, std::string_view program_digest) {
+    FileEnvironment env;
+    std::istringstream stream(bytes.String(), std::ios::binary);
+    env.Deserialize(stream, {}, program_digest);
+    auto parts = std::make_shared<Parts>();
+    parts->bytes = std::move(bytes);
+    // Expanding reuses the digest instead of hashing the program again.
+    parts->program_digest = env.ProgramDigest();
+    parts->compilation_identity = env.CompilationIdentity();
+    parts->sph = env.SPH();
+    parts->stage = env.ShaderStage();
+    parts->cbuf_size_mask = env.CbufSizeMask();
+    parts->decoded_bytes = env.CompilationInputBytes();
+    parts->sealed_bytes = parts->decoded_bytes - env.SharedCodeBytes();
+    parts->hle = env.HasHLEMacroState();
+    StoredEnvironment result;
+    result.parts = std::move(parts);
+    return result;
+}
+
+FileEnvironment StoredEnvironment::Expand() const {
+    FileEnvironment env;
+    std::istringstream stream(parts->bytes.String(), std::ios::binary);
+    env.Deserialize(stream, {}, parts->program_digest);
+    return env;
+}
+
+size_t StoredEnvironment::RetainedBytes() const noexcept {
+    // A program held apart from the metadata is accounted by its own identity.
+    const size_t stored = parts->bytes.size() - ProgramBytes();
+    return sizeof(Parts) + stored + parts->program_digest.capacity() +
+        parts->compilation_identity.capacity();
 }
 
 u64 FileEnvironment::ReadInstruction(u32 address) {
-    if (address < read_lowest || address > read_highest) {
+    if (!code || address < read_lowest || address > read_highest) {
         throw Shader::LogicError("Out of bounds address {}", address);
     }
-    return code[(address - read_lowest) / sizeof(u64)];
+    return (*code)[(address - read_lowest) / sizeof(u64)];
+}
+
+u32 FileEnvironment::ReadCbufSize(u32 cbuf_index) {
+    const auto key=MakeCbufKey(cbuf_index, UINT32_MAX);
+    if(asked)asked->constants.insert(key);
+    if(reuse_hle.has_value()) {
+        if(cbuf_index>=(stage==Shader::Stage::Compute?8U:18U))
+            throw Shader::LogicError("Cross-version cbuf proof index out of range");
+        return cbuf_values.try_emplace(key,0).first->second;
+    }
+    const auto it = cbuf_values.find(key);
+    return it != cbuf_values.end() ? it->second : 0;
+}
+
+u32 FileEnvironment::ReadTextureQuery(const Shader::TextureHandleSource& source,
+                                    Shader::TextureQueryKind kind) {
+    if(asked && !reuse_hle.has_value() && !asking_texture) {
+        // The constant reads of a query only find its handle; the code itself does not use them.
+        asking_texture=true;
+        try {
+            const u32 handle=ResolveTextureHandle(source);
+            const u32 answer=QueryTextureHandle(handle,kind);
+            asking_texture=false;
+            asked->Texture({source,kind,handle,answer});
+            return answer;
+        } catch(...) {
+            asking_texture=false;
+            throw;
+        }
+    }
+    if(!reuse_hle.has_value())return Shader::Environment::ReadTextureQuery(source,kind);
+    const bool previous=semantic_textures.in_query;
+    semantic_textures.in_query=true;
+    try {
+        const u32 handle=ResolveTextureHandle(source);
+        const u32 answer=QueryTextureHandle(handle,kind);
+        semantic_textures.in_query=previous;
+        semantic_textures.Add({source,kind,handle,answer});
+        return answer;
+    } catch(...) {
+        semantic_textures.in_query=previous;
+        throw;
+    }
 }
 
 u32 FileEnvironment::ReadCbufValue(u32 cbuf_index, u32 cbuf_offset) {
+    if(asked && !asking_texture)asked->constants.insert(MakeCbufKey(cbuf_index,cbuf_offset));
+    if(reuse_hle.has_value())semantic_textures.Strict(0,MakeCbufKey(cbuf_index,cbuf_offset));
     const auto it{cbuf_values.find(MakeCbufKey(cbuf_index, cbuf_offset))};
     if (it == cbuf_values.end()) {
-        throw Shader::LogicError("Uncached read texture type");
+        throw Shader::LogicError("Uncached constant buffer read c{}[0x{:x}]", cbuf_index, cbuf_offset);
     }
     return it->second;
 }
 
 Shader::TextureType FileEnvironment::ReadTextureType(u32 handle) {
+    if(asked && !asking_texture)asked->texture_types.insert(handle);
+    if(reuse_hle.has_value())semantic_textures.Strict(1,handle);
     const auto it{texture_types.find(handle)};
     if (it == texture_types.end()) {
-        throw Shader::LogicError("Uncached read texture type");
+        throw Shader::LogicError("Uncached texture type of handle 0x{:x}", handle);
     }
     return it->second;
 }
 
 Shader::TexturePixelFormat FileEnvironment::ReadTexturePixelFormat(u32 handle) {
+    if(asked && !asking_texture)asked->pixel_formats.insert(handle);
+    if(reuse_hle.has_value())semantic_textures.Strict(2,handle);
     const auto it{texture_pixel_formats.find(handle)};
     if (it == texture_pixel_formats.end()) {
-        throw Shader::LogicError("Uncached read texture pixel format");
+        throw Shader::LogicError("Uncached texture pixel format of handle 0x{:x}", handle);
     }
     return it->second;
 }
@@ -553,6 +1139,8 @@ bool FileEnvironment::IsTexturePixelFormatInteger(u32 handle) {
 }
 
 u32 FileEnvironment::ReadViewportTransformState() {
+    if(asked)asked->viewport=true;
+    if(reuse_hle.has_value())reuse_viewport_queried=true;
     return viewport_transform_state;
 }
 
@@ -574,16 +1162,35 @@ std::array<u32, 3> FileEnvironment::WorkgroupSize() const {
 
 std::optional<Shader::ReplaceConstant> FileEnvironment::GetReplaceConstBuffer(u32 bank,
                                                                               u32 offset) {
-    const u64 key = (static_cast<u64>(bank) << 32) | static_cast<u64>(offset);
-    auto it = cbuf_replacements.find(key);
-    if (it == cbuf_replacements.end()) {
-        return std::nullopt;
+    const u64 key=(u64{bank}<<32)|offset;
+    const auto found=cbuf_replacements.find(key);
+    const std::optional<Shader::ReplaceConstant> result=found==cbuf_replacements.end()?
+        std::nullopt:std::optional{found->second};
+    if(reuse_hle.value_or(false)) {
+        if(replacement_queries.size()>=ShaderProfile::CandidateWarmupBudget::MaxReplacementQueries && !replacement_queries.contains(key))
+            throw Shader::LogicError("Cross-version replacement proof budget exceeded");
+        replacement_queries.try_emplace(key,result);
     }
-    return it->second;
+    if(asked && asked->hle)asked->replacements.try_emplace(key,result);
+    return result;
 }
 
 void SerializePipeline(std::span<const char> key, std::span<const GenericEnvironment* const> envs,
-                       const std::filesystem::path& filename, u32 cache_version) try {
+                       const std::filesystem::path& filename, u32 cache_version, std::string_view context) try {
+    if (filename.extension() == ".nxc") {
+        if (!std::ranges::all_of(envs, &GenericEnvironment::CanBeSerialized)) return;
+        CacheStore::Record record;
+        record.key.assign(key.data(), key.size());
+        for (const auto* env : envs) {
+            std::ostringstream bytes(std::ios::binary);
+            env->Serialize(bytes); record.environments.push_back(bytes.str());
+        }
+        try { CacheStore::Append(filename, cache_version, record, nullptr, context); }
+        catch (const std::exception& error) {
+            LOG_ERROR(Common_Filesystem, "Cannot append local shader cache: {}", error.what());
+        }
+        return;
+    }
     std::ofstream file(filename, std::ios::binary | std::ios::ate | std::ios::app);
     file.exceptions(std::ifstream::failbit);
     if (!file.is_open()) {
@@ -614,10 +1221,112 @@ void SerializePipeline(std::span<const char> key, std::span<const GenericEnviron
     }
 }
 
+namespace {
+/// Rewrites a pipeline cache file with only the given byte ranges of it
+void CompactPipelineCache(std::ifstream& file, const std::filesystem::path& filename,
+                          std::span<const std::pair<std::streamoff, std::streamoff>> ranges) try {
+    std::filesystem::path temp{filename};
+    temp += ".tmp";
+    {
+        std::ofstream out(temp, std::ios::binary | std::ios::trunc);
+        out.exceptions(std::ofstream::failbit);
+        std::vector<char> buffer;
+        for (const auto& [begin, end] : ranges) {
+            buffer.resize(static_cast<size_t>(end - begin));
+            file.seekg(begin);
+            file.read(buffer.data(), static_cast<std::streamsize>(buffer.size()));
+            out.write(buffer.data(), static_cast<std::streamsize>(buffer.size()));
+        }
+    }
+    file.close();
+    std::filesystem::rename(temp, filename);
+} catch (const std::exception& e) {
+    LOG_WARNING(Common_Filesystem, "Failed to compact pipeline cache file: {}", e.what());
+    std::error_code ec;
+    std::filesystem::remove(std::filesystem::path{filename}.concat(".tmp"), ec);
+}
+} // Anonymous namespace
+
+bool MigrateLegacyPipelines(std::stop_token stop_loading, const std::filesystem::path& legacy,
+                            const std::filesystem::path& store, u32 cache_version,
+                            size_t compute_key_size, size_t graphics_key_size,
+                            std::string_view context, size_t& migrated) {
+    migrated = 0;
+    std::ifstream file(legacy, std::ios::binary | std::ios::ate);
+    if (!file.is_open()) {
+        return false;
+    }
+    try {
+        file.exceptions(std::ifstream::failbit);
+        const auto end{file.tellg()};
+        file.seekg(0, std::ios::beg);
+        std::array<char, 8> magic_number;
+        u32 version{};
+        file.read(magic_number.data(), magic_number.size())
+            .read(reinterpret_cast<char*>(&version), sizeof(version));
+        if (magic_number != MAGIC_NUMBER || version != cache_version) {
+            return true;
+        }
+        while (file.tellg() != end) {
+            if (stop_loading.stop_requested()) {
+                return false;
+            }
+            u32 num_envs{};
+            file.read(reinterpret_cast<char*>(&num_envs), sizeof(num_envs));
+            if (num_envs == 0 || num_envs > 6) {
+                break;
+            }
+            CacheStore::Record record;
+            Shader::Stage stage{};
+            for (u32 index = 0; index < num_envs; ++index) {
+                // Validate through the regular loader, then keep the exact bytes.
+                const auto begin{file.tellg()};
+                FileEnvironment env;
+                env.Deserialize(file);
+                if (index == 0) {
+                    stage = env.ShaderStage();
+                }
+                const auto finish{file.tellg()};
+                std::string bytes(static_cast<size_t>(finish - begin), '\0');
+                file.seekg(begin);
+                file.read(bytes.data(), static_cast<std::streamsize>(bytes.size()));
+                record.environments.emplace_back(std::move(bytes));
+            }
+            if (stage == Shader::Stage::Compute && num_envs != 1) {
+                break;
+            }
+            record.key.resize(stage == Shader::Stage::Compute ? compute_key_size : graphics_key_size);
+            file.read(record.key.data(), static_cast<std::streamsize>(record.key.size()));
+            CacheStore::Append(store, cache_version, record, nullptr, context);
+            ++migrated;
+        }
+    } catch (const std::ios_base::failure& e) {
+        LOG_WARNING(Common_Filesystem, "Legacy pipeline cache ends early: {}", e.what());
+    }
+    return true;
+}
+
 void LoadPipelines(
     std::stop_token stop_loading, const std::filesystem::path& filename, u32 expected_cache_version,
-    Common::UniqueFunction<void, std::ifstream&, FileEnvironment> load_compute,
-    Common::UniqueFunction<void, std::ifstream&, std::vector<FileEnvironment>> load_graphics) try {
+    Common::UniqueFunction<bool, std::istream&, FileEnvironment> load_compute,
+    Common::UniqueFunction<bool, std::istream&, std::vector<FileEnvironment>> load_graphics) try {
+    if (filename.extension() == ".nxc") {
+        for (const auto& record : CacheStore::Read(filename, expected_cache_version)) {
+            if (stop_loading.stop_requested()) return;
+            std::vector<FileEnvironment> envs;
+            for (const auto& bytes : record.environments) {
+                std::istringstream stream(bytes.String(), std::ios::binary);
+                FileEnvironment env; env.Deserialize(stream); envs.push_back(std::move(env));
+            }
+            std::istringstream key(record.key, std::ios::binary);
+            key.exceptions(std::ios::failbit | std::ios::badbit);
+            if (envs.front().ShaderStage() == Shader::Stage::Compute) {
+                if (envs.size() != 1) throw std::ios_base::failure("Invalid compute stage count");
+                load_compute(key, std::move(envs.front()));
+            } else load_graphics(key, std::move(envs));
+        }
+        return;
+    }
     std::ifstream file(filename, std::ios::binary | std::ios::ate);
     if (!file.is_open()) {
         return;
@@ -646,21 +1355,43 @@ void LoadPipelines(
         }
         return;
     }
+    // Byte ranges of the records to keep, the header included
+    std::vector<std::pair<std::streamoff, std::streamoff>> kept{{0, file.tellg()}};
+    bool dropped{};
     while (file.tellg() != end) {
         if (stop_loading.stop_requested()) {
             return;
         }
+        const std::streamoff record_start{file.tellg()};
         u32 num_envs{};
         file.read(reinterpret_cast<char*>(&num_envs), sizeof(num_envs));
+        if (num_envs == 0 || num_envs > 6) {
+            throw std::ios_base::failure("Invalid shader cache stage count");
+        }
         std::vector<FileEnvironment> envs(num_envs);
         for (FileEnvironment& env : envs) {
             env.Deserialize(file);
         }
+        bool keep{};
         if (envs.front().ShaderStage() == Shader::Stage::Compute) {
-            load_compute(file, std::move(envs.front()));
+            if (envs.size() != 1) {
+                throw std::ios_base::failure("Invalid compute shader cache stage count");
+            }
+            keep = load_compute(file, std::move(envs.front()));
         } else {
-            load_graphics(file, std::move(envs));
+            keep = load_graphics(file, std::move(envs));
         }
+        const std::streamoff record_end{file.tellg()};
+        if (!keep) {
+            dropped = true;
+        } else if (kept.back().second == record_start) {
+            kept.back().second = record_end;
+        } else {
+            kept.emplace_back(record_start, record_end);
+        }
+    }
+    if (dropped) {
+        CompactPipelineCache(file, filename, kept);
     }
 
 } catch (const std::ios_base::failure& e) {

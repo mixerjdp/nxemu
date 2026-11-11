@@ -1,4 +1,4 @@
-﻿<?xml version="1.0" encoding="utf-8"?>
+<?xml version="1.0" encoding="utf-8"?>
 <Project ToolsVersion="4.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
   <ItemGroup>
     <Filter Include="Source Files">
@@ -95,6 +95,9 @@
     <ClInclude Include="runtime_info.h">
       <Filter>Header Files</Filter>
     </ClInclude>
+    <ClInclude Include="scale_trace.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
     <ClInclude Include="shader_info.h">
       <Filter>Header Files</Filter>
     </ClInclude>
@@ -102,6 +105,9 @@
       <Filter>Header Files</Filter>
     </ClInclude>
     <ClInclude Include="varying_state.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="vtg_as_compute.h">
       <Filter>Header Files</Filter>
     </ClInclude>
     <ClInclude Include="backend\bindings.h">
@@ -233,8 +239,19 @@
     <ClInclude Include="frontend\maxwell\translate\impl\video_helper.h">
       <Filter>Header Files\frontend\maxwell\translate\impl</Filter>
     </ClInclude>
-    <ClInclude Include="ir_opt\passes.h">
+    <ClInclude Include="ir_opt\reconstruction_pass.h">
       <Filter>Header Files\ir_opt</Filter>
+    </ClInclude>
+    <ClInclude Include="ir_opt\conditional_value.h">
+      <Filter>Header Files\ir_opt</Filter>
+    </ClInclude>
+    <ClInclude Include="ir_opt\passes.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+  </ItemGroup>
+  <ItemGroup>
+    <ClInclude Include="ir_opt\bindless_descriptor.h">
+      <Filter>Header Files</Filter>
     </ClInclude>
   </ItemGroup>
   <ItemGroup>
@@ -766,10 +783,22 @@
     <ClCompile Include="ir_opt\lower_int64_to_int32.cpp">
       <Filter>Source Files\ir_opt</Filter>
     </ClCompile>
+    <ClCompile Include="ir_opt\pixel_local_read_pass.cpp">
+      <Filter>Source Files\ir_opt</Filter>
+    </ClCompile>
     <ClCompile Include="ir_opt\position_pass.cpp">
       <Filter>Source Files\ir_opt</Filter>
     </ClCompile>
+    <ClCompile Include="ir_opt\reconstruction_pass.cpp">
+      <Filter>Source Files\ir_opt</Filter>
+    </ClCompile>
     <ClCompile Include="ir_opt\rescaling_pass.cpp">
+      <Filter>Source Files\ir_opt</Filter>
+    </ClCompile>
+    <ClCompile Include="ir_opt\geometry_layer_forwarding_pass.cpp">
+      <Filter>Source Files\ir_opt</Filter>
+    </ClCompile>
+    <ClCompile Include="ir_opt\shared_memory_packing_pass.cpp">
       <Filter>Source Files\ir_opt</Filter>
     </ClCompile>
     <ClCompile Include="ir_opt\ssa_rewrite_pass.cpp">
@@ -782,6 +811,9 @@
       <Filter>Source Files\ir_opt</Filter>
     </ClCompile>
     <ClCompile Include="ir_opt\verification_pass.cpp">
+      <Filter>Source Files\ir_opt</Filter>
+    </ClCompile>
+    <ClCompile Include="ir_opt\vtg_to_compute_pass.cpp">
       <Filter>Source Files\ir_opt</Filter>
     </ClCompile>
   </ItemGroup>

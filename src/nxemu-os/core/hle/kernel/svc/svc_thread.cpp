@@ -72,7 +72,12 @@ Result CreateThread(Core::System& system, Handle* out_handle, u64 entry_point, u
     KThread::Register(kernel, thread);
 
     // Add the thread to the handle table.
-    R_RETURN(process.GetHandleTable().Add(out_handle, thread));
+    R_TRY(process.GetHandleTable().Add(out_handle, thread));
+
+    // FW 22.0.0+ stores the current thread handle in the thread-local region.
+    process.GetMemory().Write32(thread->GetTlsAddress().GetValue() + 0x110, *out_handle);
+
+    R_SUCCEED();
 }
 
 /// Starts the thread for the provided handle
@@ -106,19 +111,7 @@ void SleepThread(Core::System& system, s64 ns) {
 
     // When the input tick is positive, sleep.
     if (ns > 0) {
-        // Convert the timeout from nanoseconds to ticks.
-        // NOTE: Nintendo does not use this conversion logic in WaitSynchronization...
-        s64 timeout;
-
-        const s64 offset_tick(ns);
-        if (offset_tick > 0) {
-            timeout = kernel.HardwareTimer().GetTick() + offset_tick + 2;
-            if (timeout <= 0) {
-                timeout = std::numeric_limits<s64>::max();
-            }
-        } else {
-            timeout = std::numeric_limits<s64>::max();
-        }
+        const s64 timeout = kernel.HardwareTimer().GetTimeoutDeadlineNs(ns);
 
         // Sleep.
         // NOTE: Nintendo does not check the result of this sleep.
@@ -155,7 +148,9 @@ Result GetThreadContext3(Core::System& system, u64 out_context, Handle thread_ha
     R_TRY(thread->GetThreadContext3(std::addressof(context)));
 
     // Copy the thread context to user space.
-    R_UNLESS(GetCurrentMemory(kernel).WriteBlock(out_context, std::addressof(context), sizeof(context)), ResultInvalidPointer);
+    R_UNLESS(GetCurrentMemory(kernel).WriteBlock(Common::ProcessAddress{out_context},
+                                                   std::addressof(context), sizeof(context)),
+             ResultInvalidPointer);
     R_SUCCEED();
 }
 

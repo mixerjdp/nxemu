@@ -55,6 +55,9 @@ private:
     Result GetIdleTimeDetectionExtension(
         Out<IdleTimeDetectionExtension> out_idle_time_detection_extension);
     Result ReportUserIsActive();
+    Result GetCurrentIlluminance(Out<f32> out_illuminance);
+    Result IsIlluminanceAvailable(Out<bool> out_is_illuminance_available);
+    Result GetCurrentIlluminanceEx(Out<bool> out_over_limit, Out<f32> out_illuminance);
     Result SetAutoSleepDisabled(bool is_auto_sleep_disabled);
     Result IsAutoSleepDisabled(Out<bool> out_is_auto_sleep_disabled);
     Result SetInputDetectionPolicy(InputDetectionPolicy input_detection_policy);
@@ -63,6 +66,8 @@ private:
     Result SetAlbumImageTakenNotificationEnabled(bool enabled);
     Result SaveCurrentScreenshot(Capture::AlbumReportOption album_report_option);
     Result SetRecordVolumeMuted(bool muted);
+    Result Unknown230(u32 in_val, Out<u16> out_val);
+    Result Unknown240(u32 in_val);
 
     Kernel::KProcess* const m_process;
     const std::shared_ptr<Applet> m_applet;

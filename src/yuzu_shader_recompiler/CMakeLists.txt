@@ -216,6 +216,7 @@ add_library(shader_recompiler STATIC
     frontend/maxwell/translate_program.h
     host_translate_info.h
     ir_opt/collect_shader_info_pass.cpp
+    ir_opt/conditional_value.h
     ir_opt/conditional_barrier_pass.cpp
     ir_opt/constant_propagation_pass.cpp
     ir_opt/dead_code_elimination_pass.cpp
@@ -226,20 +227,29 @@ add_library(shader_recompiler STATIC
     ir_opt/lower_fp16_to_fp32.cpp
     ir_opt/lower_fp64_to_fp32.cpp
     ir_opt/lower_int64_to_int32.cpp
+    ir_opt/bindless_descriptor.h
     ir_opt/passes.h
+    ir_opt/pixel_local_read_pass.cpp
     ir_opt/position_pass.cpp
     ir_opt/rescaling_pass.cpp
+    ir_opt/reconstruction_pass.cpp
+    ir_opt/reconstruction_pass.h
+    ir_opt/geometry_layer_forwarding_pass.cpp
+    ir_opt/shared_memory_packing_pass.cpp
     ir_opt/ssa_rewrite_pass.cpp
     ir_opt/texture_pass.cpp
     ir_opt/vendor_workaround_pass.cpp
     ir_opt/verification_pass.cpp
+    ir_opt/vtg_to_compute_pass.cpp
     object_pool.h
     precompiled_headers.h
     profile.h
     program_header.h
     runtime_info.h
+    scale_trace.h
     shader_info.h
     varying_state.h
+    vtg_as_compute.h
 )
 
 target_include_directories(shader_recompiler PRIVATE

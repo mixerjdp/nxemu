@@ -131,6 +131,36 @@ Result Container::SetLayerBlending(u64 layer_id, bool enabled) {
     R_SUCCEED();
 }
 
+Result Container::SetLayerZIndex(u64 layer_id, s32 z_index) {
+    std::scoped_lock lk{m_lock};
+
+    auto* const layer = m_layers.GetLayerById(layer_id);
+    R_UNLESS(layer != nullptr, VI::ResultNotFound);
+
+    if (auto layer_ref = m_surface_flinger->FindLayer(layer->GetConsumerBinderId())) {
+        layer_ref->z_index = z_index;
+    } else {
+        LOG_WARNING(Service_VI,
+                    "SetLayerZIndex failed to find SurfaceFlinger layer for layer_id={} (cid={})",
+                    layer_id, layer->GetConsumerBinderId());
+    }
+
+    R_SUCCEED();
+}
+
+Result Container::GetLayerZIndex(u64 layer_id, s32* out_z_index) {
+    std::scoped_lock lk{m_lock};
+
+    auto* const layer = m_layers.GetLayerById(layer_id);
+    R_UNLESS(layer != nullptr, VI::ResultNotFound);
+
+    const auto surface_layer = m_surface_flinger->FindLayer(layer->GetConsumerBinderId());
+    R_UNLESS(surface_layer != nullptr, VI::ResultNotFound);
+
+    *out_z_index = surface_layer->z_index;
+    R_SUCCEED();
+}
+
 void Container::LinkVsyncEvent(u64 display_id, Event* event) {
     std::scoped_lock lk{m_lock};
     m_conductor->LinkVsyncEvent(display_id, event);
@@ -218,9 +248,25 @@ Result Container::CloseLayerLocked(u64 layer_id) {
 
 bool Container::ComposeOnDisplay(s32* out_swap_interval, f32* out_compose_speed_scale,
                                  u64 display_id) {
+    {
+        std::scoped_lock lk{m_lock};
+        if (m_is_shut_down || !m_surface_flinger->DisplayHasLayers(display_id)) {
+            return false;
+        }
+        if (!m_surface_flinger->NeedsFramebufferUpdate(display_id)) {
+            return m_surface_flinger->ComposeDisplay(out_swap_interval, out_compose_speed_scale,
+                                                     display_id, false);
+        }
+    }
+
+    m_surface_flinger->WaitForComposite();
+
     std::scoped_lock lk{m_lock};
+    if (m_is_shut_down) {
+        return false;
+    }
     return m_surface_flinger->ComposeDisplay(out_swap_interval, out_compose_speed_scale,
-                                             display_id);
+                                             display_id, true);
 }
 
 } // namespace Service::VI

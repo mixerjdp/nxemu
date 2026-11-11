@@ -89,43 +89,34 @@ void AddNVNStorageBuffers(IR::Program& program) {
     if (!program.info.uses_global_memory) {
         return;
     }
-    const u32 driver_cbuf{0};
-    const u32 descriptor_size{0x10};
-    const u32 num_buffers{16};
-    const u32 base{[&] {
-        switch (program.stage) {
-        case Stage::VertexA:
-        case Stage::VertexB:
-            return 0x110u;
-        case Stage::TessellationControl:
-            return 0x210u;
-        case Stage::TessellationEval:
-            return 0x310u;
-        case Stage::Geometry:
-            return 0x410u;
-        case Stage::Fragment:
-            return 0x510u;
-        case Stage::Compute:
-            return 0x310u;
-        }
-        throw InvalidArgument("Invalid stage {}", program.stage);
-    }()};
-    auto& descs{program.info.storage_buffers_descriptors};
-    for (u32 index = 0; index < num_buffers; ++index) {
-        if (!program.info.nvn_buffer_used[index]) {
+    auto& info{program.info};
+    auto& descs{info.storage_buffers_descriptors};
+    for (auto& desc : descs) {
+        // Runtime global reads may select any tracked buffer, including one outside
+        // the NVN table. Helpers also read its byte size at offset +8. Marking every
+        // buffer as written would make the GPU download buffers it only reads, over
+        // newer CPU writes.
+        auto& used_size = info.constant_buffer_used_sizes[desc.cbuf_index];
+        used_size = std::max(used_size, desc.cbuf_offset + 12);
+    }
+    for (size_t nvn_index = 0; nvn_index < info.nvn_buffer_used.size(); ++nvn_index) {
+        if (!info.nvn_buffer_used[nvn_index]) {
             continue;
         }
-        const u32 offset{base + index * descriptor_size};
-        const auto it{std::ranges::find(descs, offset, &StorageBufferDescriptor::cbuf_offset)};
+        const u32 offset{NvnStorageBufferOffset(info, nvn_index)};
+        const auto it{std::ranges::find_if(descs, [offset](const StorageBufferDescriptor& desc) {
+            return desc.cbuf_index == Info::NVN_STORAGE_BUFFER_CBUF_INDEX &&
+                   desc.cbuf_offset == offset;
+        })};
         if (it != descs.end()) {
-            it->is_written |= program.info.stores_global_memory;
+            it->is_written |= info.stores_global_memory;
             continue;
         }
         descs.push_back({
-            .cbuf_index = driver_cbuf,
+            .cbuf_index = Info::NVN_STORAGE_BUFFER_CBUF_INDEX,
             .cbuf_offset = offset,
             .count = 1,
-            .is_written = program.info.stores_global_memory,
+            .is_written = info.stores_global_memory,
         });
     }
 }
@@ -449,6 +440,77 @@ IR::Program GenerateGeometryPassthrough(ObjectPool<IR::Inst>& inst_pool,
     program.post_order_blocks = PostOrder(program.syntax_list.front());
     Optimization::SsaRewritePass(program);
 
+    return program;
+}
+
+IR::Program GenerateVtgPassthroughVertex(ObjectPool<IR::Inst>& inst_pool,
+                                         ObjectPool<IR::Block>& block_pool,
+                                         const IR::Program& source_program,
+                                         const VaryingState& source_stores,
+                                         const VtgVaryingLayout& layout) {
+    static constexpr u32 word_size{sizeof(u32)};
+    IR::Program program;
+    program.stage = Stage::VertexB;
+    program.info.legacy_stores_mapping = source_program.info.legacy_stores_mapping;
+    program.info.used_clip_distances = source_program.info.used_clip_distances;
+    program.info.loads.Set(IR::Attribute::VertexId);
+    program.info.used_storage_buffer_types = IR::Type::U32;
+    program.info.storage_buffers_descriptors.push_back({
+        .cbuf_index = static_cast<u32>(Info::MAX_CBUFS),
+        .cbuf_offset = 0,
+        .count = 1,
+        .is_written = false,
+    });
+
+    IR::Block* const current_block{block_pool.Create(inst_pool)};
+    auto& node{program.syntax_list.emplace_back()};
+    node.type = IR::AbstractSyntaxNode::Type::Block;
+    node.data.block = current_block;
+
+    IR::IREmitter ir{*current_block};
+    ir.Prologue();
+    const IR::U32 vertex{ir.GetAttributeU32(IR::Attribute::VertexId)};
+    const IR::U32 base{ir.IMul(vertex, ir.Imm32(layout.stride * word_size))};
+    const auto forward{[&](IR::Attribute attribute) {
+        const std::optional<u32> word{layout.Offset(attribute)};
+        if (!word) {
+            return;
+        }
+        const IR::U32 offset{ir.IAdd(base, ir.Imm32(*word * word_size))};
+        current_block->AppendNewInst(IR::Opcode::LoadStorage32,
+                                     {IR::Value{0U}, IR::Value{offset}});
+        const IR::U32 value{IR::Value{&current_block->back()}};
+        ir.SetAttribute(attribute, ir.BitCast<IR::F32>(value), ir.Imm32(0U));
+        program.info.stores.Set(attribute);
+    }};
+    for (u32 element = 0; element < 4; ++element) {
+        forward(IR::Attribute::PositionX + element);
+    }
+    for (u32 index = 0; index < IR::NUM_GENERICS; ++index) {
+        for (u32 element = 0; element < 4; ++element) {
+            forward(IR::Attribute::Generic0X + index * 4 + element);
+        }
+    }
+    for (u32 index = 0; index < 8; ++index) {
+        if (source_stores[IR::Attribute::ClipDistance0 + index]) {
+            forward(IR::Attribute::ClipDistance0 + index);
+        }
+    }
+    forward(IR::Attribute::PointSize);
+    forward(IR::Attribute::Layer);
+    forward(IR::Attribute::ViewportIndex);
+
+    IR::Block* const return_block{block_pool.Create(inst_pool)};
+    IR::IREmitter{*return_block}.Epilogue();
+    current_block->AddBranch(return_block);
+
+    auto& merge{program.syntax_list.emplace_back()};
+    merge.type = IR::AbstractSyntaxNode::Type::Block;
+    merge.data.block = return_block;
+    program.syntax_list.emplace_back().type = IR::AbstractSyntaxNode::Type::Return;
+
+    program.blocks = GenerateBlocks(program.syntax_list);
+    program.post_order_blocks = PostOrder(program.syntax_list.front());
     return program;
 }
 

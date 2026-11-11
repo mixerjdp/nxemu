@@ -22,7 +22,7 @@ IFileSystem::IFileSystem(Core::System & system_, IVirtualDirectoryPtr && dir_, S
         {3, D<&IFileSystem::DeleteDirectory>, "DeleteDirectory"},
         {4, D<&IFileSystem::DeleteDirectoryRecursively>, "DeleteDirectoryRecursively"},
         {5, D<&IFileSystem::RenameFile>, "RenameFile"},
-        {6, nullptr, "RenameDirectory"},
+        {6, D<&IFileSystem::RenameDirectory>, "RenameDirectory"},
         {7, D<&IFileSystem::GetEntryType>, "GetEntryType"},
         {8, D<&IFileSystem::OpenFile>, "OpenFile"},
         {9, D<&IFileSystem::OpenDirectory>, "OpenDirectory"},
@@ -30,9 +30,9 @@ IFileSystem::IFileSystem(Core::System & system_, IVirtualDirectoryPtr && dir_, S
         {11, D<&IFileSystem::GetFreeSpaceSize>, "GetFreeSpaceSize"},
         {12, D<&IFileSystem::GetTotalSpaceSize>, "GetTotalSpaceSize"},
         {13, D<&IFileSystem::CleanDirectoryRecursively>, "CleanDirectoryRecursively"},
-        {14, nullptr, "GetFileTimeStampRaw"},
+        {14, D<&IFileSystem::GetFileTimeStampRaw>, "GetFileTimeStampRaw"},
         {15, nullptr, "QueryEntry"},
-        {16, nullptr, "GetFileSystemAttribute"},
+        {16, D<&IFileSystem::GetFileSystemAttribute>, "GetFileSystemAttribute"},
     };
     RegisterHandlers(functions);
 }
@@ -40,6 +40,7 @@ IFileSystem::IFileSystem(Core::System & system_, IVirtualDirectoryPtr && dir_, S
 Result IFileSystem::CreateFile(const InLargeData<FileSys::Sf::Path, BufferAttr_HipcPointer> path, s32 option, s64 size)
 {
     LOG_DEBUG(Service_FS, "called. file={}, option=0x{:X}, size=0x{:08X}", path->str, option, size);
+    NoteFileSystemWrite();
 
     R_RETURN(backend->CreateFile(FileSys::Path(path->str), size));
 }
@@ -47,6 +48,7 @@ Result IFileSystem::CreateFile(const InLargeData<FileSys::Sf::Path, BufferAttr_H
 Result IFileSystem::DeleteFile(const InLargeData<FileSys::Sf::Path, BufferAttr_HipcPointer> path)
 {
     LOG_DEBUG(Service_FS, "called. file={}", path->str);
+    NoteFileSystemWrite();
 
     R_RETURN(backend->DeleteFile(FileSys::Path(path->str)));
 }
@@ -54,6 +56,7 @@ Result IFileSystem::DeleteFile(const InLargeData<FileSys::Sf::Path, BufferAttr_H
 Result IFileSystem::CreateDirectory(const InLargeData<FileSys::Sf::Path, BufferAttr_HipcPointer> path)
 {
     LOG_DEBUG(Service_FS, "called. directory={}", path->str);
+    NoteFileSystemWrite();
 
     R_RETURN(backend->CreateDirectory(FileSys::Path(path->str)));
 }
@@ -61,32 +64,41 @@ Result IFileSystem::CreateDirectory(const InLargeData<FileSys::Sf::Path, BufferA
 Result IFileSystem::DeleteDirectory(const InLargeData<FileSys::Sf::Path, BufferAttr_HipcPointer> path)
 {
     LOG_DEBUG(Service_FS, "called. directory={}", path->str);
+    NoteFileSystemWrite();
 
-    UNIMPLEMENTED();
-    R_SUCCEED();
+    R_RETURN(backend->DeleteDirectory(FileSys::Path(path->str)));
 }
 
 Result IFileSystem::DeleteDirectoryRecursively(const InLargeData<FileSys::Sf::Path, BufferAttr_HipcPointer> path)
 {
     LOG_DEBUG(Service_FS, "called. directory={}", path->str);
+    NoteFileSystemWrite();
 
-    UNIMPLEMENTED();
-    R_SUCCEED();
+    R_RETURN(backend->DeleteDirectoryRecursively(FileSys::Path(path->str)));
 }
 
 Result IFileSystem::CleanDirectoryRecursively(const InLargeData<FileSys::Sf::Path, BufferAttr_HipcPointer> path)
 {
     LOG_DEBUG(Service_FS, "called. Directory: {}", path->str);
+    NoteFileSystemWrite();
 
-    UNIMPLEMENTED();
-    R_SUCCEED();
+    R_RETURN(backend->CleanDirectoryRecursively(FileSys::Path(path->str)));
 }
 
 Result IFileSystem::RenameFile(const InLargeData<FileSys::Sf::Path, BufferAttr_HipcPointer> old_path, const InLargeData<FileSys::Sf::Path, BufferAttr_HipcPointer> new_path)
 {
     LOG_DEBUG(Service_FS, "called. file '{}' to file '{}'", old_path->str, new_path->str);
+    NoteFileSystemWrite();
 
     R_RETURN(backend->RenameFile(FileSys::Path(old_path->str), FileSys::Path(new_path->str)));
+}
+
+Result IFileSystem::RenameDirectory(const InLargeData<FileSys::Sf::Path, BufferAttr_HipcPointer> old_path, const InLargeData<FileSys::Sf::Path, BufferAttr_HipcPointer> new_path)
+{
+    LOG_DEBUG(Service_FS, "called. directory '{}' to directory '{}'", old_path->str, new_path->str);
+    NoteFileSystemWrite();
+
+    R_RETURN(backend->RenameDirectory(FileSys::Path(old_path->str), FileSys::Path(new_path->str)));
 }
 
 Result IFileSystem::OpenFile(OutInterface<IFile> out_interface, const InLargeData<FileSys::Sf::Path, BufferAttr_HipcPointer> path, u32 mode)
@@ -125,6 +137,7 @@ Result IFileSystem::GetEntryType(Out<u32> out_type, const InLargeData<FileSys::S
 Result IFileSystem::Commit()
 {
     LOG_WARNING(Service_FS, "(STUBBED) called");
+    NoteFileSystemWrite();
 
     R_SUCCEED();
 }
@@ -133,7 +146,7 @@ Result IFileSystem::GetFreeSpaceSize(Out<s64> out_size, const InLargeData<FileSy
 {
     LOG_DEBUG(Service_FS, "called");
 
-    UNIMPLEMENTED();
+    *out_size = static_cast<s64>(size_getter.get_free_size());
     R_SUCCEED();
 }
 
@@ -141,7 +154,59 @@ Result IFileSystem::GetTotalSpaceSize(Out<s64> out_size, const InLargeData<FileS
 {
     LOG_DEBUG(Service_FS, "called");
 
-    UNIMPLEMENTED();
+    *out_size = static_cast<s64>(size_getter.get_total_size());
+    R_SUCCEED();
+}
+
+Result IFileSystem::GetFileTimeStampRaw(Out<VirtualFileTimeStampRaw> out_timestamp, const InLargeData<FileSys::Sf::Path, BufferAttr_HipcPointer> path)
+{
+    LOG_DEBUG(Service_FS, "called. file={}", path->str);
+
+    R_RETURN(backend->GetFileTimeStampRaw(out_timestamp.Get(), FileSys::Path(path->str)));
+}
+
+Result IFileSystem::GetFileSystemAttribute(Out<FileSys::FileSystemAttribute> out_attribute)
+{
+    LOG_WARNING(Service_FS, "(STUBBED) called");
+
+    constexpr s32 kEntryNameLengthMax = 0x80;
+    constexpr s32 kPathLengthMax = 0x300;
+
+    FileSys::FileSystemAttribute attribute{};
+
+    attribute.dir_entry_name_length_max_defined = true;
+    attribute.file_entry_name_length_max_defined = true;
+    attribute.dir_path_name_length_max_defined = true;
+    attribute.file_path_name_length_max_defined = true;
+
+    attribute.utf16_create_dir_path_len_max_defined = true;
+    attribute.utf16_delete_dir_path_len_max_defined = true;
+    attribute.utf16_rename_src_dir_path_len_max_defined = true;
+    attribute.utf16_rename_dest_dir_path_len_max_defined = true;
+    attribute.utf16_open_dir_path_len_max_defined = true;
+
+    attribute.utf16_dir_entry_name_length_max_defined = true;
+    attribute.utf16_file_entry_name_length_max_defined = true;
+    attribute.utf16_dir_path_name_length_max_defined = true;
+    attribute.utf16_file_path_name_length_max_defined = true;
+
+    attribute.dir_entry_name_length_max = kEntryNameLengthMax;
+    attribute.file_entry_name_length_max = kEntryNameLengthMax;
+    attribute.dir_path_name_length_max = kPathLengthMax;
+    attribute.file_path_name_length_max = kPathLengthMax;
+
+    attribute.utf16_create_dir_path_length_max = kPathLengthMax;
+    attribute.utf16_delete_dir_path_length_max = kPathLengthMax;
+    attribute.utf16_rename_src_dir_path_length_max = kPathLengthMax;
+    attribute.utf16_rename_dest_dir_path_length_max = kPathLengthMax;
+    attribute.utf16_open_dir_path_length_max = kPathLengthMax;
+
+    attribute.utf16_dir_entry_name_length_max = kEntryNameLengthMax;
+    attribute.utf16_file_entry_name_length_max = kEntryNameLengthMax;
+    attribute.utf16_dir_path_name_length_max = kPathLengthMax;
+    attribute.utf16_file_path_name_length_max = kPathLengthMax;
+
+    *out_attribute = attribute;
     R_SUCCEED();
 }
 

@@ -8,6 +8,7 @@
 #include <memory>
 #include <mutex>
 #include <span>
+#include <stop_token>
 #include <string>
 #include <vector>
 
@@ -70,6 +71,7 @@ class ARPManager;
 }
 
 class ServerManager;
+class Event;
 
 namespace SM {
 class ServiceManager;
@@ -118,6 +120,7 @@ namespace Core {
 class CpuManager;
 class Debugger;
 class DeviceMemory;
+class FrameStep;
 class GPUDirtyMemoryManager;
 class PerfStats;
 class Reporter;
@@ -152,13 +155,14 @@ public:
     System(System &&) = delete;
     System & operator=(System &&) = delete;
 
-    void InitializeKernel(uint64_t titleID);
+    void InitializeKernel(uint64_t titleID, bool is_64_bit = true);
 
     /**
      * Initializes the system
      * This function will initialize core functionality used for system emulation
      */
     void Initialize();
+    void InitializeInput();
 
     /**
      * Run the OS and Application
@@ -187,6 +191,7 @@ public:
     /// Forcibly detach the debugger if it is running.
     void DetachDebugger();
 
+    [[nodiscard]] std::stop_token GetShutdownToken() const;
     std::unique_lock<std::mutex> StallApplication();
     void UnstallApplication();
 
@@ -220,7 +225,7 @@ public:
 
     std::span<GPUDirtyMemoryManager> GetGPUDirtyMemoryManager();
 
-    void GatherGPUDirtyMemory(ICacheInvalidator * invalidator);
+    void GatherGPUDirtyMemory(ICacheInvalidator * invalidator, bool rearm_native_reads = true);
 
     ISystemModules & GetSystemModules();
     IVideo & GetVideo();
@@ -308,6 +313,9 @@ public:
     /// Provides a constant reference to the speed limiter
     [[nodiscard]] const Core::SpeedLimiter & SpeedLimiter() const;
 
+    /// The frame step patch sets read (core/frame_step.h)
+    [[nodiscard]] Core::FrameStep & FrameStep();
+
     std::shared_ptr<InputCommon::InputSubsystem> & InputSubsystem() const;
 
     [[nodiscard]] u64 GetApplicationProcessProgramID() const;
@@ -381,7 +389,7 @@ public:
     [[nodiscard]] bool DebuggerEnabled() const override;
 
     /// Runs a server instance until shutdown.
-    void RunServer(std::unique_ptr<Service::ServerManager> && server_manager);
+    bool RunServer(std::unique_ptr<Service::ServerManager> && server_manager);
 
     /**
      * Registers a callback from the frontend for System to re-launch the application using a
@@ -402,6 +410,9 @@ public:
      * It is used to transfer data between programs.
      */
     [[nodiscard]] std::deque<std::vector<u8>> & GetUserChannel();
+    void PushGeneralChannelData(std::vector<u8>&& data);
+    bool TryPopGeneralChannel(std::vector<u8>& out_data);
+    [[nodiscard]] Service::Event& GetGeneralChannelEvent();
 
     /**
      * Registers a callback from the frontend for System to exit the application.

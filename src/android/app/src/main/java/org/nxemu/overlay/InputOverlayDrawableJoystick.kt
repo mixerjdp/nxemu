@@ -16,7 +16,6 @@ import kotlin.math.sqrt
 import org.nxemu.features.input.NativeInput.ButtonState
 import org.nxemu.features.input.model.NativeAnalog
 import org.nxemu.features.input.model.NativeButton
-import org.nxemu.features.settings.model.BooleanSetting
 
 /**
  * Custom [BitmapDrawable] that is capable
@@ -126,12 +125,10 @@ class InputOverlayDrawableJoystick(
             pressedState = true
             outerBitmap.alpha = 0
             boundsBoxBitmap.alpha = opacity
-            if (BooleanSetting.JOYSTICK_REL_CENTER.getBoolean()) {
-                virtBounds.offset(
-                    xPosition - virtBounds.centerX(),
-                    yPosition - virtBounds.centerY()
-                )
-            }
+            virtBounds.offset(
+                xPosition - virtBounds.centerX(),
+                yPosition - virtBounds.centerY()
+            )
             boundsBoxBitmap.bounds = virtBounds
             trackId = pointerId
         }
@@ -200,7 +197,7 @@ class InputOverlayDrawableJoystick(
         val fingerPositionX = event.getX(pointerIndex).toInt()
         val fingerPositionY = event.getY(pointerIndex).toInt()
 
-        when (event.action) {
+        when (event.actionMasked) {
             MotionEvent.ACTION_DOWN -> {
                 previousTouchX = fingerPositionX
                 previousTouchY = fingerPositionY

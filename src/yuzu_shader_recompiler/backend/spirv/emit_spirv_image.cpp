@@ -1,6 +1,8 @@
 // SPDX-FileCopyrightText: Copyright 2021 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <optional>
+
 #include <boost/container/static_vector.hpp>
 
 #include "yuzu_shader_recompiler/backend/spirv/emit_spirv.h"
@@ -39,7 +41,7 @@ public:
             if (offset.IsEmpty()) {
                 return;
             }
-            Add(spv::ImageOperandsMask::Offset, ctx.Def(offset));
+            Add(spv::ImageOperandsMask::Offset, SignedOffset(ctx, offset));
             return;
         }
         const std::array values{offset.InstRecursive(), offset2.InstRecursive()};
@@ -51,12 +53,14 @@ public:
         if (opcode != values[1]->GetOpcode() || opcode != IR::Opcode::CompositeConstructU32x4) {
             throw LogicError("Invalid PTP arguments");
         }
-        auto read{[&](unsigned int a, unsigned int b) { return values[a]->Arg(b).U32(); }};
+        auto read{[&](unsigned int a, unsigned int b) {
+            return static_cast<s32>(values[a]->Arg(b).U32());
+        }};
 
         const Id offsets{ctx.ConstantComposite(
-            ctx.TypeArray(ctx.U32[2], ctx.Const(4U)), ctx.Const(read(0, 0), read(0, 1)),
-            ctx.Const(read(0, 2), read(0, 3)), ctx.Const(read(1, 0), read(1, 1)),
-            ctx.Const(read(1, 2), read(1, 3)))};
+            ctx.TypeArray(ctx.S32[2], ctx.Const(4U)), ctx.SConst(read(0, 0), read(0, 1)),
+            ctx.SConst(read(0, 2), read(0, 3)), ctx.SConst(read(1, 0), read(1, 1)),
+            ctx.SConst(read(1, 2), read(1, 3)))};
         Add(spv::ImageOperandsMask::ConstOffsets, offsets);
     }
 
@@ -130,6 +134,46 @@ public:
     }
 
 private:
+    // The IR carries offsets as unsigned vectors. Texel offsets are signed, and
+    // Metal has no gather overload taking an unsigned one, so MoltenVK fails to
+    // compile the shader.
+    static Id SignedOffset(EmitContext& ctx, const IR::Value& offset) {
+        if (offset.IsImmediate()) {
+            return ctx.SConst(static_cast<s32>(offset.U32()));
+        }
+        IR::Inst* const inst{offset.InstRecursive()};
+        if (inst->AreAllArgsImmediates()) {
+            switch (inst->GetOpcode()) {
+            case IR::Opcode::CompositeConstructU32x2:
+                return ctx.SConst(static_cast<s32>(inst->Arg(0).U32()),
+                                  static_cast<s32>(inst->Arg(1).U32()));
+            case IR::Opcode::CompositeConstructU32x3:
+                return ctx.SConst(static_cast<s32>(inst->Arg(0).U32()),
+                                  static_cast<s32>(inst->Arg(1).U32()),
+                                  static_cast<s32>(inst->Arg(2).U32()));
+            case IR::Opcode::CompositeConstructU32x4:
+                return ctx.SConst(static_cast<s32>(inst->Arg(0).U32()),
+                                  static_cast<s32>(inst->Arg(1).U32()),
+                                  static_cast<s32>(inst->Arg(2).U32()),
+                                  static_cast<s32>(inst->Arg(3).U32()));
+            default:
+                break;
+            }
+        }
+        switch (offset.Type()) {
+        case IR::Type::U32:
+            return ctx.OpBitcast(ctx.S32[1], ctx.Def(offset));
+        case IR::Type::U32x2:
+            return ctx.OpBitcast(ctx.S32[2], ctx.Def(offset));
+        case IR::Type::U32x3:
+            return ctx.OpBitcast(ctx.S32[3], ctx.Def(offset));
+        case IR::Type::U32x4:
+            return ctx.OpBitcast(ctx.S32[4], ctx.Def(offset));
+        default:
+            return ctx.Def(offset);
+        }
+    }
+
     void AddOffset(EmitContext& ctx, const IR::Value& offset, bool runtime_offset_allowed) {
         if (offset.IsEmpty()) {
             return;
@@ -164,7 +208,7 @@ private:
             }
         }
         if (runtime_offset_allowed) {
-            Add(spv::ImageOperandsMask::Offset, ctx.Def(offset));
+            Add(spv::ImageOperandsMask::Offset, SignedOffset(ctx, offset));
         }
     }
 
@@ -185,17 +229,96 @@ private:
     spv::ImageOperandsMask mask{};
 };
 
-Id Texture(EmitContext& ctx, IR::TextureInstInfo info, [[maybe_unused]] const IR::Value& index) {
+// Combines the image and the sampler selected by a runtime handle. The index packs the
+// texture index in its low 20 bits and the sampler index above them.
+Id DirectTexture(EmitContext& ctx, const TextureDefinition& def, const IR::Value& index) {
+    if (!ctx.profile.support_sampled_image_array_nonuniform_indexing) {
+        throw NotImplementedException("Nonuniform sampled texture indexing is unsupported by the host");
+    }
+    const Id packed{ctx.Def(index)};
+    const Id image_index{ctx.OpBitwiseAnd(ctx.U32[1], packed, ctx.Const(0xfffffU))};
+    const Id sampler_index{ctx.runtime_samplers_linked
+                               ? image_index
+                               : ctx.OpShiftRightLogical(ctx.U32[1], packed, ctx.Const(20U))};
+    const Id image_pointer{ctx.OpAccessChain(def.pointer_type, def.id, image_index)};
+    const Id image{ctx.OpLoad(def.image_type, image_pointer)};
+    const Id sampler_pointer{
+        ctx.OpAccessChain(ctx.runtime_sampler_pointer, ctx.runtime_samplers, sampler_index)};
+    const Id sampler{ctx.OpLoad(ctx.runtime_sampler_type, sampler_pointer)};
+    const Id sampled_image{ctx.OpSampledImage(def.sampled_type, image, sampler)};
+    ctx.uses_nonuniform_sampled_image = true;
+    for (const Id object : {image_index, sampler_index, image_pointer, image, sampler_pointer,
+                            sampler, sampled_image}) {
+        if (ctx.nonuniform_sampled_ids.insert(object.value).second) {
+            ctx.Decorate(object, spv::Decoration::NonUniform);
+        }
+    }
+    return sampled_image;
+}
+
+Id Texture(EmitContext& ctx, IR::TextureInstInfo info, const IR::Value& index) {
     const TextureDefinition& def{ctx.textures.at(info.descriptor_index)};
+    if (def.is_direct) {
+        return DirectTexture(ctx, def, index);
+    }
     if (def.count > 1) {
-        const Id pointer{ctx.OpAccessChain(def.pointer_type, def.id, ctx.Def(index))};
-        return ctx.OpLoad(def.sampled_type, pointer);
+        if (!index.IsImmediate() && !ctx.profile.support_sampled_image_array_nonuniform_indexing) {
+            throw NotImplementedException("Nonuniform sampled texture indexing is unsupported by the host");
+        }
+        const Id array_index{ctx.Def(index)};
+        const Id pointer{ctx.OpAccessChain(def.pointer_type, def.id, array_index)};
+        const Id sampled_image{ctx.OpLoad(def.sampled_type, pointer)};
+        // Guest bindless handles can depend on interpolated surface coordinates. Without
+        // NonUniform, the host may select a single array element for the entire subgroup.
+        if (!index.IsImmediate() && ctx.profile.support_sampled_image_array_nonuniform_indexing) {
+            ctx.uses_nonuniform_sampled_image = true;
+            for (const Id object : {array_index, pointer, sampled_image}) {
+                if (ctx.nonuniform_sampled_ids.insert(object.value).second) {
+                    ctx.Decorate(object, spv::Decoration::NonUniform);
+                }
+            }
+        }
+        return sampled_image;
     } else {
         return ctx.OpLoad(def.sampled_type, def.id);
     }
 }
 
-Id TextureImage(EmitContext& ctx, IR::TextureInstInfo info, const IR::Value& index) {
+/// With Profile::texel_buffer_size_view, size_view selects the view that has the size the guest
+/// bound instead of the one that is read.
+Id TextureImage(EmitContext& ctx, IR::TextureInstInfo info, const IR::Value& index,
+                bool size_view = false) {
+    if (info.type == TextureType::Buffer && ctx.texture_buffers.at(info.descriptor_index).count > 1) {
+        if (!ctx.profile.support_uniform_texel_buffer_array_nonuniform_indexing) {
+            throw NotImplementedException("Nonuniform texel buffer indexing is unsupported by the host");
+        }
+        const auto& def = ctx.texture_buffers.at(info.descriptor_index);
+        const Id array_index{ctx.Def(index)};
+        Id element{array_index};
+        if (ctx.profile.texel_buffer_size_view) {
+            element = ctx.OpIAdd(ctx.U32[1],
+                                 ctx.OpShiftLeftLogical(ctx.U32[1], array_index, ctx.Const(1U)),
+                                 ctx.Const(size_view ? 1U : 0U));
+        }
+        const Id pointer_type{ctx.TypePointer(spv::StorageClass::UniformConstant, ctx.image_buffer_type)};
+        const Id pointer{ctx.OpAccessChain(pointer_type, def.id, element)};
+        const Id image{ctx.OpLoad(ctx.image_buffer_type, pointer)};
+        ctx.uses_nonuniform_uniform_texel_buffer = true;
+        for (const Id object : {array_index, element, pointer, image}) {
+            if (ctx.nonuniform_sampled_ids.insert(object.value).second) {
+                ctx.Decorate(object, spv::Decoration::NonUniform);
+            }
+        }
+        return image;
+    }
+    if (info.type != TextureType::Buffer && ctx.textures.at(info.descriptor_index).count > 1) {
+        const auto& def = ctx.textures.at(info.descriptor_index);
+        const Id image{ctx.OpImage(def.image_type, Texture(ctx, info, index))};
+        if (!index.IsImmediate() && ctx.nonuniform_sampled_ids.insert(image.value).second) {
+            ctx.Decorate(image, spv::Decoration::NonUniform);
+        }
+        return image;
+    }
     if (!index.IsEmpty() && (!index.IsImmediate() || index.U32() != 0)) {
         throw NotImplementedException("Indirect image indexing");
     }
@@ -203,6 +326,11 @@ Id TextureImage(EmitContext& ctx, IR::TextureInstInfo info, const IR::Value& ind
         const TextureBufferDefinition& def{ctx.texture_buffers.at(info.descriptor_index)};
         if (def.count > 1) {
             throw NotImplementedException("Indirect texture sample");
+        }
+        if (ctx.profile.texel_buffer_size_view) {
+            const Id view{
+                ctx.TexelBufferView(def.id, ctx.image_buffer_type, ctx.Const(size_view ? 1U : 0U))};
+            return ctx.OpLoad(ctx.image_buffer_type, view);
         }
         return ctx.OpLoad(ctx.image_buffer_type, def.id);
     } else {
@@ -214,15 +342,41 @@ Id TextureImage(EmitContext& ctx, IR::TextureInstInfo info, const IR::Value& ind
     }
 }
 
-std::pair<Id, bool> Image(EmitContext& ctx, const IR::Value& index, IR::TextureInstInfo info) {
-    if (!index.IsEmpty() && (!index.IsImmediate() || index.U32() != 0)) {
-        throw NotImplementedException("Indirect image indexing");
-    }
+std::pair<Id, bool> Image(EmitContext& ctx, const IR::Value& index, IR::TextureInstInfo info,
+                          bool size_view = false) {
     if (info.type == TextureType::Buffer) {
+        if (!index.IsEmpty() && (!index.IsImmediate() || index.U32() != 0)) {
+            throw NotImplementedException("Indirect image buffer indexing");
+        }
         const ImageBufferDefinition def{ctx.image_buffers.at(info.descriptor_index)};
+        if (ctx.profile.texel_buffer_size_view) {
+            const Id view{
+                ctx.TexelBufferView(def.id, def.image_type, ctx.Const(size_view ? 1U : 0U))};
+            return {ctx.OpLoad(def.image_type, view), def.is_integer};
+        }
         return {ctx.OpLoad(def.image_type, def.id), def.is_integer};
     } else {
         const ImageDefinition def{ctx.images.at(info.descriptor_index)};
+        if (def.count > 1) {
+            if (!index.IsImmediate() && !ctx.profile.support_storage_image_array_nonuniform_indexing) {
+                throw NotImplementedException("Nonuniform storage image indexing is unsupported by the host");
+            }
+            const Id array_index{ctx.Def(index)};
+            const Id pointer{ctx.OpAccessChain(def.pointer_type, def.id, array_index)};
+            const Id image{ctx.OpLoad(def.image_type, pointer)};
+            if (!index.IsImmediate()) {
+                ctx.uses_nonuniform_storage_image = true;
+                for (const Id object : {array_index, pointer, image}) {
+                    if (ctx.nonuniform_sampled_ids.insert(object.value).second) {
+                        ctx.Decorate(object, spv::Decoration::NonUniform);
+                    }
+                }
+            }
+            return {image, def.is_integer};
+        }
+        if (!index.IsEmpty() && (!index.IsImmediate() || index.U32() != 0)) {
+            throw NotImplementedException("Indirect single image indexing");
+        }
         return {ctx.OpLoad(def.image_type, def.id), def.is_integer};
     }
 }
@@ -258,6 +412,48 @@ Id Emit(MethodPtrType sparse_ptr, MethodPtrType non_sparse_ptr, EmitContext& ctx
     return ctx.OpCompositeExtract(result_type, sample, 1U);
 }
 
+/// The color attachment the host reads a pixel local texture from, or 0xF to sample it
+std::optional<Id> AttachmentReadSelector(EmitContext& ctx, IR::TextureInstInfo info) {
+    if (info.type == TextureType::Buffer) {
+        return std::nullopt;
+    }
+    const TextureDefinition& def{ctx.textures.at(info.descriptor_index)};
+    if (def.attachment_read_slot == TextureDefinition::NO_ATTACHMENT_READ) {
+        return std::nullopt;
+    }
+    const Id pointer_type{ctx.TypePointer(spv::StorageClass::PushConstant, ctx.U32[1])};
+    const Id member{ctx.Const(ctx.rescaling_attachment_reads_member_index)};
+    const Id pointer{ctx.OpAccessChain(pointer_type, ctx.rescaling_push_constants, member)};
+    const Id reads{ctx.OpLoad(ctx.U32[1], pointer)};
+    return ctx.OpBitFieldUExtract(ctx.U32[1], reads, ctx.Const(def.attachment_read_slot * 4),
+                                  ctx.Const(4U));
+}
+
+Id Splat(EmitContext& ctx, Id condition, u32 size) {
+    const Id type{ctx.TypeVector(ctx.U1, static_cast<int>(size))};
+    return size == 2 ? ctx.OpCompositeConstruct(type, condition, condition)
+                     : ctx.OpCompositeConstruct(type, condition, condition, condition, condition);
+}
+
+/// Replaces the texel by the selected color attachment of the fragment's own pixel.
+/// The host binds a null texture while it selects one, so the sample above reads nothing.
+Id ReadAttachment(EmitContext& ctx, std::optional<Id> selector, Id texel) {
+    if (!selector) {
+        return texel;
+    }
+    const Id coords{ctx.SConst(0, 0)};
+    for (u32 index = 0; index < ctx.input_attachments.size(); ++index) {
+        if (!Sirit::ValidId(ctx.input_attachments[index])) {
+            continue;
+        }
+        const Id attachment{ctx.OpLoad(ctx.input_attachment_type, ctx.input_attachments[index])};
+        const Id value{ctx.OpImageRead(ctx.F32[4], attachment, coords)};
+        const Id is_selected{ctx.OpIEqual(ctx.U1, *selector, ctx.Const(index))};
+        texel = ctx.OpSelect(ctx.F32[4], Splat(ctx, is_selected, 4), value, texel);
+    }
+    return texel;
+}
+
 Id IsScaled(EmitContext& ctx, const IR::Value& index, Id member_index, u32 base_index) {
     const Id push_constant_u32{ctx.TypePointer(spv::StorageClass::PushConstant, ctx.U32[1])};
     Id bit{};
@@ -276,8 +472,12 @@ Id IsScaled(EmitContext& ctx, const IR::Value& index, Id member_index, u32 base_
         if (base_index != 0) {
             index_value = ctx.OpIAdd(ctx.U32[1], index_value, ctx.Const(base_index));
         }
+        const Id word_index{ctx.OpShiftRightLogical(ctx.U32[1], index_value, ctx.Const(5u))};
+        const Id pointer{ctx.OpAccessChain(push_constant_u32, ctx.rescaling_push_constants,
+                                           member_index, word_index)};
+        const Id word{ctx.OpLoad(ctx.U32[1], pointer)};
         const Id bit_index{ctx.OpBitwiseAnd(ctx.U32[1], index_value, ctx.Const(31u))};
-        bit = ctx.OpBitFieldUExtract(ctx.U32[1], index_value, bit_index, ctx.Const(1u));
+        bit = ctx.OpBitFieldUExtract(ctx.U32[1], word, bit_index, ctx.Const(1u));
     }
     return ctx.OpINotEqual(ctx.U1, bit, ctx.u32_zero_value);
 }
@@ -334,8 +534,8 @@ void AddOffsetToCoordinates(EmitContext& ctx, const IR::TextureInstInfo& info, I
         break;
     }
     case TextureType::ColorArray2D:
-        offset = ctx.OpCompositeConstruct(ctx.U32[3], ctx.OpCompositeExtract(ctx.U32[1], coords, 0),
-                                          ctx.OpCompositeExtract(ctx.U32[1], coords, 1),
+        offset = ctx.OpCompositeConstruct(ctx.U32[3], ctx.OpCompositeExtract(ctx.U32[1], offset, 0),
+                                          ctx.OpCompositeExtract(ctx.U32[1], offset, 1),
                                           ctx.u32_zero_value);
         [[fallthrough]];
     case TextureType::Color3D: {
@@ -452,9 +652,11 @@ Id EmitImageSampleImplicitLod(EmitContext& ctx, IR::Inst* inst, const IR::Value&
     if (ctx.stage == Stage::Fragment) {
         const ImageOperands operands(ctx, info.has_bias != 0, false, info.has_lod_clamp != 0,
                                      bias_lc, offset);
-        return Emit(&EmitContext::OpImageSparseSampleImplicitLod,
-                    &EmitContext::OpImageSampleImplicitLod, ctx, inst, ctx.F32[4],
-                    Texture(ctx, info, index), coords, operands.MaskOptional(), operands.Span());
+        const Id texel{Emit(&EmitContext::OpImageSparseSampleImplicitLod,
+                            &EmitContext::OpImageSampleImplicitLod, ctx, inst, ctx.F32[4],
+                            Texture(ctx, info, index), coords, operands.MaskOptional(),
+                            operands.Span())};
+        return ReadAttachment(ctx, AttachmentReadSelector(ctx, info), texel);
     } else {
         // We can't use implicit lods on non-fragment stages on SPIR-V. Maxwell hardware behaves as
         // if the lod was explicitly zero.  This may change on Turing with implicit compute
@@ -471,9 +673,10 @@ Id EmitImageSampleExplicitLod(EmitContext& ctx, IR::Inst* inst, const IR::Value&
                               Id lod, const IR::Value& offset) {
     const auto info{inst->Flags<IR::TextureInstInfo>()};
     const ImageOperands operands(ctx, false, true, false, lod, offset);
-    return Emit(&EmitContext::OpImageSparseSampleExplicitLod,
-                &EmitContext::OpImageSampleExplicitLod, ctx, inst, ctx.F32[4],
-                Texture(ctx, info, index), coords, operands.Mask(), operands.Span());
+    const Id texel{Emit(&EmitContext::OpImageSparseSampleExplicitLod,
+                        &EmitContext::OpImageSampleExplicitLod, ctx, inst, ctx.F32[4],
+                        Texture(ctx, info, index), coords, operands.Mask(), operands.Span())};
+    return ReadAttachment(ctx, AttachmentReadSelector(ctx, info), texel);
 }
 
 Id EmitImageSampleDrefImplicitLod(EmitContext& ctx, IR::Inst* inst, const IR::Value& index,
@@ -536,14 +739,26 @@ Id EmitImageFetch(EmitContext& ctx, IR::Inst* inst, const IR::Value& index, Id c
     AddOffsetToCoordinates(ctx, info, coords, offset);
     if (info.type == TextureType::Buffer) {
         lod = Id{};
+        if (ctx.profile.texel_buffer_size_view) {
+            coords = ctx.TexelBufferCoord(coords, TextureImage(ctx, info, index),
+                                          TextureImage(ctx, info, index, true));
+        }
     }
     if (Sirit::ValidId(ms)) {
         // This image is multisampled, lod must be implicit
         lod = Id{};
     }
+    const std::optional<Id> selector{AttachmentReadSelector(ctx, info)};
+    if (selector) {
+        // Keep the fetch inside the null texture bound while an attachment is read
+        const Id reads{ctx.OpINotEqual(ctx.U1, *selector, ctx.Const(0xFU))};
+        coords = ctx.OpSelect(ctx.U32[2], Splat(ctx, reads, 2), ctx.Const(0U, 0U), coords);
+    }
     const ImageOperands operands(lod, ms);
-    return Emit(&EmitContext::OpImageSparseFetch, &EmitContext::OpImageFetch, ctx, inst, ctx.F32[4],
-                TextureImage(ctx, info, index), coords, operands.MaskOptional(), operands.Span());
+    const Id texel{Emit(&EmitContext::OpImageSparseFetch, &EmitContext::OpImageFetch, ctx, inst,
+                        ctx.F32[4], TextureImage(ctx, info, index), coords,
+                        operands.MaskOptional(), operands.Span())};
+    return ReadAttachment(ctx, selector, texel);
 }
 
 Id EmitImageQueryDimensions(EmitContext& ctx, IR::Inst* inst, const IR::Value& index, Id lod,
@@ -571,8 +786,12 @@ Id EmitImageQueryDimensions(EmitContext& ctx, IR::Inst* inst, const IR::Value& i
     case TextureType::Color3D:
     case TextureType::ColorArrayCube:
         return ctx.OpCompositeConstruct(ctx.U32[4], query(ctx.U32[3]), mips());
-    case TextureType::Buffer:
-        return ctx.OpCompositeConstruct(ctx.U32[4], query(ctx.U32[1]), zero, zero, mips());
+    case TextureType::Buffer: {
+        const Id size{ctx.profile.texel_buffer_size_view
+                          ? ctx.OpImageQuerySize(ctx.U32[1], TextureImage(ctx, info, index, true))
+                          : query(ctx.U32[1])};
+        return ctx.OpCompositeConstruct(ctx.U32[4], size, zero, zero, mips());
+    }
     }
     throw LogicError("Unspecified image type {}", info.type.Value());
 }
@@ -593,9 +812,10 @@ Id EmitImageGradient(EmitContext& ctx, IR::Inst* inst, const IR::Value& index, I
                                               ctx.Def(offset), {}, lod_clamp)
                               : ImageOperands(ctx, info.has_lod_clamp != 0, derivatives,
                                               info.num_derivatives, offset, lod_clamp);
-    return Emit(&EmitContext::OpImageSparseSampleExplicitLod,
-                &EmitContext::OpImageSampleExplicitLod, ctx, inst, ctx.F32[4],
-                Texture(ctx, info, index), coords, operands.Mask(), operands.Span());
+    const Id texel{Emit(&EmitContext::OpImageSparseSampleExplicitLod,
+                        &EmitContext::OpImageSampleExplicitLod, ctx, inst, ctx.F32[4],
+                        Texture(ctx, info, index), coords, operands.Mask(), operands.Span())};
+    return ReadAttachment(ctx, AttachmentReadSelector(ctx, info), texel);
 }
 
 Id EmitImageRead(EmitContext& ctx, IR::Inst* inst, const IR::Value& index, Id coords) {
@@ -605,6 +825,9 @@ Id EmitImageRead(EmitContext& ctx, IR::Inst* inst, const IR::Value& index, Id co
         return ctx.ConstantNull(ctx.U32[4]);
     }
     const auto [image, is_integer] = Image(ctx, index, info);
+    if (info.type == TextureType::Buffer && ctx.profile.texel_buffer_size_view) {
+        coords = ctx.TexelBufferCoord(coords, image, Image(ctx, index, info, true).first);
+    }
     const Id result_type{is_integer ? ctx.U32[4] : ctx.F32[4]};
     Id color{Emit(&EmitContext::OpImageSparseRead, &EmitContext::OpImageRead, ctx, inst,
                   result_type, image, coords, std::nullopt, std::span<const Id>{})};
@@ -617,10 +840,28 @@ Id EmitImageRead(EmitContext& ctx, IR::Inst* inst, const IR::Value& index, Id co
 void EmitImageWrite(EmitContext& ctx, IR::Inst* inst, const IR::Value& index, Id coords, Id color) {
     const auto info{inst->Flags<IR::TextureInstInfo>()};
     const auto [image, is_integer] = Image(ctx, index, info);
+    if (info.type == TextureType::Buffer && ctx.profile.texel_buffer_size_view) {
+        coords = ctx.TexelBufferCoord(coords, image, Image(ctx, index, info, true).first);
+    }
     if (!is_integer) {
         color = ctx.OpBitcast(ctx.F32[4], color);
+    } else if (info.type != TextureType::Buffer && ctx.images[info.descriptor_index].is_signed) {
+        color = ctx.OpBitcast(ctx.S32[4], color);
     }
     ctx.OpImageWrite(image, coords, color);
+    if (Sirit::ValidId(ctx.runtime_image_write_mask) && info.type != TextureType::Buffer &&
+        !ctx.images[info.descriptor_index].is_integer &&
+        ctx.images[info.descriptor_index].is_direct) {
+        // Record the original handle once for the three numeric variants. The host
+        // publishes only these images after dispatch, rather than the whole TIC pool.
+        const Id handle = ctx.Def(index);
+        const Id word = ctx.OpShiftRightLogical(ctx.U32[1], handle, ctx.Const(5U));
+        const Id bit = ctx.OpBitwiseAnd(ctx.U32[1], handle, ctx.Const(31U));
+        const Id pointer = ctx.OpAccessChain(ctx.runtime_image_write_mask_element,
+                                            ctx.runtime_image_write_mask, ctx.Const(0U), word);
+        ctx.OpAtomicOr(ctx.U32[1], pointer, ctx.Const(static_cast<u32>(spv::Scope::Device)),
+                       ctx.Const(0U), ctx.OpShiftLeftLogical(ctx.U32[1], ctx.Const(1U), bit));
+    }
 }
 
 Id EmitIsTextureScaled(EmitContext& ctx, const IR::Value& index) {

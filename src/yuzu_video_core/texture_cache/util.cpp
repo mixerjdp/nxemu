@@ -8,6 +8,10 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
+#include <cstdio>
+#include <cstdlib>
+#include <map>
 #include <numeric>
 #include <optional>
 #include <span>
@@ -344,7 +348,7 @@ template <u32 GOB_EXTENT>
     if (!IsBlockLinearSizeCompatible(new_info, info, base.level, 0, strict_size)) {
         return std::nullopt;
     }
-    const u32 mip_depth = std::max(1U, new_info.size.depth << base.level);
+    const u32 mip_depth = AdjustMipSize(new_info.size.depth, base.level);
     if (mip_depth < info.size.depth + base.layer) {
         return std::nullopt;
     }
@@ -422,15 +426,21 @@ template <u32 GOB_EXTENT>
         return std::nullopt;
     }
     const ImageInfo& info = overlap.info;
-    if (!IsBlockLinearSizeCompatible(new_info, info, base->level, 0, strict_size)) {
+    if (!IsBlockLinearSizeCompatible(info, new_info, base->level, 0, strict_size)) {
         return std::nullopt;
     }
     if (new_info.block != MipBlockSize(info, base->level)) {
         return std::nullopt;
     }
     const SubresourceExtent resources = new_info.resources;
-    s32 layers = 1;
-    if (info.type != ImageType::e3D) {
+    s32 layers;
+    if (info.type == ImageType::e3D) {
+        const u32 mip_depth = AdjustMipSize(info.size.depth, base->level);
+        if (mip_depth < new_info.size.depth + base->layer) {
+            return std::nullopt;
+        }
+        layers = 1;
+    } else {
         layers = std::max(resources.layers, info.resources.layers + base->layer);
     }
     return OverlapResult{
@@ -735,7 +745,11 @@ boost::container::small_vector<ImageCopy, 16> MakeShrinkImageCopies(const ImageI
 
     const bool is_dst_3d = dst.type == ImageType::e3D;
     if (is_dst_3d) {
-        ASSERT(src.type == ImageType::e3D);
+        // A single 2D plane can populate one slice of a volume. The destination
+        // slice is carried by base.layer and becomes dst_offset.z below.
+        const bool is_single_2d_slice = src.type == ImageType::e2D &&
+                                        src.size.depth == 1 && src.resources.layers == 1;
+        ASSERT(src.type == ImageType::e3D || is_single_2d_slice);
         ASSERT(src.resources.levels == 1);
     }
     const bool both_2d{src.type == ImageType::e2D && dst.type == ImageType::e2D};
@@ -1081,12 +1095,43 @@ boost::container::small_vector<SwizzleParameters, 16> FullUploadSwizzles(const I
 void SwizzleImage(Tegra::MemoryManager& gpu_memory, GPUVAddr gpu_addr, const ImageInfo& info,
                   std::span<const BufferImageCopy> copies, std::span<const u8> memory,
                   Common::ScratchBuffer<u8>& tmp_buffer) {
+    // Temporary opt-in profiling; remove after the NCE readback investigation.
+    static const bool profile = std::getenv("NXEMU_NCE_READBACK_PROFILE") != nullptr;
+    using Clock = std::chrono::steady_clock;
+    const auto started = profile ? Clock::now() : Clock::time_point{};
     const bool is_pitch_linear = info.type == ImageType::Linear;
     for (const BufferImageCopy& copy : copies) {
         if (is_pitch_linear) {
             SwizzlePitchLinearImage(gpu_memory, gpu_addr, info, copy, memory);
         } else {
             SwizzleBlockLinearImage(gpu_memory, gpu_addr, info, copy, memory, tmp_buffer);
+        }
+    }
+    if (profile) {
+        struct Stats { u64 calls{}; u64 bytes{}; double ms{}; };
+        using Key = std::array<u64, 8>;
+        static thread_local std::map<Key, Stats> stats;
+        static thread_local auto reported = Clock::now();
+        const auto now = Clock::now();
+        const Key key{gpu_addr, info.size.width, info.size.height, info.size.depth,
+                      BytesPerBlock(info.format), static_cast<u64>(info.resources.layers),
+                      static_cast<u64>(info.resources.levels), static_cast<u64>(info.format)};
+        auto& item = stats[key];
+        ++item.calls;
+        for (const auto& copy : copies) item.bytes += copy.buffer_size;
+        item.ms += std::chrono::duration<double, std::milli>(now - started).count();
+        if (now - reported >= std::chrono::seconds(5)) {
+            const double seconds = std::chrono::duration<double>(now - reported).count();
+            for (const auto& [k, v] : stats) {
+                std::fprintf(stderr, "[NCE-READBACK] interval=%.3f addr=%llx size=%llux%llux%llu bpb=%llu layers=%llu levels=%llu format=%llu calls=%llu MiB=%.3f ms=%.3f\n",
+                    seconds, (unsigned long long)k[0], (unsigned long long)k[1],
+                    (unsigned long long)k[2], (unsigned long long)k[3],
+                    (unsigned long long)k[4], (unsigned long long)k[5],
+                    (unsigned long long)k[6], (unsigned long long)k[7],
+                    (unsigned long long)v.calls, static_cast<double>(v.bytes) / 1048576.0, v.ms);
+            }
+            stats.clear();
+            reported = now;
         }
     }
 }
@@ -1216,7 +1261,7 @@ std::optional<SubresourceBase> FindSubresource(const ImageInfo& candidate, const
         return std::nullopt;
     }
     if (existing.type == ImageType::e3D) {
-        const u32 mip_depth = std::max(1U, existing.size.depth << base->level);
+        const u32 mip_depth = AdjustMipSize(existing.size.depth, base->level);
         if (mip_depth < candidate.size.depth + base->layer) {
             return std::nullopt;
         }
@@ -1247,7 +1292,7 @@ bool IsSubCopy(const ImageInfo& candidate, const ImageBase& image, GPUVAddr cand
         return false;
     }
     if (existing.type == ImageType::e3D) {
-        const u32 mip_depth = std::max(1U, existing.size.depth << base->level);
+        const u32 mip_depth = AdjustMipSize(existing.size.depth, base->level);
         if (mip_depth < candidate.size.depth + base->layer) {
             return false;
         }

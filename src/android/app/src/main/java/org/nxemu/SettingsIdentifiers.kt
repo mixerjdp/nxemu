@@ -2,6 +2,12 @@ package org.nxemu
 
 object NXUISetting {
     const val GameDirectories = "nxui:GameDirectories"
+    const val ShowInputOverlay = "nxui:ShowInputOverlay"
+    const val OverlayScale = "nxui:OverlayScale"
+    const val OverlayOpacity = "nxui:OverlayOpacity"
+    const val OverlayControlData = "nxui:OverlayControlData"
+    const val ThemeMode = "nxui:ThemeMode"
+    const val LockDrawer = "nxui:LockDrawer"
 }
 
 object NXCoreSetting {

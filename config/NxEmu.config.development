@@ -1,10 +1,14 @@
 {
    "Core" : {
-      "ModuleDirectory-x64" : "..\\..\\..\\modules\\x64"
+      "ModuleDirectory-x64" : "..\\..\\..\\modules\\x64",
+      "ModuleDirectory-arm64" : "../../../modules/arm64"
    },
    "UI" : {
       "Language" : {
          "Directory" : "..\\..\\..\\lang"
       }
+   },
+   "nxemu-loader" : {
+      "BundledModsDirectory" : "../../../external/nxemu-switch-mods"
    }
 }

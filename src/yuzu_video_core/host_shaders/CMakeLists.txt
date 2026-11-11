@@ -9,16 +9,29 @@ set(FIDELITYFX_FILES
 )
 
 set(GLSL_INCLUDES
+    catmull_rom.glsl
     fidelityfx_fsr.frag
+    present_rcas.frag
+    present_easu.frag
     ${FIDELITYFX_FILES}
 )
 
 set(SHADER_FILES
+    vulkan_indirect_count.comp
+    vulkan_vtg_indirect.comp
     astc_decoder.comp
     blit_color_float.frag
+    blit_color_msaa.frag
+    blit_color_msaa_sint.frag
+    blit_color_msaa_uint.frag
+    blit_depth_msaa.frag
+    blit_depth_stencil_msaa.frag
     block_linear_unswizzle_2d.comp
     block_linear_unswizzle_3d.comp
     convert_abgr8_to_d24s8.frag
+    convert_abgr8_to_d24s8_depth.frag
+    convert_abgr8_to_s8d24.frag
+    convert_abgr8_to_s8d24_depth.frag
     convert_abgr8_to_d32f.frag
     convert_d32f_to_abgr8.frag
     convert_d24s8_to_abgr8.frag
@@ -26,6 +39,13 @@ set(SHADER_FILES
     convert_float_to_depth.frag
     convert_msaa_to_non_msaa.comp
     convert_non_msaa_to_msaa.comp
+    convert_non_msaa_to_msaa.frag
+    convert_non_msaa_to_msaa_sint.frag
+    convert_non_msaa_to_msaa_uint.frag
+    convert_non_msaa_to_msaa_depth.frag
+    convert_non_msaa_to_msaa_depth_stencil.frag
+    convert_packed_depth_to_msaa.frag
+    convert_packed_depth_stencil_to_msaa.frag
     convert_s8d24_to_abgr8.frag
     full_screen_triangle.vert
     fxaa.frag
@@ -37,11 +57,14 @@ set(SHADER_FILES
     opengl_fidelityfx_fsr_rcas.frag
     opengl_lmem_warmup.comp
     opengl_present.frag
+    opengl_present_cas.frag
     opengl_present.vert
     opengl_present_scaleforce.frag
     opengl_smaa.glsl
     pitch_unswizzle.comp
+    present_area.frag
     present_bicubic.frag
+    present_catmull_rom.frag
     present_gaussian.frag
     queries_prefix_scan_sum.comp
     queries_prefix_scan_sum_nosubgroups.comp
@@ -54,6 +77,8 @@ set(SHADER_FILES
     smaa_neighborhood_blending.frag
     vulkan_blit_depth_stencil.frag
     vulkan_color_clear.frag
+    vulkan_color_clear_sint.frag
+    vulkan_color_clear_uint.frag
     vulkan_color_clear.vert
     vulkan_depthstencil_clear.frag
     vulkan_fidelityfx_fsr.vert
@@ -61,18 +86,36 @@ set(SHADER_FILES
     vulkan_fidelityfx_fsr_easu_fp32.frag
     vulkan_fidelityfx_fsr_rcas_fp16.frag
     vulkan_fidelityfx_fsr_rcas_fp32.frag
+    vulkan_present_capture.frag
     vulkan_present.frag
+    vulkan_present_cas_quad.frag
+    vulkan_present_cas_catmull_quad.frag
+    vulkan_present_cas.frag
+    vulkan_present_cas_catmull.frag
+    vulkan_present_easu_fp16.frag
+    vulkan_present_easu_fp32.frag
+    vulkan_present_rcas_fp16.frag
+    vulkan_present_rcas_fp32.frag
     vulkan_present.vert
+    vulkan_present_scaleforce_fast_fp16.frag
+    vulkan_present_scaleforce_fast_fp32.frag
     vulkan_present_scaleforce_fp16.frag
     vulkan_present_scaleforce_fp32.frag
+    vulkan_block_linear_unswizzle_2d_buffer.comp
     vulkan_quad_indexed.comp
+    vulkan_readback_delta.comp
+    vulkan_tracked_readback.comp
     vulkan_turbo_mode.comp
     vulkan_uint8.comp
     watermark.frag
     watermark.vert
 )
 
-find_program(GLSLANGVALIDATOR "glslangValidator")
+if (NXEMU_ENABLE_INTEL_CMAA2)
+    list(APPEND SHADER_FILES intel_cmaa2_apply.vert intel_cmaa2_apply.frag)
+endif()
+
+find_program(GLSLANGVALIDATOR "glslangValidator" HINTS "$ENV{VULKAN_SDK}/Bin")
 if ("${GLSLANGVALIDATOR}" STREQUAL "GLSLANGVALIDATOR-NOTFOUND")
     message(FATAL_ERROR "Required program `glslangValidator` not found.")
 endif()
@@ -124,6 +167,22 @@ foreach(FILENAME IN ITEMS ${SHADER_FILES})
         )
         set(SHADER_HEADERS ${SHADER_HEADERS} ${SOURCE_HEADER_FILE})
     endif()
+    set(SPIRV_INCLUDE_DEPENDENCIES)
+    if(FILENAME MATCHES "^vulkan_present_cas")
+        set(SPIRV_INCLUDE_DEPENDENCIES opengl_present_cas.frag catmull_rom.glsl)
+    elseif(FILENAME STREQUAL "present_catmull_rom.frag")
+        set(SPIRV_INCLUDE_DEPENDENCIES catmull_rom.glsl)
+    elseif(FILENAME MATCHES "^smaa_")
+        set(SPIRV_INCLUDE_DEPENDENCIES opengl_smaa.glsl)
+    elseif(FILENAME MATCHES "^vulkan_present_scaleforce_")
+        set(SPIRV_INCLUDE_DEPENDENCIES opengl_present_scaleforce.frag)
+    elseif(FILENAME MATCHES "^vulkan_present_easu_")
+        set(SPIRV_INCLUDE_DEPENDENCIES present_easu.frag ${FIDELITYFX_FILES})
+    elseif(FILENAME MATCHES "^vulkan_present_rcas_")
+        set(SPIRV_INCLUDE_DEPENDENCIES present_rcas.frag ${FIDELITYFX_FILES})
+    elseif(FILENAME MATCHES "^vulkan_fidelityfx_fsr_(easu|rcas)_")
+        set(SPIRV_INCLUDE_DEPENDENCIES fidelityfx_fsr.frag ${FIDELITYFX_FILES})
+    endif()
     # Skip compiling to SPIR-V OpenGL exclusive files
     if (NOT ${FILENAME} MATCHES "opengl.*")
         string(TOUPPER ${SHADER_NAME}_SPV SPIRV_VARIABLE_NAME)
@@ -135,12 +194,35 @@ foreach(FILENAME IN ITEMS ${SHADER_FILES})
                 ${GLSLANGVALIDATOR} -V ${QUIET_FLAG} -I"${FIDELITYFX_INCLUDE_DIR}" ${GLSL_FLAGS} --variable-name ${SPIRV_VARIABLE_NAME} -o ${SPIRV_HEADER_FILE} ${SOURCE_FILE} --target-env ${SPIR_V_VERSION}
             MAIN_DEPENDENCY
                 ${SOURCE_FILE}
+            DEPENDS
+                ${SPIRV_INCLUDE_DEPENDENCIES}
         )
         set(SHADER_HEADERS ${SHADER_HEADERS} ${SPIRV_HEADER_FILE})
     endif()
 endforeach()
 
-foreach(FILEPATH IN ITEMS ${FIDELITYFX_FILES})
+# High is a preset of the same source used by Ultra. Generate both even when
+# the optional Intel/DXC backend and all benchmarks are disabled.
+foreach(_stage IN ITEMS edge_detection blending_weight_calculation neighborhood_blending)
+    foreach(_ext IN ITEMS vert frag)
+        set(_original "${CMAKE_CURRENT_SOURCE_DIR}/smaa_${_stage}.${_ext}")
+        set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${_original}")
+        file(READ "${_original}" _high_text)
+        string(REPLACE "#define SMAA_PRESET_ULTRA" "#define SMAA_PRESET_HIGH" _high_text "${_high_text}")
+        set(_high_source "${CMAKE_CURRENT_BINARY_DIR}/smaa_high_${_stage}.${_ext}")
+        file(GENERATE OUTPUT "${_high_source}" CONTENT "${_high_text}")
+        set(_high_header "${SHADER_DIR}/smaa_high_${_stage}_${_ext}_spv.h")
+        string(TOUPPER "SMAA_HIGH_${_stage}_${_ext}_SPV" _high_symbol)
+        add_custom_command(OUTPUT "${_high_header}"
+            COMMAND ${GLSLANGVALIDATOR} -V ${QUIET_FLAG} "-I${CMAKE_CURRENT_SOURCE_DIR}" ${GLSL_FLAGS}
+                --variable-name "${_high_symbol}" -o "${_high_header}" "${_high_source}"
+                --target-env ${SPIR_V_VERSION}
+            DEPENDS "${_high_source}" "${CMAKE_CURRENT_SOURCE_DIR}/opengl_smaa.glsl" VERBATIM)
+        list(APPEND SHADER_HEADERS "${_high_header}")
+    endforeach()
+endforeach()
+
+foreach(FILEPATH IN ITEMS ${FIDELITYFX_FILES} ${CMAKE_CURRENT_SOURCE_DIR}/catmull_rom.glsl)
     get_filename_component(FILENAME ${FILEPATH} NAME)
     string(REPLACE "." "_" HEADER_NAME ${FILENAME})
     set(SOURCE_FILE ${FILEPATH})
@@ -168,3 +250,63 @@ add_custom_target(host_shaders
     SOURCES
         ${SHADER_SOURCES}
 )
+
+# Ordinary builds use the validated CMAA2 compute shaders in the source tree.
+option(NXEMU_REGENERATE_CMAA2_SHADERS "Enable the CMAA2 shader regeneration target" OFF)
+if (NXEMU_REGENERATE_CMAA2_SHADERS)
+    set(INTEL_CMAA2_HEADER_DIR "${CMAKE_SOURCE_DIR}/src/3rd_party/intel_cmaa2/spirv")
+    find_program(INTEL_CMAA2_DXC dxc HINTS "$ENV{VULKAN_SDK}/Bin" REQUIRED)
+    find_program(INTEL_CMAA2_SPIRV_VAL spirv-val HINTS "$ENV{VULKAN_SDK}/Bin" REQUIRED)
+    find_package(Python3 COMPONENTS Interpreter REQUIRED)
+    set(INTEL_CMAA2_UPSTREAM
+        "${CMAKE_SOURCE_DIR}/src/3rd_party/intel_cmaa2/CMAA2.hlsl")
+    if (NOT EXISTS "${INTEL_CMAA2_UPSTREAM}")
+        message(FATAL_ERROR "Intel CMAA2 source not found. Run tools/cmaa2/fetch_intel_cmaa2.py src/3rd_party/intel_cmaa2/CMAA2.hlsl")
+    endif()
+    set(INTEL_CMAA2_PREPARED "${CMAKE_CURRENT_BINARY_DIR}/intel_cmaa2_prepared.hlsl")
+    add_custom_command(
+        OUTPUT "${INTEL_CMAA2_PREPARED}"
+        COMMAND ${Python3_EXECUTABLE} "${CMAKE_SOURCE_DIR}/tools/cmaa2/prepare_intel_shader.py"
+                "${INTEL_CMAA2_UPSTREAM}" "${INTEL_CMAA2_PREPARED}"
+        DEPENDS "${INTEL_CMAA2_UPSTREAM}" "${CMAKE_SOURCE_DIR}/tools/cmaa2/prepare_intel_shader.py"
+        VERBATIM)
+    foreach(_stage IN ITEMS edges args candidates)
+        if (_stage STREQUAL "edges")
+            set(_entry "EdgesColor2x2CS")
+        elseif(_stage STREQUAL "args")
+            set(_entry "ComputeDispatchArgsCS")
+        elseif(_stage STREQUAL "candidates")
+            set(_entry "ProcessCandidatesCS")
+        endif()
+        set(_spv "${CMAKE_CURRENT_BINARY_DIR}/intel_cmaa2_${_stage}.spv")
+        set(_hdr "${CMAKE_CURRENT_BINARY_DIR}/intel_cmaa2_${_stage}_spv.h")
+        string(TOUPPER "INTEL_CMAA2_${_stage}_SPV" _var)
+        add_custom_command(
+            OUTPUT "${_hdr}"
+            COMMAND ${INTEL_CMAA2_DXC}
+                    -spirv -T cs_6_0 -E "${_entry}" -fspv-entrypoint-name=main -fspv-target-env=vulkan1.1
+                    -fvk-u-shift 0 0 -fvk-t-shift 8 0 -fvk-s-shift 12 0
+                    -DCMAA2_UAV_STORE_TYPED=1
+                    -DCMAA2_UAV_STORE_TYPED_UNORM_FLOAT=0
+                    -DCMAA2_UAV_STORE_CONVERT_TO_SRGB=0
+                    -DCMAA2_SUPPORT_HDR_COLOR_RANGE=1
+                    -DCMAA2_EDGE_DETECTION_LUMA_PATH=1
+                    -DCMAA2_STATIC_QUALITY_PRESET=1
+                    -DCMAA2_USE_HALF_FLOAT_PRECISION=0
+                    -Fo "${_spv}" "${INTEL_CMAA2_PREPARED}"
+            COMMAND ${INTEL_CMAA2_SPIRV_VAL} --target-env vulkan1.1 "${_spv}"
+            COMMAND ${Python3_EXECUTABLE}
+                    "${CMAKE_SOURCE_DIR}/tools/cmaa2/spirv_to_header.py"
+                    "${_spv}" "${_hdr}" "${_var}"
+            DEPENDS "${INTEL_CMAA2_PREPARED}"
+                    "${CMAKE_SOURCE_DIR}/tools/cmaa2/spirv_to_header.py"
+            VERBATIM)
+        list(APPEND INTEL_CMAA2_SHADER_HEADERS "${_hdr}")
+    endforeach()
+    add_custom_target(regenerate_cmaa2_shaders
+        COMMAND ${CMAKE_COMMAND} -E make_directory "${INTEL_CMAA2_HEADER_DIR}"
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            ${INTEL_CMAA2_SHADER_HEADERS} "${INTEL_CMAA2_HEADER_DIR}"
+        DEPENDS ${INTEL_CMAA2_SHADER_HEADERS}
+        VERBATIM)
+endif()

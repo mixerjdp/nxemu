@@ -6,6 +6,7 @@
 #include <array>
 #include <bitset>
 #include <map>
+#include <vector>
 
 #include "yuzu_common/common_types.h"
 #include "yuzu_shader_recompiler/frontend/ir/type.h"
@@ -157,6 +158,18 @@ enum class Interpolation {
     NoPerspective,
 };
 
+/// How a fragment shader texture read is known to only read the fragment's own pixel
+enum class PixelLocalRead : u8 {
+    None,
+    /// texelFetch at the integer fragment coordinate
+    FragCoord,
+    /// Sample at a varying holding the clip position mapped to the viewport, divided by w
+    ScreenPosition,
+};
+
+/// Textures of a fragment shader that can be read from the color attachment they render to
+constexpr u32 MAX_PIXEL_LOCAL_READS = 8;
+
 struct ConstantBufferDescriptor {
     u32 index;
     u32 count;
@@ -173,6 +186,23 @@ struct StorageBufferDescriptor {
     auto operator<=>(const StorageBufferDescriptor&) const = default;
 };
 
+struct TextureHandleSource {
+    bool has_secondary;
+    u32 cbuf_index;
+    u32 cbuf_offset;
+    u32 shift_left;
+    u32 secondary_cbuf_index;
+    u32 secondary_cbuf_offset;
+    u32 secondary_shift_left;
+    u32 count;
+    u32 stride; ///< Byte stride of the handle field
+    u32 handle_or_bits{};
+    u32 mask{~0U};
+    u32 secondary_mask{~0U};
+
+    auto operator<=>(const TextureHandleSource&) const = default;
+};
+
 struct TextureBufferDescriptor {
     bool has_secondary;
     u32 cbuf_index;
@@ -182,7 +212,13 @@ struct TextureBufferDescriptor {
     u32 secondary_cbuf_offset;
     u32 secondary_shift_left;
     u32 count;
-    u32 size_shift;
+    u32 stride; ///< Byte stride of the handle field
+    u32 handle_or_bits{};
+    u32 mask{~0U};
+    u32 secondary_mask{~0U};
+
+    /// Compact alternatives for a handle selected by a Phi or Select.
+    std::vector<TextureHandleSource> sources;
 
     auto operator<=>(const TextureBufferDescriptor&) const = default;
 };
@@ -196,7 +232,7 @@ struct ImageBufferDescriptor {
     u32 cbuf_index;
     u32 cbuf_offset;
     u32 count;
-    u32 size_shift;
+    u32 stride; ///< Byte stride of the handle field
 
     auto operator<=>(const ImageBufferDescriptor&) const = default;
 };
@@ -214,7 +250,25 @@ struct TextureDescriptor {
     u32 secondary_cbuf_offset;
     u32 secondary_shift_left;
     u32 count;
-    u32 size_shift;
+    u32 stride; ///< Byte stride of the handle field
+    /// Sampler-less array indexed by the TIC index of a runtime handle.
+    bool is_direct{};
+    /// Bound with the texture tables in descriptor set 1, which the host keeps between draws.
+    bool in_table_set{};
+    /// Constant bits combined with the cbuf handle, including an immediate sampler index.
+    u32 handle_or_bits{};
+    /// An index read from a guest constant buffer and resolved once per draw.
+    bool has_index_cbuf{};
+    u32 index_cbuf_index{};
+    u32 index_cbuf_offset{};
+    u32 index_shift{};
+    u32 mask{~0U};
+    u32 secondary_mask{~0U};
+
+    /// Finite SSA alternatives, bound as a compact array instead of the entire TIC table.
+    std::vector<TextureHandleSource> sources;
+
+    PixelLocalRead pixel_local_read{};
 
     auto operator<=>(const TextureDescriptor&) const = default;
 };
@@ -229,16 +283,29 @@ struct ImageDescriptor {
     u32 cbuf_index;
     u32 cbuf_offset;
     u32 count;
-    u32 size_shift;
+    u32 stride; ///< Byte stride of the handle field
+    bool is_direct;
+    bool is_signed{};
 
     auto operator<=>(const ImageDescriptor&) const = default;
 };
 using ImageDescriptors = boost::container::small_vector<ImageDescriptor, 4>;
 
 struct Info {
+    bool operator==(const Info&) const = default;
+    u32 runtime_image_write_mask_words{};
+    /// Written storage and image buffers that mark the pages they write. Zero when the shader
+    /// has a store that cannot be tracked.
+    u32 write_tracking_slots{};
+    /// Size of the sampler array combined with direct texture descriptors. Zero when unused.
+    u32 runtime_sampler_count{};
+    bool runtime_samplers_linked{};
     static constexpr size_t MAX_INDIRECT_CBUFS{14};
     static constexpr size_t MAX_CBUFS{18};
     static constexpr size_t MAX_SSBOS{32};
+    static constexpr size_t NUM_NVN_STORAGE_BUFFERS{16};
+    static constexpr u32 NVN_STORAGE_BUFFER_DESCRIPTOR_SIZE{0x10};
+    static constexpr u32 NVN_STORAGE_BUFFER_CBUF_INDEX{0};
 
     bool uses_workgroup_id{};
     bool uses_local_invocation_id{};
@@ -260,6 +327,7 @@ struct Info {
     bool loads_indexed_attributes{};
 
     std::array<bool, 8> stores_frag_color{};
+    std::array<bool, 8> stores_frag_alpha{};
     bool stores_sample_mask{};
     bool stores_frag_depth{};
 
@@ -275,6 +343,8 @@ struct Info {
     bool uses_fp64{};
     bool uses_fp16_denorms_flush{};
     bool uses_fp16_denorms_preserve{};
+    /// fp16 <-> fp32 conversions that must keep fp16 denormals (no FTZ requested).
+    bool uses_fp16_denorm_conversions{};
     bool uses_fp32_denorms_flush{};
     bool uses_fp32_denorms_preserve{};
     bool uses_int8{};
@@ -319,12 +389,15 @@ struct Info {
     u32 constant_buffer_mask{};
     std::array<u32, MAX_CBUFS> constant_buffer_used_sizes{};
     u32 nvn_buffer_base{};
-    std::bitset<16> nvn_buffer_used{};
+    std::bitset<NUM_NVN_STORAGE_BUFFERS> nvn_buffer_used{};
 
     bool requires_layer_emulation{};
     IR::Attribute emulated_layer{};
 
     u32 used_clip_distances{};
+
+    /// Color attachments read as input attachments by the pixel local texture reads
+    u32 input_attachment_mask{};
 
     boost::container::static_vector<ConstantBufferDescriptor, MAX_CBUFS>
         constant_buffer_descriptors;
@@ -334,6 +407,25 @@ struct Info {
     TextureDescriptors texture_descriptors;
     ImageDescriptors image_descriptors;
 };
+
+inline u32 NvnStorageBufferOffset(const Info& info, size_t nvn_index) {
+    return info.nvn_buffer_base +
+           static_cast<u32>(nvn_index) * Info::NVN_STORAGE_BUFFER_DESCRIPTOR_SIZE;
+}
+
+inline bool IsUsedNvnStorageBufferDescriptor(const Info& info,
+                                             const StorageBufferDescriptor& desc) {
+    if (desc.cbuf_index != Info::NVN_STORAGE_BUFFER_CBUF_INDEX ||
+        desc.cbuf_offset < info.nvn_buffer_base) {
+        return false;
+    }
+    const u32 relative_offset{desc.cbuf_offset - info.nvn_buffer_base};
+    if (relative_offset % Info::NVN_STORAGE_BUFFER_DESCRIPTOR_SIZE != 0) {
+        return false;
+    }
+    const size_t nvn_index{relative_offset / Info::NVN_STORAGE_BUFFER_DESCRIPTOR_SIZE};
+    return nvn_index < info.nvn_buffer_used.size() && info.nvn_buffer_used[nvn_index];
+}
 
 template <typename Descriptors>
 u32 NumDescriptors(const Descriptors& descriptors) {

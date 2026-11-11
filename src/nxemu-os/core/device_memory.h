@@ -33,6 +33,21 @@ public:
         return buffer.BackingBasePointer();
     }
 
+    uint64_t BackingSize() const
+    {
+        return buffer.BackingSize();
+    }
+
+    uint8_t * VirtualBasePointer()
+    {
+        return buffer.VirtualBasePointer();
+    }
+
+    void EnableDirectMappedAddress()
+    {
+        buffer.EnableDirectMappedAddress();
+    }
+
     template <typename T>
     Common::PhysicalAddress GetPhysicalAddr(const T* ptr) const {
         return (reinterpret_cast<uintptr_t>(ptr) -

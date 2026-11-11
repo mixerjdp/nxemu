@@ -3,13 +3,88 @@
 
 add_subdirectory(host_shaders)
 
+option(NXEMU_BUILD_FSR_TESTS "Build scaling and graphics profile regression tests" OFF)
+
 if(LIBVA_FOUND)
     set_source_files_properties(host1x/ffmpeg/ffmpeg.cpp
         PROPERTIES COMPILE_DEFINITIONS LIBVA_FOUND=1)
     list(APPEND FFmpeg_LIBRARIES ${LIBVA_LIBRARIES})
 endif()
 
+if(NXEMU_BUILD_FSR_TESTS)
+    foreach(_profile_variant IN ITEMS enabled disabled)
+        add_executable(nxemu_profile_${_profile_variant}_tests
+            ../../tests/fsr/profile_tests.cpp ../nxemu-video/video_enum_strings.cpp)
+        target_include_directories(nxemu_profile_${_profile_variant}_tests PRIVATE ${PROJECT_SOURCE_DIR}/src)
+        target_link_libraries(nxemu_profile_${_profile_variant}_tests PRIVATE yuzu_common)
+        if(_profile_variant STREQUAL "disabled")
+            target_compile_definitions(nxemu_profile_${_profile_variant}_tests PRIVATE NXEMU_TEST_DISABLE_CMAA2=1)
+        endif()
+        add_test(NAME nxemu_profile_${_profile_variant} COMMAND nxemu_profile_${_profile_variant}_tests)
+    endforeach()
+    add_executable(nxemu_reconstruction_tests ../../tests/fsr/reconstruction_tests.cpp)
+    target_include_directories(nxemu_reconstruction_tests PRIVATE ${PROJECT_SOURCE_DIR}/src)
+    target_link_libraries(nxemu_reconstruction_tests PRIVATE shader_recompiler yuzu_common)
+    add_test(NAME nxemu_reconstruction COMMAND nxemu_reconstruction_tests)
+    add_test(NAME nxemu_reconstruction_disabled COMMAND nxemu_reconstruction_tests --disabled)
+    set_tests_properties(nxemu_reconstruction_disabled PROPERTIES
+        ENVIRONMENT "NXEMU_HALF_RATE_RECONSTRUCTION=0")
+    add_executable(nxemu_fsr_diagnostics_tests ../../tests/fsr/diagnostics_tests.cpp)
+    target_include_directories(nxemu_fsr_diagnostics_tests PRIVATE ${PROJECT_SOURCE_DIR}/src)
+    add_test(NAME nxemu_fsr_diagnostics COMMAND nxemu_fsr_diagnostics_tests)
+    get_filename_component(_fsr_glslang_bin "${GLSLANGVALIDATOR}" DIRECTORY)
+    find_library(NXEMU_FSR_VULKAN_LOADER NAMES vulkan-1 vulkan
+        HINTS "${_fsr_glslang_bin}/../Lib" "$ENV{VULKAN_SDK}/Lib")
+    if(NXEMU_FSR_VULKAN_LOADER)
+        add_executable(nxemu-downscale-sharpen-tests ../../tests/fsr/downscale_sharpen_tests.cpp fsr.cpp)
+        add_dependencies(nxemu-downscale-sharpen-tests host_shaders)
+        target_include_directories(nxemu-downscale-sharpen-tests PRIVATE ${PROJECT_SOURCE_DIR}/src ${HOST_SHADERS_INCLUDE})
+        target_link_libraries(nxemu-downscale-sharpen-tests PRIVATE Vulkan::Headers ${NXEMU_FSR_VULKAN_LOADER} yuzu_common)
+        add_test(NAME nxemu_downscale_sharpen COMMAND nxemu-downscale-sharpen-tests)
+    endif()
+endif()
+
 add_library(video_core STATIC
+    command_header.h
+    pipeline_cache_store.cpp
+    pipeline_cache_store.h
+    shader_profile_audit.h
+    shader_profile_location.h
+    shader_profile_runtime.h
+    shader_profile_sph.h
+    shader_profile_import_status.h
+    shader_profile_identity.h
+    shader_profile_candidate_budget.h
+    shader_profile_reuse.h
+    shader_profile_context.h
+    shader_profile_layout.h
+    shader_profile_limits.h
+    shader_profile_versions.h
+    shader_profile_provenance.h
+    shader_profile_publication.h
+    shader_profile_file_stamp.h
+    shared_shader_bytes.h
+    shader_profile_text.h
+    shader_profile_validation.h
+    renderer_vulkan/startup_pipeline_variants.h
+    shader_profile.cpp
+    shader_profile.h
+    shader_profile_hash.h
+    shader_profile_metrics.h
+    shader_profile_resources.h
+    shader_profile_search.h
+    shader_profile_journal.h
+    shader_profile_export.cpp
+    shader_profile_export.h
+    shader_profile_discovery.cpp
+    shader_profile_discovery.h
+    shader_profile_compact.cpp
+    shader_profile_compact.h
+    shader_profile_codec.cpp
+    shader_profile_codec.h
+    renderer_vulkan/guest_pipeline_recipe_probe.h
+    renderer_vulkan/guest_pipeline_recorder.h
+    renderer_vulkan/guest_recipe_input_cache.h
     buffer_cache/buffer_base.h
     buffer_cache/buffer_cache_base.h
     buffer_cache/buffer_cache.cpp
@@ -18,9 +93,11 @@ add_library(video_core STATIC
     buffer_cache/usage_tracker.h
     buffer_cache/word_manager.h
     cache_types.h
+    flush_region_cache_filter.h
     capture.h
     cdma_pusher.cpp
     cdma_pusher.h
+    composite_request.h
     compatible_formats.cpp
     compatible_formats.h
     control/channel_state.cpp
@@ -44,6 +121,7 @@ add_library(video_core STATIC
     engines/engine_interface.h
     engines/engine_upload.cpp
     engines/engine_upload.h
+    engines/fast_copy.h
     engines/fermi_2d.cpp
     engines/fermi_2d.h
     engines/kepler_compute.cpp
@@ -108,8 +186,11 @@ add_library(video_core STATIC
     memory_manager.h
     precompiled_headers.h
     present.h
+    present_sharpening.h
+    area_sampling.h
     pte_kind.h
     query_cache/bank_base.h
+    query_cache/query_bank_operations.h
     query_cache/query_base.h
     query_cache/query_cache_base.h
     query_cache/query_cache.h
@@ -182,10 +263,14 @@ add_library(video_core STATIC
     renderer_vulkan/present/filters.h
     renderer_vulkan/present/fsr.cpp
     renderer_vulkan/present/fsr.h
+    renderer_vulkan/present/catmull_pass.cpp
+    renderer_vulkan/present/catmull_pass.h
     renderer_vulkan/present/fxaa.cpp
     renderer_vulkan/present/fxaa.h
     renderer_vulkan/present/layer.cpp
     renderer_vulkan/present/layer.h
+    renderer_vulkan/present/scale_capture.h
+    renderer_vulkan/present/scale_trace.h
     renderer_vulkan/present/present_push_constants.h
     renderer_vulkan/present/smaa.cpp
     renderer_vulkan/present/smaa.h
@@ -195,6 +280,11 @@ add_library(video_core STATIC
     renderer_vulkan/present/window_adapt_pass.h
     renderer_vulkan/blit_image.cpp
     renderer_vulkan/blit_image.h
+    renderer_vulkan/descriptor_lookup.h
+    renderer_vulkan/descriptor_limits.h
+    renderer_vulkan/descriptor_copy_cache.h
+    renderer_vulkan/descriptor_payload.h
+    renderer_vulkan/cbuf_size_dependencies.h
     renderer_vulkan/fixed_pipeline_state.cpp
     renderer_vulkan/fixed_pipeline_state.h
     renderer_vulkan/maxwell_to_vk.cpp
@@ -217,6 +307,8 @@ add_library(video_core STATIC
     renderer_vulkan/vk_compute_pipeline.h
     renderer_vulkan/vk_descriptor_pool.cpp
     renderer_vulkan/vk_descriptor_pool.h
+    renderer_vulkan/vk_display.cpp
+    renderer_vulkan/vk_display.h
     renderer_vulkan/vk_fence_manager.cpp
     renderer_vulkan/vk_fence_manager.h
     renderer_vulkan/vk_graphics_pipeline.cpp
@@ -256,6 +348,7 @@ add_library(video_core STATIC
     shader_cache.h
     shader_environment.cpp
     shader_environment.h
+    snapshot_memory_budget.h
     shader_notify.cpp
     shader_notify.h
     smaa_area_tex.h
@@ -275,6 +368,7 @@ add_library(video_core STATIC
     texture_cache/image_base.h
     texture_cache/image_info.cpp
     texture_cache/image_info.h
+    texture_cache/mip_levels.h
     texture_cache/image_view_base.cpp
     texture_cache/image_view_base.h
     texture_cache/image_view_info.cpp
@@ -307,6 +401,7 @@ add_library(video_core STATIC
     vulkan_common/vulkan_debug_callback.h
     vulkan_common/vulkan_device.cpp
     vulkan_common/vulkan_device.h
+    vulkan_common/moltenvk_workarounds.h
     vulkan_common/vulkan_instance.cpp
     vulkan_common/vulkan_instance.h
     vulkan_common/vulkan_library.cpp
@@ -326,11 +421,85 @@ add_library(video_core STATIC
 
 target_include_directories(video_core PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 target_include_directories(video_core PRIVATE ${CMAKE_SOURCE_DIR}/src/nxemu-video)
+if(ANDROID AND NXEMU_ENABLE_ANDROID_ADPF)
+    target_compile_definitions(video_core PRIVATE NXEMU_ENABLE_ANDROID_ADPF=1)
+endif()
 target_link_libraries(video_core PUBLIC common nxemu_core yuzu_common)
+target_link_libraries(video_core PRIVATE zstd::zstd)
+target_link_libraries(video_core PRIVATE ${CMAKE_DL_LIBS})
 target_link_libraries(video_core PUBLIC glad shader_recompiler stb::headers bc_decoder stb_dxt)
 
-if (YUZU_USE_BUNDLED_FFMPEG AND NOT (WIN32 OR ANDROID))
+if (YUZU_USE_BUNDLED_FFMPEG AND NOT (WIN32 OR ANDROID OR APPLE))
     add_dependencies(video_core ffmpeg-build)
+endif()
+
+if(APPLE AND NOT FFmpeg_LIBRARIES)
+    if(NOT ARCHITECTURE_arm64)
+        message(FATAL_ERROR
+            "Bundled macOS FFmpeg libraries are arm64-only. "
+            "Build with -DCMAKE_OSX_ARCHITECTURES=arm64, or provide "
+            "FFmpeg_INCLUDE_DIR and FFmpeg_LIBRARIES for the target architecture.")
+    endif()
+    set(_ffmpeg_macos_root "${CMAKE_SOURCE_DIR}/external/ffmpeg/lib/macos-arm64")
+    set(_ffmpeg_macos_libs
+        "${_ffmpeg_macos_root}/libavfilter.a"
+        "${_ffmpeg_macos_root}/libavcodec.a"
+        "${_ffmpeg_macos_root}/libswscale.a"
+        "${_ffmpeg_macos_root}/libavutil.a"
+    )
+
+    foreach(_ffmpeg_lib IN LISTS _ffmpeg_macos_libs)
+        if(NOT EXISTS "${_ffmpeg_lib}")
+            message(FATAL_ERROR "Missing FFmpeg macOS arm64 library: ${_ffmpeg_lib}")
+        endif()
+    endforeach()
+
+    set(FFmpeg_INCLUDE_DIR "${CMAKE_SOURCE_DIR}/external/ffmpeg/include")
+    set(FFmpeg_LIBRARIES ${_ffmpeg_macos_libs})
+endif()
+
+if(WIN32 AND NOT FFmpeg_LIBRARIES)
+    if(NOT ARCHITECTURE_x86_64)
+        message(FATAL_ERROR
+            "Bundled Windows FFmpeg libraries are x64-only. Provide "
+            "FFmpeg_INCLUDE_DIR and FFmpeg_LIBRARIES for the target architecture.")
+    endif()
+    set(_ffmpeg_windows_root "${CMAKE_SOURCE_DIR}/external/ffmpeg/lib")
+    set(_ffmpeg_windows_libs "")
+    foreach(_ffmpeg_lib avcodec avdevice avfilter avformat avutil swresample swscale)
+        if(NOT EXISTS "${_ffmpeg_windows_root}/lib${_ffmpeg_lib}.lib")
+            message(FATAL_ERROR "Missing FFmpeg Windows x64 library: lib${_ffmpeg_lib}.lib")
+        endif()
+        list(APPEND _ffmpeg_windows_libs "${_ffmpeg_windows_root}/lib${_ffmpeg_lib}.lib")
+    endforeach()
+    set(FFmpeg_INCLUDE_DIR "${CMAKE_SOURCE_DIR}/external/ffmpeg/include")
+    set(FFmpeg_LIBRARIES ${_ffmpeg_windows_libs})
+endif()
+
+# Static link order: dependents before the libraries they use.
+if(NOT FFmpeg_LIBRARIES AND CMAKE_SYSTEM_NAME STREQUAL "Linux" AND NOT ANDROID AND ARCHITECTURE_x86_64)
+    set(_ffmpeg_linux_root "${CMAKE_SOURCE_DIR}/external/ffmpeg/lib/linux-x64")
+    set(_ffmpeg_linux_libs
+        "${_ffmpeg_linux_root}/libavfilter.a"
+        "${_ffmpeg_linux_root}/libavformat.a"
+        "${_ffmpeg_linux_root}/libavcodec.a"
+        "${_ffmpeg_linux_root}/libswscale.a"
+        "${_ffmpeg_linux_root}/libswresample.a"
+        "${_ffmpeg_linux_root}/libavutil.a"
+    )
+    foreach(_ffmpeg_lib IN LISTS _ffmpeg_linux_libs)
+        if(NOT EXISTS "${_ffmpeg_lib}")
+            message(FATAL_ERROR "Missing FFmpeg Linux x64 library: ${_ffmpeg_lib}")
+        endif()
+    endforeach()
+    set(FFmpeg_INCLUDE_DIR "${CMAKE_SOURCE_DIR}/external/ffmpeg/include")
+    set(FFmpeg_LIBRARIES ${_ffmpeg_linux_libs})
+endif()
+
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND NOT FFmpeg_LIBRARIES)
+    message(FATAL_ERROR
+        "No FFmpeg libraries for ${CMAKE_SYSTEM_PROCESSOR}. The bundled Linux libraries are x86-64 only; "
+        "provide matching FFmpeg_INCLUDE_DIR and FFmpeg_LIBRARIES for this architecture.")
 endif()
 
 if(NOT FFmpeg_INCLUDE_DIR)
@@ -344,7 +513,7 @@ if(ANDROID AND NOT FFmpeg_LIBRARIES)
         set(FFmpeg_LIBRARIES "${_ffmpeg_android_root}/libffmpeg.so")
     else()
         set(_ffmpeg_android_names
-            libavutil libswresample libavcodec libavfilter libswscale)
+            libavfilter libavcodec libswscale libswresample libavutil)
         set(_ffmpeg_android_ok TRUE)
         foreach(_n IN LISTS _ffmpeg_android_names)
             if(NOT EXISTS "${_ffmpeg_android_root}/${_n}.a")
@@ -359,7 +528,7 @@ if(ANDROID AND NOT FFmpeg_LIBRARIES)
             endforeach()
             set(FFmpeg_LIBRARIES "${_ffmpeg_android_libs}")
         else()
-            message(WARNING
+            message(FATAL_ERROR
                 "Missing FFmpeg libraries in ${_ffmpeg_android_root} "
                 "(need libffmpeg.so or static: ${_ffmpeg_android_names}.a). "
                 "Cross-compile for ${ANDROID_ABI}, install them there, "
@@ -368,8 +537,15 @@ if(ANDROID AND NOT FFmpeg_LIBRARIES)
     endif()
 endif()
 
-target_include_directories(video_core PRIVATE ${FFmpeg_INCLUDE_DIR})
+# SYSTEM: the FFmpeg headers do not pass the conversion checks below.
+target_include_directories(video_core SYSTEM PRIVATE ${FFmpeg_INCLUDE_DIR})
 target_link_libraries(video_core PRIVATE ${FFmpeg_LIBRARIES})
+if(APPLE)
+    foreach(framework CoreFoundation CoreMedia CoreVideo VideoToolbox)
+        find_library(NXEMU_${framework}_FRAMEWORK ${framework} REQUIRED)
+        target_link_libraries(video_core PRIVATE ${NXEMU_${framework}_FRAMEWORK})
+    endforeach()
+endif()
 target_link_options(video_core PRIVATE ${FFmpeg_LDFLAGS})
 
 add_dependencies(video_core host_shaders)
@@ -438,3 +614,9 @@ if(ANDROID)
 endif()
 
 create_target_directory_groups(video_core)
+
+if (NXEMU_ENABLE_INTEL_CMAA2)
+    target_sources(video_core PRIVATE
+        renderer_vulkan/present/intel_cmaa2.cpp
+        renderer_vulkan/present/intel_cmaa2.h)
+endif()

@@ -1,138 +1,84 @@
-#include "settings/ui_settings.h"
 #include "startup_checks.h"
-#include "user_interface/notification.h"
-#include "user_interface/sciter_main_window.h"
+#include "settings/ui_settings.h"
 #include <common/path.h>
-#include <common/std_string.h>
-#include <memory>
 #include <nxemu-core/app_init.h>
-#include <nxemu-core/version.h>
+#include <nxemu-core/settings/core_settings.h>
+#include <filesystem>
 #include <yuzu_common/fs/path_util.h>
-#include <sciter_ui.h>
-#include <widgets/list_box.h>
-#include <widgets/combo_box.h>
-#include <widgets/menubar.h>
-#include <widgets/page_nav.h>
-#include <widgets/tooltip_host.h>
-#include "user_interface/widgets/rom_browser.h"
+#include <nxemu/ui/ui_application.h>
 
-#ifdef WIN32
+#ifdef _WIN32
 #include <windows.h>
 #endif
+#ifdef __APPLE__
+#include <sys/resource.h>
+#endif
 
-void RegisterWidgets(ISciterUI & sciterUI)
-{
-    Register_WidgetListBox(sciterUI);
-    Register_WidgetComboBox(sciterUI);
-    Register_WidgetMenuBar(sciterUI);
-    Register_WidgetPageNav(sciterUI);
-    Register_WidgetToolTipHost(sciterUI);
-    Register_WidgetRomBrowser(sciterUI);
-}
-
-#ifdef WIN32
+#ifdef _WIN32
 extern "C"
 {
-    __declspec(dllexport) DWORD NvOptimusEnablement = 0x00000001;         // NVIDIA
-    __declspec(dllexport) int AmdPowerXpressRequestHighPerformance = 1;   // AMD
+    __declspec(dllexport) DWORD NvOptimusEnablement = 0x00000001;       // NVIDIA
+    __declspec(dllexport) int AmdPowerXpressRequestHighPerformance = 1; // AMD
 }
+#endif
 
-static void EnablePerMonitorDpiAwareness()
+#ifdef __APPLE__
+// Apps started from Finder inherit a soft limit of 256 open files, which a
+// firmware install (one open file per NCA) exceeds.
+static void RaiseOpenFileLimit()
 {
-    typedef BOOL (WINAPI * PFN_SetProcessDpiAwarenessContext)(HANDLE);
-    typedef HRESULT (WINAPI * PFN_SetProcessDpiAwareness)(int);
-    typedef BOOL (WINAPI * PFN_SetProcessDPIAware)(void);
-
-    HMODULE user32 = ::GetModuleHandleW(L"user32.dll");
-    if (user32 != nullptr)
+    rlimit limit{};
+    if (getrlimit(RLIMIT_NOFILE, &limit) != 0)
     {
-        PFN_SetProcessDpiAwarenessContext setCtx = reinterpret_cast<PFN_SetProcessDpiAwarenessContext>(
-            ::GetProcAddress(user32, "SetProcessDpiAwarenessContext"));
-        if (setCtx != nullptr)
-        {
-            if (setCtx(reinterpret_cast<HANDLE>(static_cast<INT_PTR>(-4))))
-            {
-                return;
-            }
-            if (setCtx(reinterpret_cast<HANDLE>(static_cast<INT_PTR>(-3))))
-            {
-                return;
-            }
-        }
+        return;
     }
-
-    HMODULE shcore = ::LoadLibraryW(L"shcore.dll");
-    if (shcore != nullptr)
+    const rlim_t wanted = 10240; // OPEN_MAX, the most macOS accepts here
+    const rlim_t target = limit.rlim_max == RLIM_INFINITY || limit.rlim_max > wanted ? wanted : limit.rlim_max;
+    if (limit.rlim_cur < target)
     {
-        PFN_SetProcessDpiAwareness setAware = reinterpret_cast<PFN_SetProcessDpiAwareness>(
-            ::GetProcAddress(shcore, "SetProcessDpiAwareness"));
-        if (setAware != nullptr && SUCCEEDED(setAware(2)))
-        {
-            return;
-        }
-    }
-
-    if (user32 != nullptr)
-    {
-        PFN_SetProcessDPIAware setLegacy = reinterpret_cast<PFN_SetProcessDPIAware>(
-            ::GetProcAddress(user32, "SetProcessDPIAware"));
-        if (setLegacy != nullptr)
-        {
-            setLegacy();
-        }
+        limit.rlim_cur = target;
+        setrlimit(RLIMIT_NOFILE, &limit);
     }
 }
 #endif
 
-static int RunApplication(const char * arg0) 
+static int RunApplication(int argc, char ** argv)
 {
-    bool has_broken_vulkan = false;
-    bool is_child = false;
-    if (CheckEnvVars(&is_child)) {
-        return 0;
-    }
-
-#ifdef WIN32
-    EnablePerMonitorDpiAwareness();
+#ifdef __APPLE__
+    RaiseOpenFileLimit();
 #endif
-    bool res = AppInit(&Notification::GetInstance(), Path(Path::MODULE_DIRECTORY), Common::FS::GetYuzuPathString(Common::FS::YuzuPath::YuzuDir).c_str());
-
-    if (res && StartupChecks(arg0, &has_broken_vulkan, uiSettings.performVulkanCheck)) {
+    // The process may be the child that probes Vulkan for another instance.
+    bool isChild = false;
+    if (CheckEnvVars(&isChild))
+    {
         return 0;
     }
-    uiSettings.hasBrokenVulkan = has_broken_vulkan;
-
-    ISciterUI * sciterUI = nullptr;
-    if (res && !SciterUIInit(uiSettings.languageDir, uiSettings.languageBase.c_str(), uiSettings.languageCurrent.c_str(), uiSettings.sciterConsole, sciterUI))
+    if (!AppInit(Path(Path::MODULE_DIRECTORY), Common::FS::GetYuzuPathString(Common::FS::YuzuPath::YuzuDir).c_str()))
     {
-        res = false;
+        AppCleanup();
+        return 1;
     }
-    if (res)
+    SetupUISetting();
+    const auto exeDir = Common::FS::GetExeDirectory();
+    const bool bundled = exeDir.filename() == "MacOS" && exeDir.parent_path().filename() == "Contents";
+    const auto modules = bundled ? exeDir.parent_path() / "Frameworks/modules" : exeDir / "modules";
+    if (std::filesystem::is_directory(modules))
     {
-        RegisterWidgets(*sciterUI);
-        SciterMainWindow window(*sciterUI, stdstr_f("NXEmu %s", VER_FILE_VERSION_STR).c_str());
-        window.Show();
-        sciterUI->Run();
+        coreSettings.moduleDir = Path(modules.string(), "");
     }
-    if (sciterUI != nullptr)
-    {
-        sciterUI->Shutdown();
-    }
+    const int result = RunUiApplication(argc, argv);
     AppCleanup();
-    Notification::CleanUp();
-    return res ? 0 : 1;
+    return result;
 }
 
 #ifdef _WIN32
 int WINAPI WinMain(_In_ HINSTANCE /*hInstance*/, _In_opt_ HINSTANCE /*hPrevInstance*/, _In_ LPSTR /*lpszArgs*/, _In_ int /*nWinMode*/)
 {
-    char arg0[MAX_PATH]{};
-    GetModuleFileNameA(nullptr, arg0, MAX_PATH);
-    return RunApplication(arg0);
+    return RunApplication(__argc, __argv);
 }
 #else
 int main(int argc, char * argv[])
 {
-    return RunApplication((argc > 0 && argv[0] != nullptr) ? argv[0] : "nxemu");
+    return RunApplication(argc, argv);
 }
 #endif

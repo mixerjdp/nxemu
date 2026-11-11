@@ -2,17 +2,19 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include "yuzu_video_core/dma_pusher.h"
+
+#include "video_settings.h"
 #include "yuzu_common/cityhash.h"
 #include "yuzu_common/settings.h"
+#include "yuzu_common/yuzu_assert.h"
 #include "yuzu_video_core/engines/maxwell_3d.h"
 #include "yuzu_video_core/gpu.h"
 #include "yuzu_video_core/guest_memory.h"
 #include "yuzu_video_core/memory_manager.h"
-#include "video_settings.h"
+#include "yuzu_video_core/rasterizer_interface.h"
 
 namespace Tegra
 {
-
 constexpr u32 MacroRegistersStart = 0xE00;
 constexpr u32 ComputeInline = 0x6D;
 
@@ -38,6 +40,16 @@ void DmaPusher::DispatchCalls()
             break;
         }
     }
+
+    if (memory_operation_sync_state == MemoryOperationSyncState::Armed)
+    {
+        WaitForArmedMemoryOperationSync();
+    }
+    else
+    {
+        memory_operation_sync_state = MemoryOperationSyncState::None;
+    }
+
     gpu.FlushCommands();
     gpu.OnCommandListEnd();
 }
@@ -46,79 +58,164 @@ bool DmaPusher::Step()
 {
     if (!ib_enable || dma_pushbuffer.empty())
     {
-        // pushbuffer empty and IB empty or nonexistent - nothing to do
         return false;
     }
 
-    CommandList & command_list{dma_pushbuffer.front()};
+    CommandList & command_list = dma_pushbuffer.front();
 
-    ASSERT_OR_EXECUTE(
-        command_list.command_lists.size() || command_list.prefetch_command_list.size(), {
-            // Somehow the command_list is empty, in order to avoid a crash
-            // We ignore it and assume its size is 0.
-            dma_pushbuffer.pop();
-            dma_pushbuffer_subindex = 0;
-            return true;
-        });
+    const size_t prefetch_size = command_list.prefetch_command_list.size();
+    const size_t command_list_size = command_list.command_lists.size();
 
-    if (command_list.prefetch_command_list.size())
+    if (prefetch_size == 0 && command_list_size == 0)
     {
-        // Prefetched command list from nvdrv, used for things like synchronization
+        dma_pushbuffer.pop();
+        dma_pushbuffer_subindex = 0;
+        return true;
+    }
+
+    if (prefetch_size > 0)
+    {
         ProcessCommands(command_list.prefetch_command_list);
         dma_pushbuffer.pop();
+        return true;
+    }
+
+    const CommandListHeader & header = command_list.command_lists[dma_pushbuffer_subindex];
+    dma_state.dma_get = header.Address();
+
+    // SYNC_WAIT applies to the current GP entry, including zero-length entries.
+    if (header.sync)
+    {
+        switch (memory_operation_sync_state)
+        {
+        case MemoryOperationSyncState::Skip:
+            memory_operation_sync_state = MemoryOperationSyncState::None;
+            break;
+        case MemoryOperationSyncState::Armed:
+            WaitForArmedMemoryOperationSync();
+            break;
+        case MemoryOperationSyncState::None:
+            if (Settings::IsGpuCommandSynchronizationEnabled())
+            {
+                SynchronizeMemoryOperations();
+            }
+            break;
+        }
     }
     else
     {
-        const CommandListHeader command_list_header{command_list.command_lists[dma_pushbuffer_subindex++]};
-        dma_state.dma_get = command_list_header.addr;
-
-        if (dma_pushbuffer_subindex >= command_list.command_lists.size())
-        {
-            // We've gone through the current list, remove it from the queue
-            dma_pushbuffer.pop();
-            dma_pushbuffer_subindex = 0;
-        }
-
-        if (command_list_header.size == 0)
-        {
-            return true;
-        }
-
-        // Push buffer non-empty, read a word
-        if (dma_state.method >= MacroRegistersStart)
-        {
-            if (subchannels[dma_state.subchannel])
-            {
-                subchannels[dma_state.subchannel]->current_dirty = memory_manager.IsMemoryDirty(dma_state.dma_get, command_list_header.size * sizeof(u32));
-            }
-        }
-        const auto safe_process = [&] {
-            Tegra::Memory::GpuGuestMemory<Tegra::CommandHeader, GuestMemoryFlags::SafeRead> headers(memory_manager, dma_state.dma_get, command_list_header.size, &command_headers);
-            ProcessCommands(headers);
-        };
-        const auto unsafe_process = [&] {
-            Tegra::Memory::GpuGuestMemory<Tegra::CommandHeader, GuestMemoryFlags::UnsafeRead> headers(memory_manager, dma_state.dma_get, command_list_header.size,&command_headers);
-            ProcessCommands(headers);
-        };
-        if (Settings::IsGPULevelHigh())
-        {
-            if (dma_state.method >= MacroRegistersStart)
-            {
-                unsafe_process();
-                return true;
-            }
-            if (subchannel_type[dma_state.subchannel] == Engines::EngineTypes::KeplerCompute &&
-                dma_state.method == ComputeInline)
-            {
-                unsafe_process();
-                return true;
-            }
-            safe_process();
-            return true;
-        }
-        unsafe_process();
+        ASSERT(memory_operation_sync_state == MemoryOperationSyncState::None);
     }
+
+    if (header.size > 0 && dma_state.method_count && subchannels[dma_state.subchannel])
+    {
+        const auto engine = subchannel_type[dma_state.subchannel];
+        const bool compute_payload = engine == Engines::EngineTypes::KeplerCompute &&
+                                     dma_state.method == ComputeInline && dma_state.non_incrementing;
+        const bool macro_payload = engine == Engines::EngineTypes::Maxwell3D &&
+                                   dma_state.method >= MacroRegistersStart;
+        if (compute_payload || macro_payload)
+        {
+            // A safe fetch can download the parameters and clear their GPU dirty state. Keep
+            // their origin so compute launches and draw macros consume live GPU
+            // arguments, including at Normal accuracy where DMA reads may be unsafe.
+            const std::size_t words = std::min<std::size_t>(dma_state.method_count, header.size);
+            subchannels[dma_state.subchannel]->current_dirty =
+                memory_manager.IsMemoryDirty(dma_state.dma_get, words * sizeof(u32));
+        }
+    }
+
+    if (header.size > 0)
+    {
+        // Only bypass readback when this entire entry continues a non-incrementing parameter
+        // command. A completed command leaves its method behind, and a partial continuation can
+        // be followed by new headers that the CPU must fetch safely.
+        const bool is_gpu_consumed =
+            Settings::IsDMALevelDefault() && dma_state.non_incrementing &&
+            dma_state.method_count >= header.size &&
+            (dma_state.method >= MacroRegistersStart ||
+             (subchannel_type[dma_state.subchannel] == Engines::EngineTypes::KeplerCompute &&
+              dma_state.method == ComputeInline));
+        const bool use_safe = Settings::UseSafeDMAReads() && !is_gpu_consumed;
+        if (use_safe)
+        {
+            Tegra::Memory::GpuGuestMemory<Tegra::CommandHeader, GuestMemoryFlags::SafeRead> headers(
+                memory_manager, dma_state.dma_get, header.size, &command_headers);
+            ProcessCommands(headers);
+        }
+        else
+        {
+            Tegra::Memory::GpuGuestMemory<Tegra::CommandHeader, GuestMemoryFlags::UnsafeRead> headers(
+                memory_manager, dma_state.dma_get, header.size, &command_headers);
+            ProcessCommands(headers);
+        }
+    }
+
+    // Prepare a following SYNC_WAIT at the current GP-entry boundary. Clean pushbuffers can be
+    // fetched directly because DmaPusher already processes GP entries in order.
+    const std::size_t next_entry_index = dma_pushbuffer_subindex + 1;
+    if (next_entry_index < command_list_size && Settings::IsGpuCommandSynchronizationEnabled())
+    {
+        const CommandListHeader & next_header = command_list.command_lists[next_entry_index];
+        if (next_header.sync)
+        {
+            ASSERT(memory_operation_sync_state == MemoryOperationSyncState::None);
+            if (CanSkipCleanMemoryOperationSync(next_header))
+            {
+                memory_operation_sync_state = MemoryOperationSyncState::Skip;
+            }
+            else
+            {
+                ArmMemoryOperationSync();
+            }
+        }
+    }
+
+    if (++dma_pushbuffer_subindex >= command_list_size)
+    {
+        dma_pushbuffer.pop();
+        dma_pushbuffer_subindex = 0;
+    }
+
     return true;
+}
+
+void DmaPusher::SynchronizeMemoryOperations()
+{
+    ASSERT(rasterizer != nullptr);
+    rasterizer->WaitForFence();
+}
+
+void DmaPusher::ArmMemoryOperationSync()
+{
+    ASSERT(rasterizer != nullptr);
+    ASSERT(memory_operation_sync_state == MemoryOperationSyncState::None);
+
+    memory_operation_sync_ready.store(false, std::memory_order_relaxed);
+    memory_operation_sync_state = MemoryOperationSyncState::Armed;
+    rasterizer->SignalMemoryOperationFence([this]() {
+        memory_operation_sync_ready.store(true, std::memory_order_release);
+        memory_operation_sync_ready.notify_one();
+    });
+}
+
+void DmaPusher::WaitForArmedMemoryOperationSync()
+{
+    ASSERT(memory_operation_sync_state == MemoryOperationSyncState::Armed);
+
+    memory_operation_sync_ready.wait(false, std::memory_order_acquire);
+    memory_operation_sync_state = MemoryOperationSyncState::None;
+}
+
+bool DmaPusher::CanSkipCleanMemoryOperationSync(const CommandListHeader & header) const
+{
+    // The actual fetch must still resolve writes that can appear after this look-ahead probe.
+    if (!Settings::UseSafeDMAReads() || header.size == 0 || header.conditional_fetch)
+    {
+        return false;
+    }
+
+    return !memory_manager.IsMemoryDirty(header.Address(), header.size * sizeof(u32));
 }
 
 void DmaPusher::ProcessCommands(std::span<const CommandHeader> commands)
@@ -140,11 +237,64 @@ void DmaPusher::ProcessCommands(std::span<const CommandHeader> commands)
                 index += max_write;
                 continue;
             }
-            else
+            if (dma_state.method >= non_puller_methods)
             {
-                dma_state.is_last_call = dma_state.method_count <= 1;
-                CallMethod(command_header.argument);
+                auto * const subchannel = subchannels[dma_state.subchannel];
+                if (subchannel_type[dma_state.subchannel] == Engines::EngineTypes::Maxwell3D &&
+                    !subchannel->execution_mask[dma_state.method])
+                {
+                    const size_t begin = index;
+                    const u32 first_method = dma_state.method;
+                    const size_t available = dma_increment_once ? 1 :
+                        std::min<size_t>(dma_state.method_count, commands.size() - index);
+                    do
+                    {
+                        ++dma_state.method;
+                        ++index;
+                    } while (index - begin < available &&
+                             !subchannel->execution_mask[dma_state.method]);
+                    const u32 count = static_cast<u32>(index - begin);
+                    subchannel->PushMethodRun(first_method, commands.subspan(begin, count));
+                    dma_state.is_last_call = dma_state.method_count <= count;
+                    dma_state.method_count -= count;
+                    if (dma_increment_once)
+                    {
+                        dma_state.non_incrementing = true;
+                    }
+                    continue;
+                }
+                while (index < commands.size() && dma_state.method_count != 0)
+                {
+                    if (subchannel->execution_mask[dma_state.method])
+                    {
+                        dma_state.dma_word_offset = (uint32_t)(index * sizeof(uint32_t));
+                        dma_state.is_last_call = dma_state.method_count <= 1;
+                        CallMethod(commands[index].argument);
+                        dma_state.method++;
+                        if (dma_increment_once)
+                        {
+                            dma_state.non_incrementing = true;
+                        }
+                        dma_state.method_count--;
+                        index++;
+                        break;
+                    }
+                    dma_state.is_last_call = dma_state.method_count <= 1;
+                    subchannel->method_sink.emplace_back(dma_state.method, commands[index].argument);
+                    dma_state.method++;
+                    dma_state.method_count--;
+                    index++;
+                    if (dma_increment_once)
+                    {
+                        dma_state.non_incrementing = true;
+                        break;
+                    }
+                }
+                continue;
             }
+
+            dma_state.is_last_call = dma_state.method_count <= 1;
+            CallMethod(command_header.argument);
 
             if (!dma_state.non_incrementing)
             {
@@ -177,6 +327,7 @@ void DmaPusher::ProcessCommands(std::span<const CommandHeader> commands)
                 dma_state.method = command_header.method;
                 dma_state.subchannel = command_header.subchannel;
                 dma_state.dma_word_offset = static_cast<u64>(-static_cast<s64>(dma_state.dma_get)); // negate to set address as 0
+                dma_state.is_last_call = true;
                 CallMethod(command_header.arg_count);
                 dma_state.non_incrementing = true;
                 dma_increment_once = false;
@@ -212,10 +363,20 @@ void DmaPusher::CallMethod(u32 argument) const
         auto subchannel = subchannels[dma_state.subchannel];
         if (!subchannel->execution_mask[dma_state.method]) [[likely]]
         {
-            subchannel->method_sink.emplace_back(dma_state.method, argument);
+            if (subchannel_type[dma_state.subchannel] == Engines::EngineTypes::Maxwell3D)
+            {
+                subchannel->PushMethod(dma_state.method, argument);
+            }
+            else
+            {
+                subchannel->method_sink.emplace_back(dma_state.method, argument);
+            }
             return;
         }
-        subchannel->ConsumeSink();
+        if (!subchannel->method_sink.empty())
+        {
+            subchannel->ConsumeSink();
+        }
         subchannel->current_dma_segment = dma_state.dma_get + dma_state.dma_word_offset;
         subchannel->CallMethod(dma_state.method, argument, dma_state.is_last_call);
     }
@@ -230,15 +391,18 @@ void DmaPusher::CallMultiMethod(const u32 * base_start, u32 num_methods) const
     else
     {
         auto subchannel = subchannels[dma_state.subchannel];
-        subchannel->ConsumeSink();
+        if (!subchannel->method_sink.empty())
+        {
+            subchannel->ConsumeSink();
+        }
         subchannel->current_dma_segment = dma_state.dma_get + dma_state.dma_word_offset;
         subchannel->CallMultiMethod(dma_state.method, base_start, num_methods, dma_state.method_count);
     }
 }
 
-void DmaPusher::BindRasterizer(VideoCore::RasterizerInterface * rasterizer)
+void DmaPusher::BindRasterizer(VideoCore::RasterizerInterface * rasterizer_)
 {
-    puller.BindRasterizer(rasterizer);
+    rasterizer = rasterizer_;
+    puller.BindRasterizer(rasterizer_);
 }
-
 } // namespace Tegra

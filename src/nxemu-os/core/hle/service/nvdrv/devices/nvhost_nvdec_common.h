@@ -4,6 +4,8 @@
 #pragma once
 
 #include <deque>
+#include <memory>
+#include <mutex>
 #include <unordered_map>
 #include <vector>
 
@@ -17,6 +19,8 @@ namespace Service::Nvidia {
 namespace NvCore {
 class Container;
 class NvMap;
+struct Session;
+class PinnedHandle;
 } // namespace NvCore
 
 namespace Devices {
@@ -117,6 +121,10 @@ protected:
     NvResult UnmapBuffer(IoctlMapBuffer& params, std::span<MapBufferEntry> entries);
     NvResult SetSubmitTimeout(u32 timeout);
 
+    using Mappings = std::vector<std::shared_ptr<NvCore::PinnedHandle>>;
+    std::mutex mappings_mutex;
+    std::shared_ptr<const Mappings> mappings = std::make_shared<const Mappings>();
+
     Kernel::KEvent* QueryEvent(u32 event_id) override;
 
     u32 channel_syncpoint;
@@ -127,7 +135,7 @@ protected:
     NvCore::NvMap& nvmap;
     NvCore::ChannelType channel_type;
     std::array<u32, MaxSyncPoints> device_syncpoints{};
-    std::unordered_map<DeviceFD, NvCore::SessionId> sessions;
+    std::unordered_map<DeviceFD, std::weak_ptr<NvCore::Session>> sessions;
 };
 }; // namespace Devices
 } // namespace Service::Nvidia

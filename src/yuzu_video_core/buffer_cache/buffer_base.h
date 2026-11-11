@@ -38,6 +38,12 @@ public:
     static constexpr u64 BASE_PAGE_BITS = 16;
     static constexpr u64 BASE_PAGE_SIZE = 1ULL << BASE_PAGE_BITS;
 
+    /// Changes every time the host contents of the buffer change
+    u64 content_version{};
+
+    /// Conservative for this buffer's lifetime: sparse part registration only sets this.
+    bool has_sparse_references{};
+
     explicit BufferBase(VAddr cpu_addr_, u64 size_bytes_)
         : cpu_addr{cpu_addr_}, size_bytes{size_bytes_} {}
 

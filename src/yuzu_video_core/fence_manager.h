@@ -4,6 +4,7 @@
 #pragma once
 
 #include <algorithm>
+#include <atomic>
 #include <condition_variable>
 #include <cstring>
 #include <deque>
@@ -14,6 +15,7 @@
 #include <queue>
 
 #include "yuzu_common/common_types.h"
+#include "yuzu_common/parallel_readback_copy.h"
 #include "yuzu_common/scope_exit.h"
 #include "yuzu_common/settings.h"
 #include "yuzu_common/thread.h"
@@ -71,34 +73,23 @@ public:
         uncommitted_operations.emplace_back(std::move(func));
     }
 
-    void SignalFence(std::function<void()>&& func) {
-        bool delay_fence = Settings::IsGPULevelHigh();
+    void SignalFence(std::function<void()>&& func, bool force_delay = false) {
+        (void)SubmitFence(std::move(func), force_delay, false, nullptr);
+    }
+
+    // Query values and their slots must remain alive until GPU readbacks retire.
+    // Empty submissions still complete inline, without a host GPU fence.
+    void SignalQueryFence(std::function<void()>&& func) {
+        (void)SubmitFence(std::move(func), true, true, nullptr);
+    }
+
+    void SignalMemoryOperationFence(std::function<void()>&& func) {
+        const bool completed_inline = SubmitFence(std::move(func), true, true, nullptr);
         if constexpr (!can_async_check) {
-            TryReleasePendingFences<false>();
+            if (!completed_inline) {
+                TryReleasePendingFences<true>();
+            }
         }
-        const bool should_flush = ShouldFlush();
-        CommitAsyncFlushes();
-        TFence new_fence = CreateFence(!should_flush);
-        if constexpr (can_async_check) {
-            guard.lock();
-        }
-        if (delay_fence) {
-            uncommitted_operations.emplace_back(std::move(func));
-        }
-        pending_operations.emplace_back(std::move(uncommitted_operations));
-        QueueFence(new_fence);
-        if (!delay_fence) {
-            func();
-        }
-        fences.push(std::move(new_fence));
-        if (should_flush) {
-            rasterizer.FlushCommands();
-        }
-        if constexpr (can_async_check) {
-            guard.unlock();
-            cv.notify_all();
-        }
-        rasterizer.InvalidateGPUCache();
     }
 
     void SignalSyncPoint(u32 value) {
@@ -107,25 +98,28 @@ public:
         SignalFence(std::move(func));
     }
 
+    // Explicit synchronization remains blocking at every GPU accuracy level.
+    void WaitForFence() {
+        // Fence submission has one GPU-thread producer; keep its waiter alive through notify_one.
+        wait_finished.store(false, std::memory_order_relaxed);
+
+        const bool completed_inline = SubmitFence({}, true, true, &wait_finished);
+        if (completed_inline) {
+            return;
+        }
+
+        if constexpr (!can_async_check) {
+            TryReleasePendingFences<true>();
+        }
+
+        wait_finished.wait(false, std::memory_order_acquire);
+    }
+
     void WaitPendingFences([[maybe_unused]] bool force) {
         if constexpr (!can_async_check) {
             TryReleasePendingFences<true>();
-        } else {
-            if (!force) {
-                return;
-            }
-            std::mutex wait_mutex;
-            std::condition_variable wait_cv;
-            std::atomic<bool> wait_finished{};
-            std::function<void()> func([&] {
-                std::scoped_lock lk(wait_mutex);
-                wait_finished.store(true, std::memory_order_relaxed);
-                wait_cv.notify_all();
-            });
-            SignalFence(std::move(func));
-            std::unique_lock lk(wait_mutex);
-            wait_cv.wait(
-                lk, [&wait_finished] { return wait_finished.load(std::memory_order_relaxed); });
+        } else if (force) {
+            WaitForFence();
         }
     }
 
@@ -167,6 +161,106 @@ protected:
     TQueryCache& query_cache;
 
 private:
+    static void CompleteWaiter(std::atomic<bool>* waiter) {
+        if (waiter == nullptr) {
+            return;
+        }
+        waiter->store(true, std::memory_order_release);
+        if constexpr (can_async_check) {
+            waiter->notify_one();
+        }
+    }
+
+    bool SubmitFence(std::function<void()>&& func, bool force_delay,
+                     bool allow_stub_fast_path, std::atomic<bool>* waiter) {
+        if constexpr (!can_async_check) {
+            TryReleasePendingFences<false>();
+        }
+
+        // Preparing query writes can checkpoint an active counter and enqueue a
+        // readback even when no guest report was pending. Decide whether a real
+        // GPU fence is needed only after that work has been materialized.
+        query_cache.PrepareAsyncFlushes();
+        const bool should_flush = ShouldFlush();
+        CommitAsyncFlushes();
+
+        if constexpr (can_async_check) {
+            guard.lock();
+        }
+
+        // Ordinary fences and query housekeeping also occupy the queue after
+        // their completion signal has run inline. Only a readback or an earlier
+        // delayed signal requires Normal to defer this completion signal. Where pending
+        // readbacks fault on CPU access, a readback alone does not either.
+        const bool unprotected_flush = should_flush && !buffer_cache.PendingDownloadsProtected();
+        const bool delay_fence = force_delay || Settings::IsGpuReadbackExact() ||
+                                 unprotected_flush || pending_delayed_fences != 0;
+
+        const bool can_complete_stub_inline =
+            allow_stub_fast_path && delay_fence && !should_flush && fences.empty() &&
+            pending_operations.empty() && !fence_in_flight;
+
+        if (can_complete_stub_inline) {
+            auto operations = std::move(uncommitted_operations);
+            if (func) {
+                operations.emplace_back(std::move(func));
+            }
+
+            if constexpr (can_async_check) {
+                // Keep later submissions behind the inline retirement.
+                fence_in_flight = true;
+                guard.unlock();
+            }
+
+            // Retire the logical flush slot inline when no older fence exists.
+            PopAsyncFlushes();
+            for (auto& operation : operations) {
+                operation();
+            }
+            rasterizer.InvalidateGPUCache();
+
+            if constexpr (can_async_check) {
+                bool has_pending_fences;
+                {
+                    std::scoped_lock lock(guard);
+                    fence_in_flight = false;
+                    has_pending_fences = !fences.empty();
+                }
+                if (has_pending_fences) {
+                    cv.notify_one();
+                }
+            }
+            return true;
+        }
+
+        TFence new_fence = CreateFence(!should_flush);
+        if (delay_fence && func) {
+            uncommitted_operations.emplace_back(std::move(func));
+        }
+        pending_operations.emplace_back(std::move(uncommitted_operations));
+        pending_waiters.emplace_back(waiter);
+        QueueFence(new_fence);
+        if (!delay_fence && func) {
+            func();
+        }
+        fences.push(std::move(new_fence));
+        if (delay_fence) {
+            // Count through the last delayed signal, including an entry already
+            // owned by the worker. Later inline-only queue entries cannot keep
+            // Normal on the delayed path once this prefix has retired.
+            pending_delayed_fences = fences.size() + (fence_in_flight ? 1 : 0);
+        }
+        if (should_flush) {
+            rasterizer.FlushCommands();
+        }
+        if constexpr (can_async_check) {
+            guard.unlock();
+            cv.notify_one();
+        }
+        rasterizer.InvalidateGPUCache();
+        return false;
+    }
+
     template <bool force_wait>
     void TryReleasePendingFences() {
         while (!fences.empty()) {
@@ -181,6 +275,8 @@ private:
             PopAsyncFlushes();
             auto operations = std::move(pending_operations.front());
             pending_operations.pop_front();
+            auto* waiter = pending_waiters.front();
+            pending_waiters.pop_front();
             for (auto& operation : operations) {
                 operation();
             }
@@ -189,27 +285,40 @@ private:
                 delayed_destruction_ring.Push(std::move(current_fence));
             }
             fences.pop();
+            if (pending_delayed_fences != 0) {
+                --pending_delayed_fences;
+            }
+            CompleteWaiter(waiter);
         }
     }
 
     void ReleaseThreadFunc(std::stop_token stop_token) {
+        // Join readback helpers before exiting the DLL thread, outside CRT TLS
+        // destruction and its Windows loader lock. All early returns unwind it.
+        Common::ReadbackCopyContext readback_context;
         // Cleanup
         Common::SetCurrentThreadName("GPUFencingThread");
         Common::SetCurrentThreadPriority(Common::ThreadPriority::High);
 
         TFence current_fence;
         std::deque<std::function<void()>> current_operations;
+        std::atomic<bool>* current_waiter{};
         while (!stop_token.stop_requested()) {
             {
                 std::unique_lock lock(guard);
-                cv.wait(lock, [&] { return stop_token.stop_requested() || !fences.empty(); });
+                cv.wait(lock, [&] {
+                    return stop_token.stop_requested() || (!fence_in_flight && !fences.empty());
+                });
                 if (stop_token.stop_requested()) [[unlikely]] {
                     return;
                 }
                 current_fence = std::move(fences.front());
                 current_operations = std::move(pending_operations.front());
+                current_waiter = pending_waiters.front();
                 fences.pop();
                 pending_operations.pop_front();
+                pending_waiters.pop_front();
+                fence_in_flight = true;
             }
             if (!current_fence->IsStubbed()) {
                 WaitFence(current_fence);
@@ -222,6 +331,16 @@ private:
                 std::unique_lock lock(ring_guard);
                 delayed_destruction_ring.Push(std::move(current_fence));
             }
+            {
+                std::scoped_lock lock(guard);
+                fence_in_flight = false;
+                if (pending_delayed_fences != 0) {
+                    --pending_delayed_fences;
+                }
+            }
+            // Complete after retirement to avoid SMO-to-SMO stub convoys.
+            CompleteWaiter(current_waiter);
+            current_waiter = nullptr;
         }
     }
 
@@ -258,6 +377,12 @@ private:
     std::queue<TFence> fences;
     std::deque<std::function<void()>> uncommitted_operations;
     std::deque<std::deque<std::function<void()>>> pending_operations;
+    std::deque<std::atomic<bool>*> pending_waiters;
+    bool fence_in_flight{};
+    // Number of queued/in-flight fences through the last delayed signal.
+    // Guarded by guard on the asynchronous path; cleared only after callbacks.
+    size_t pending_delayed_fences{};
+    std::atomic<bool> wait_finished{};
 
     std::mutex guard;
     std::mutex ring_guard;

@@ -6,7 +6,9 @@
 #include <atomic>
 #include <deque>
 #include <limits>
+#include <memory>
 #include <mutex>
+#include <optional>
 #include <span>
 #include <type_traits>
 #include <unordered_map>
@@ -29,10 +31,13 @@
 #include "yuzu_video_core/engines/fermi_2d.h"
 #include "yuzu_video_core/surface.h"
 #include "yuzu_video_core/texture_cache/descriptor_table.h"
+#include "yuzu_video_core/texture_cache/image_view_descriptor_index.h"
 #include "yuzu_video_core/texture_cache/image_base.h"
 #include "yuzu_video_core/texture_cache/image_info.h"
 #include "yuzu_video_core/texture_cache/image_view_base.h"
 #include "yuzu_video_core/texture_cache/render_targets.h"
+#include "yuzu_video_core/gpu_write_history.h"
+#include "yuzu_video_core/texture_cache/readback_page_tracker.h"
 #include "yuzu_video_core/texture_cache/types.h"
 #include "yuzu_video_core/textures/texture.h"
 
@@ -52,15 +57,18 @@ using namespace Common::Literals;
 struct ImageViewInOut {
     u32 index{};
     bool blacklist{};
+    /// Entry of a table indexed by the shader, which may never sample it
+    bool is_table{};
     ImageViewId id{};
 };
 
 struct AsyncDecodeContext {
-    ImageId image_id;
+    ImageId image_id{};
     Common::ScratchBuffer<u8> decoded_data;
     boost::container::small_vector<BufferImageCopy, 16> copies;
-    std::mutex mutex;
-    std::atomic_bool complete;
+    /// The image was deleted and its slot may be reused.
+    std::atomic_bool cancelled{false};
+    std::atomic_bool complete{false};
 };
 
 using TextureCacheGPUMap = std::unordered_map<u64, std::vector<ImageId>, Common::IdentityHash<u64>>;
@@ -87,6 +95,7 @@ public:
 
     TextureCacheGPUMap* gpu_page_table;
     TextureCacheGPUMap* sparse_page_table;
+    size_t gpu_page_table_index{};
 };
 
 template <class P>
@@ -113,6 +122,13 @@ class TextureCache : public VideoCommon::ChannelSetupCaches<TextureCacheChannelI
     static constexpr size_t GC_EMERGENCY_COUNTS = 2;
 
     using Runtime = typename P::Runtime;
+    static constexpr bool SUPPORTS_ASYNC_GC =
+        IMPLEMENTS_ASYNC_DOWNLOADS && requires(Runtime& backend, u64 tick) {
+            backend.GetReadbackTick();
+            backend.IsReadbackReady(tick);
+            backend.WaitReadback(tick);
+            backend.SubmitReadbacks();
+        };
     using Image = typename P::Image;
     using ImageAlloc = typename P::ImageAlloc;
     using ImageView = typename P::ImageView;
@@ -130,6 +146,10 @@ class TextureCache : public VideoCommon::ChannelSetupCaches<TextureCacheChannelI
 
 public:
     explicit TextureCache(Runtime&, Tegra::MaxwellDeviceMemoryManager&);
+    ~TextureCache();
+
+    /// Drain deferred GC copies before the backend's submission dependencies are destroyed.
+    void DrainGCReadbacks();
 
     /// Notify the cache that a new frame has been queued
     void TickFrame();
@@ -153,8 +173,14 @@ public:
     /// Fill image_view_ids with the compute images in indices
     void FillComputeImageViews(std::span<ImageViewInOut> views);
 
+    // Filter a direct TIC entry before creating/uploading an unrelated image.
+    bool IsCompute3DImage(u32 index, bool is_integer, bool is_signed);
+
     /// Handle feedback loops during draws.
     void CheckFeedbackLoop(std::span<const ImageViewInOut> views);
+
+    /// Marks the render targets a draw writes, for the feedback loop checks of later draws.
+    void MarkRenderTargetsWritten(u32 color_mask, bool depth);
 
     /// Get the sampler from the graphics descriptor table in the specified index
     Sampler* GetGraphicsSampler(u32 index);
@@ -182,21 +208,43 @@ public:
 
     /// Updates the Render Targets if they can be rescaled
     /// @retval True if the Render Targets have been rescaled.
-    bool RescaleRenderTargets();
+    bool RescaleRenderTargets(u32 clear_layer_count = 0);
 
     /// Update bound render targets and upload memory if necessary
     /// @param is_clear True when the render targets are being used for clears
-    void UpdateRenderTargets(bool is_clear);
+    void UpdateRenderTargets(bool is_clear, u32 clear_layer_count = 0);
+
+    /// True when every bound render target was drawn to in an earlier frame, so that a draw
+    /// skipped now is redrawn by a later frame. UpdateRenderTargets should be called before this
+    [[nodiscard]] bool RenderTargetsDrawnBefore() const;
+
+    /// True when an image was drawn to for the first time since the previous call
+    [[nodiscard]] bool TakeNewRenderTargets() {
+        return std::exchange(has_new_render_targets, false);
+    }
+
+    /// Image view bound as a color render target, null when none is
+    /// UpdateRenderTargets should be called before this
+    [[nodiscard]] ImageViewId ColorBufferViewId(size_t index) const noexcept {
+        return render_targets.color_buffer_ids[index];
+    }
 
     /// Find a framebuffer with the currently bound render targets
     /// UpdateRenderTargets should be called before this
     Framebuffer* GetFramebuffer();
 
+    /// Isolate one attachment/layer for helper draws. NUM_RT selects depth/stencil.
+    Framebuffer* GetClearFramebuffer(size_t color_attachment, u32 layer);
+
     /// Mark images in a range as modified from the CPU
     void WriteMemory(DAddr cpu_addr, size_t size);
 
+    template <typename BufferHandle>
+    void UpdateImagesFromBuffer(DAddr cpu_addr, size_t size, BufferHandle buffer,
+                                u64 buffer_offset);
+
     /// Download contents of host images to guest memory in a region
-    void DownloadMemory(DAddr cpu_addr, size_t size);
+    void DownloadMemory(DAddr cpu_addr, size_t size, bool native_read = false);
 
     std::optional<RasterizerDownloadArea> GetFlushArea(DAddr cpu_addr, u64 size);
 
@@ -204,7 +252,8 @@ public:
     void UnmapMemory(DAddr cpu_addr, size_t size);
 
     /// Remove images in a region
-    void UnmapGPUMemory(size_t as_id, GPUVAddr gpu_addr, size_t size);
+    void UnmapGPUMemory(size_t as_id, GPUVAddr gpu_addr, size_t size,
+                        bool preserve_contents = false);
 
     /// Blit an image with the given parameters
     bool BlitImage(const Tegra::Engines::Fermi2D::Surface& dst,
@@ -229,6 +278,10 @@ public:
 
     [[nodiscard]] ImageId DmaImageId(const Tegra::DMA::ImageOperand& operand, bool is_upload);
 
+    [[nodiscard]] bool DmaImageToImage(const Tegra::DMA::ImageCopy& copy_info,
+                                       const Tegra::DMA::ImageOperand& src,
+                                       const Tegra::DMA::ImageOperand& dst);
+
     [[nodiscard]] std::pair<Image*, BufferImageCopy> DmaBufferImageCopy(
         const Tegra::DMA::ImageCopy& copy_info, const Tegra::DMA::BufferOperand& buffer_operand,
         const Tegra::DMA::ImageOperand& image_operand, ImageId image_id, bool modifies_image);
@@ -239,6 +292,18 @@ public:
 
     /// Return true when a CPU region is modified from the GPU
     [[nodiscard]] bool IsRegionGpuModified(DAddr addr, size_t size);
+
+    /// Return true when an image the guest reads back has GPU writes missing from guest memory
+    [[nodiscard]] bool HasUnpublishedReadImage(DAddr addr, size_t size);
+
+    /// Lock-free: false proves that no image the guest reads back has unpublished data here.
+    [[nodiscard]] bool MayHaveUnpublishedReadImage(DAddr addr, size_t size) const noexcept {
+        return unpublished_read_pages.Any(addr, size);
+    }
+
+    /// The guest accesses a page of an image it reads back. Returns whether that page must be
+    /// downloaded now; afterwards asynchronous publications include it.
+    [[nodiscard]] bool ObserveReadImages(DAddr addr, size_t size);
 
     [[nodiscard]] bool IsRescaling() const noexcept;
 
@@ -253,6 +318,8 @@ public:
     std::recursive_mutex mutex;
 
 private:
+    void DeduplicateDownloads();
+
     /// Iterate over all page indices in a range
     template <typename Func>
     static void ForEachCPUPage(DAddr addr, size_t size, Func&& func) {
@@ -286,6 +353,8 @@ private:
 
     void OnGPUASRegister(size_t map_id) final override;
 
+    void OnChannelErase(size_t storage_id) final override;
+
     /// Runs the Garbage Collector.
     void RunGarbageCollector();
 
@@ -317,7 +386,8 @@ private:
 
     /// Find or create an image from the given parameters
     [[nodiscard]] ImageId FindOrInsertImage(const ImageInfo& info, GPUVAddr gpu_addr,
-                                            RelaxedOptions options = RelaxedOptions{});
+                                            RelaxedOptions options = RelaxedOptions{},
+                                            bool discard_contents = false);
 
     /// Find an image from the given parameters
     [[nodiscard]] ImageId FindImage(const ImageInfo& info, GPUVAddr gpu_addr,
@@ -325,11 +395,12 @@ private:
 
     /// Create an image from the given parameters
     [[nodiscard]] ImageId InsertImage(const ImageInfo& info, GPUVAddr gpu_addr,
-                                      RelaxedOptions options);
+                                      RelaxedOptions options, bool discard_contents = false);
 
     /// Create a new image and join perfectly matching existing images
     /// Remove joined images from the cache
-    [[nodiscard]] ImageId JoinImages(const ImageInfo& info, GPUVAddr gpu_addr, DAddr cpu_addr);
+    [[nodiscard]] ImageId JoinImages(const ImageInfo& info, GPUVAddr gpu_addr, DAddr cpu_addr,
+                                     bool discard_contents);
 
     [[nodiscard]] ImageId FindDMAImage(const ImageInfo& info, GPUVAddr gpu_addr);
 
@@ -342,13 +413,17 @@ private:
     [[nodiscard]] SamplerId FindSampler(const TSCEntry& config);
 
     /// Find or create an image view for the given color buffer index
-    [[nodiscard]] ImageViewId FindColorBuffer(size_t index);
+    [[nodiscard]] ImageViewId FindColorBuffer(size_t index, u32 clear_layer_count = 0);
 
     /// Find or create an image view for the depth buffer
-    [[nodiscard]] ImageViewId FindDepthBuffer();
+    [[nodiscard]] ImageViewId FindDepthBuffer(u32 clear_layer_count = 0);
 
     /// Find or create a view for a render target with the given image parameters
-    [[nodiscard]] ImageViewId FindRenderTargetView(const ImageInfo& info, GPUVAddr gpu_addr);
+    [[nodiscard]] ImageViewId FindRenderTargetView(const ImageInfo& info, GPUVAddr gpu_addr,
+                                                   bool discard_contents = false);
+
+    [[nodiscard]] bool CanDiscardOnClear(const ImageInfo& info, bool is_color, size_t index,
+                                         u32 clear_layer_count);
 
     /// Iterates over all the images in a region calling func
     template <typename Func>
@@ -380,19 +455,32 @@ private:
     void UntrackImage(ImageBase& image, ImageId image_id);
 
     /// Delete image from the cache
-    void DeleteImage(ImageId image, bool immediate_delete = false);
+    void DeleteImage(ImageId image, bool immediate_delete = false,
+                     std::vector<ImageViewId>* deferred_views = nullptr,
+                     bool defer_descriptor_invalidation = false);
+
+    void InvalidateImageTables();
 
     /// Remove image views references from the cache
     void RemoveImageViewReferences(std::span<const ImageViewId> removed_views);
+
+    ImageViewDescriptorIndex<ImageViewId, TICEntry> image_view_descriptors;
 
     /// Remove framebuffers using the given image views from the cache
     void RemoveFramebuffers(std::span<const ImageViewId> removed_views);
 
     /// Mark an image as modified from the GPU
-    void MarkModification(ImageBase& image) noexcept;
+    void MarkModification(ImageBase& image, ImageId image_id) noexcept;
+    void MarkUnpublishedRead(ImageBase& image);
+    void RefreshUnpublishedRead(DAddr addr, size_t size);
+    void UpdateNativeReadTracking(ImageBase& image, ImageId image_id);
+    void NotifyNativeImageModification(ImageBase& image, ImageId image_id);
 
     /// Synchronize image aliases, copying data if needed
     void SynchronizeAliases(ImageId image_id);
+
+    /// Records the first frame in which the image of the view is drawn to
+    void MarkRenderTarget(ImageViewId view_id);
 
     /// Prepare an image view to be used
     void PrepareImageView(ImageViewId image_view_id, bool is_modification, bool invalidate);
@@ -420,7 +508,18 @@ private:
     u64 GetScaledImageSizeBytes(const ImageBase& image);
 
     void QueueAsyncDecode(Image& image, ImageId image_id);
+    void CancelAsyncDecode(ImageId image_id);
     void TickAsyncDecode();
+    bool QueueGCReadback(ImageId id);
+    void PollGCReadbacks();
+    void CancelPendingDownloads(ImageId id);
+    void CancelGCReadback(ImageId id);
+
+    /// Id of the address space an image was created in, or nullopt if it is gone
+    std::optional<size_t> ImageAddressSpace(const ImageBase& image) const;
+
+    /// Memory manager of the address space an image was created in, or null if it is gone
+    Tegra::MemoryManager* ImageGpuMemory(const ImageBase& image) const;
 
     Runtime& runtime;
 
@@ -437,7 +536,13 @@ private:
     DAddr virtual_invalid_space{};
 
     bool has_deleted_images = false;
+    bool has_new_render_targets = false;
     bool is_rescaling = false;
+
+    /// Pass in which each descriptor index was last visited by FillImageViews, and its view
+    std::vector<u32> visited_pass;
+    std::vector<ImageViewId> visited_view_ids;
+    u32 current_visit_pass = 0;
     u64 total_used_memory = 0;
     u64 minimum_memory;
     u64 expected_memory;
@@ -448,10 +553,48 @@ private:
         size_t size;
     };
 
+    bool PublishObservedReadback(const ImageBase& image, std::span<const BufferImageCopy> copies,
+                                 std::span<const u8> memory, u64 observation_serial,
+                                 Tegra::MemoryManager* publication_memory = nullptr);
+    void MarkReadbackSynchronized(Image& image);
+    ReadbackPageTracker readback_pages;
+    // Pages that may hold an image the guest reads back with GPU writes not published yet.
+    // Set on the GPU thread before a later fence can signal, cleared after publication.
+    AtomicPageBits<34, 12> unpublished_read_pages;
+
     struct PendingDownload {
         bool is_swizzle;
         size_t async_buffer_id;
         Common::SlotId object_id;
+        u64 observation_serial{};
+        bool observed_partial{};
+        size_t observed_address_space{};
+        // Staging bytes reserved at commit; the image slot may be reused before the pop.
+        size_t staging_bytes{};
+        // The image was deleted after its copy was recorded; skip publication.
+        bool discarded{};
+        // Modification and GPU write ticks of the contents the copy records.
+        u64 modification_tick{};
+        u64 gpu_write_tick{};
+    };
+    bool TryDownloadObservedImage(Image& image, AsyncBuffer& map, PendingDownload& download);
+
+    // Keeps, across a writeback of an image, the guest bytes of overlapping images that the
+    // GPU wrote after it: an older alias must not overwrite them.
+    class NewerOverlapGuard {
+    public:
+        NewerOverlapGuard(TextureCache& cache, ImageId id, const ImageBase& image, u64 write_tick);
+        ~NewerOverlapGuard();
+
+        /// Newer GPU writes cover the whole image: publishing it would change no byte
+        [[nodiscard]] bool Covered() const noexcept {
+            return covered;
+        }
+
+    private:
+        TextureCache& cache;
+        bool covered{};
+        boost::container::small_vector<std::pair<DAddr, std::vector<u8>>, 2> saved;
     };
 
     Common::SlotVector<Image> slot_images;
@@ -488,9 +631,24 @@ private:
 
     u64 modification_tick = 0;
     u64 frame_tick = 0;
+    std::vector<ImageViewId> gc_removed_views;
+    bool gc_descriptor_tables_dirty = false;
+    struct GCReadback {
+        ImageId id;
+        u64 modification_tick;
+        u64 last_use_tick;
+        u64 tick;
+        size_t address_space;
+        size_t storage_index;
+        AsyncBuffer map;
+    };
+    static constexpr size_t GC_READBACK_LIMIT = 64_MiB;
+    std::deque<GCReadback> gc_readbacks;
+    std::unordered_set<ImageId> gc_readback_ids;
+    size_t gc_readback_bytes{};
 
     Common::ThreadWorker texture_decode_worker{1, "TextureDecoder"};
-    std::vector<std::unique_ptr<AsyncDecodeContext>> async_decodes;
+    std::vector<std::shared_ptr<AsyncDecodeContext>> async_decodes;
 
     // Join caching
     boost::container::small_vector<ImageId, 4> join_overlap_ids;

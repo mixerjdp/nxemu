@@ -58,8 +58,10 @@ public:
     RasterizerDownloadArea GetFlushArea(DAddr addr, u64 size) override;
     void InvalidateGPUCache() override;
     void UnmapMemory(DAddr addr, u64 size) override;
-    void ModifyGPUMemory(size_t as_id, GPUVAddr addr, u64 size) override;
+    void ModifyGPUMemory(size_t as_id, GPUVAddr addr, u64 size, bool preserve_contents = false) override;
     void SignalFence(std::function<void()>&& func) override;
+    void SignalMemoryOperationFence(std::function<void()>&& func) override;
+    void WaitForFence() override;
     void SyncOperation(std::function<void()>&& func) override;
     void SignalSyncPoint(u32 value) override;
     void SignalReference() override;
@@ -78,7 +80,7 @@ public:
     void AccelerateInlineToMemory(GPUVAddr address, size_t copy_size,
                                   std::span<const u8> memory) override;
     void LoadDiskResources(u64 title_id, std::stop_token stop_loading,
-                           const VideoCore::DiskResourceLoadCallback& callback) override;
+                           const VideoCore::DiskResourceLoadCallback& callback, std::string_view content_identity = {}, std::string_view game_path = {}, std::string_view game_context = {}) override;
     void InitializeChannel(Tegra::Control::ChannelState& channel) override;
     void BindChannel(Tegra::Control::ChannelState& channel) override;
     void ReleaseChannel(s32 channel_id) override;

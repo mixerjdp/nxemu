@@ -25,10 +25,10 @@
 
 enum
 {
-    MODULE_LOADER_SPECS_VERSION = 0x012F,
-    MODULE_VIDEO_SPECS_VERSION = 0x0120,
-    MODULE_CPU_SPECS_VERSION = 0x0116,
-    MODULE_OPERATING_SYSTEM_SPECS_VERSION = 0x011F,
+    MODULE_LOADER_SPECS_VERSION = 0x013A,
+    MODULE_VIDEO_SPECS_VERSION = 0x012C,
+    MODULE_CPU_SPECS_VERSION = 0x0121,
+    MODULE_OPERATING_SYSTEM_SPECS_VERSION = 0x012B,
 };
 
 enum MODULE_TYPE : uint16_t
@@ -43,6 +43,22 @@ enum class NotificationResponse : uint32_t
 {
     No = 0,
     Yes = 1,
+};
+
+// Native files under the configured NAND/SD mounts retain their emulated
+// device identity. Files mounted directly as game content use a separate
+// virtual-content device rather than their host PC's drive identity.
+enum class StorageReadDomain : uint32_t
+{
+    Content,
+    Nand,
+    SdCard,
+    Count
+};
+
+struct StorageReadTraffic
+{
+    uint64_t bytes[static_cast<uint32_t>(StorageReadDomain::Count)]{};
 };
 
 nxinterface IModuleNotification
@@ -75,6 +91,12 @@ nxinterface IModuleSettings
 
     virtual void RegisterCallback(const char * setting, SettingChangeCallback callback, void * userData) = 0;
     virtual void UnregisterCallback(const char * setting, SettingChangeCallback callback, void * userData) = 0;
+
+    virtual void SetDebugSetting(const char * setting, bool debug) = 0;
+    virtual bool DebugSettingsEnabled(void) const = 0;
+
+    virtual const char * GetGameSectionSettings(const char * section) const = 0;
+    virtual void SetGameSectionSettings(const char * section, const char * json) = 0;
 };
 
 /// Specifies the severity or level of detail of the log message.
@@ -224,10 +246,23 @@ typedef struct
     char name[200];   // Name of the DLL
 } MODULE_INFO;
 
+enum class RenderWindowSystem : uint32_t
+{
+    Default = 0,
+    Windows,
+    Wayland,
+    Cocoa,
+    Android,
+};
+
 nxinterface IRenderWindow
 {
     virtual void * RenderSurface(void) const = 0;
+    virtual void * DisplayConnection(void) const = 0;
+    virtual RenderWindowSystem WindowSystem(void) const = 0;
     virtual float PixelRatio(void) const = 0;
+    // Native submission, not scanout. surface identifies the submitted native window.
+    virtual void OnFramePresented(void * surface, uint32_t frame_interval_ns) = 0;
 };
 
 nxinterface IOperatingSystem;
@@ -282,6 +317,9 @@ nxinterface IModuleInfo
     virtual uint64_t DataSegmentSize(void) const = 0;
     virtual uint64_t PatchSegmentAddr(void) const = 0;
     virtual uint64_t PatchSegmentSize(void) const = 0;
+    // Patch set caves after the data segment that the host runs with native code execution
+    virtual uint64_t CaveSegmentAddr(void) const = 0;
+    virtual uint64_t CaveSegmentSize(void) const = 0;
 };
 
 nxinterface IProcess

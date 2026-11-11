@@ -151,6 +151,17 @@ public:
 
     PTEKind GetPageKind(GPUVAddr gpu_addr) const;
 
+    /**
+     * Returns the sparse allocation an address belongs to, if any.
+     */
+    [[nodiscard]] std::optional<std::pair<GPUVAddr, std::size_t>> GetSparseRegion(
+        GPUVAddr gpu_addr) const;
+
+    /// Changes every time the address space is mapped or unmapped
+    [[nodiscard]] u64 MappingGeneration() const noexcept {
+        return mapping_generation.load(std::memory_order_relaxed);
+    }
+
     size_t GetMemoryLayoutSize(GPUVAddr gpu_addr,
                                size_t max_size = std::numeric_limits<size_t>::max()) const;
 
@@ -213,10 +224,16 @@ private:
         Free = 0,
         Reserved = 1,
         Mapped = 2,
+        // Big-table slot backed by small PTEs. Uses the spare value in the existing 2-bit tag.
+        SmallPages = 3,
     };
 
     std::vector<u64> entries;
     std::vector<u64> big_entries;
+    void PrepareSmallPageMapping(GPUVAddr gpu_addr, size_t size);
+
+    void NotifyMappingChanged(GPUVAddr gpu_addr, DAddr dev_addr, size_t size,
+                              EntryType entry_type, PTEKind kind, bool is_big_pages);
 
     template <EntryType entry_type>
     GPUVAddr PageTableOp(GPUVAddr gpu_addr, [[maybe_unused]] DAddr dev_addr, size_t size,
@@ -234,6 +251,12 @@ private:
 
     Common::MultiLevelPageTable<u32> page_table;
     Common::RangeMap<GPUVAddr, PTEKind> kind_map;
+    /// Start and end of the sparse allocations, protected by guard
+    std::map<GPUVAddr, GPUVAddr> sparse_regions;
+    // Publish catalog emptiness under guard so empty lookups can avoid the mutex.
+    std::atomic<bool> has_sparse_regions{};
+    std::atomic<u64> mapping_generation{};
+    std::atomic<u32> mapping_updates_in_progress{};
     Common::VirtualBuffer<u32> big_page_table_dev;
 
     std::vector<u64> big_page_continuous;
@@ -261,6 +284,9 @@ public:
 
     uint32_t AddMemoryManager(std::shared_ptr<Tegra::MemoryManager> & gmmu); 
     std::shared_ptr<Tegra::MemoryManager> GetMemoryManager(uint32_t id);
+
+    // Only after producers and the GPU worker have stopped.
+    void Clear() { m_memoryManagers.clear(); }
 
 private:
     MemoryManagerRegistry(const MemoryManagerRegistry&) = delete;

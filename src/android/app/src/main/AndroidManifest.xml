@@ -2,6 +2,7 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
 
     <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.VIBRATE" />
 
     <application
         android:name="org.nxemu.NxEmuApplication"
@@ -13,8 +14,10 @@
         android:theme="@style/Theme.NxEmu.Splash">
         <activity
             android:name="org.nxemu.ui.main.MainActivity"
+            android:alwaysRetainTaskState="true"
             android:configChanges="orientation|screenSize|screenLayout|keyboardHidden"
             android:exported="true"
+            android:launchMode="singleTop"
             android:theme="@style/Theme.NxEmu.Splash">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
@@ -24,7 +27,20 @@
             </intent-filter>
         </activity>
         <activity
+            android:name="org.nxemu.ui.main.SettingsActivity"
+            android:configChanges="orientation|screenSize|screenLayout|keyboardHidden"
+            android:exported="false"
+            android:screenOrientation="behind"
+            android:theme="@style/Theme.NxEmu.Settings" />
+        <activity
             android:name="org.nxemu.ui.emulation.EmulationActivity"
+            android:configChanges="orientation|screenSize|screenLayout|keyboardHidden|smallestScreenSize|density|touchscreen|colorMode|keyboard|navigation|uiMode"
+            android:exported="false"
+            android:launchMode="singleTop"
+            android:screenOrientation="sensorLandscape"
+            android:theme="@style/Theme.NxEmu" />
+        <activity
+            android:name="org.nxemu.ui.settings.OverlayLayoutActivity"
             android:configChanges="orientation|screenSize|screenLayout|keyboardHidden|smallestScreenSize|density"
             android:exported="false"
             android:screenOrientation="sensorLandscape"

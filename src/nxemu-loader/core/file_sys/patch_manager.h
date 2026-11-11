@@ -33,6 +33,7 @@ struct Patch {
     uint64_t program_id;
     uint64_t title_id;
     uint32_t numeric_version = 0;
+    bool replaces_romfs = false; // a mod that layers files over the game's RomFS
 };
 
 // A centralized class to manage patches to games.
@@ -59,6 +60,13 @@ public:
     // Checks to see if PatchNSO() will have any effect given the NSO's build ID.
     // Used to prevent expensive copies in NSO loader.
     [[nodiscard]] bool HasNSOPatch(const BuildID& build_id, std::string_view name) const;
+
+    // The patch set files (exefs/*.nxpatch, core/file_sys/patch_sets.h) of the enabled mods, in mod order.
+    // Each names the build id it is for; PatchSets keeps those of the module it patches.
+    [[nodiscard]] std::vector<VirtualFile> CollectPatchSetFiles() const;
+
+    // Hash of the ExeFS patches and cheats of the enabled mods, empty without any (core/file_sys/code_mods.h).
+    [[nodiscard]] std::string HashEnabledCodeMods() const;
 
     // Currently tracked RomFS patches:
     // - Game Updates
@@ -91,5 +99,15 @@ private:
     const FileSystemController& fs_controller;
     const ContentProvider& content_provider;
 };
+
+[[nodiscard]] PatchManager::Metadata ParseControlRomFS(VirtualFile romfs);
+
+// The names of the title's add-ons that are off: those the user turned off, and the bundled mods that are off by
+// default (mod.json "enabled_by_default": false) the user has not turned on
+[[nodiscard]] std::vector<std::string> GetDisabledAddOns(uint64_t title_id, const FileSystemController& fs_controller);
+// Whether one add-on is off, as GetDisabledAddOns gives it
+[[nodiscard]] bool IsAddOnDisabled(uint64_t title_id, const FileSystemController& fs_controller, const std::string& name);
+// Stores the add-ons that are off, as GetDisabledAddOns gives them
+void SetDisabledAddOns(uint64_t title_id, const FileSystemController& fs_controller, std::vector<std::string> names);
 
 } // namespace FileSys

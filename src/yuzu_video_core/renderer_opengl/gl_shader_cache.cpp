@@ -51,7 +51,8 @@ using VideoCommon::LoadPipelines;
 using VideoCommon::SerializePipeline;
 using Context = ShaderContext::Context;
 
-constexpr u32 CACHE_VERSION = 10;
+// Loop-invariant pointer tracking changes the storage descriptor list.
+constexpr u32 CACHE_VERSION = 14;
 
 template <typename Container>
 auto MakeSpan(Container& container) {
@@ -62,6 +63,7 @@ Shader::OutputTopology MaxwellToOutputTopology(Maxwell::PrimitiveTopology topolo
     switch (topology) {
     case Maxwell::PrimitiveTopology::Points:
         return Shader::OutputTopology::PointList;
+    case Maxwell::PrimitiveTopology::Lines:
     case Maxwell::PrimitiveTopology::LineStrip:
         return Shader::OutputTopology::LineStrip;
     default:
@@ -290,7 +292,7 @@ void ShaderCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading,
             workers->QueueWork(std::move(work));
         }
     }};
-    const auto load_compute{[&](std::ifstream& file, FileEnvironment env) {
+    const auto load_compute{[&](std::istream& file, FileEnvironment env) {
         ComputePipelineKey key;
         file.read(reinterpret_cast<char*>(&key), sizeof(key));
         queue_work([this, key, env_ = std::move(env), &state, &callback](Context* ctx) mutable {
@@ -306,8 +308,9 @@ void ShaderCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading,
             }
         });
         ++state.total;
+        return true;
     }};
-    const auto load_graphics{[&](std::ifstream& file, std::vector<FileEnvironment> envs) {
+    const auto load_graphics{[&](std::istream& file, std::vector<FileEnvironment> envs) {
         GraphicsPipelineKey key;
         file.read(reinterpret_cast<char*>(&key), sizeof(key));
         queue_work([this, key, envs_ = std::move(envs), &state, &callback](Context* ctx) mutable {
@@ -327,6 +330,7 @@ void ShaderCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading,
             }
         });
         ++state.total;
+        return true;
     }};
     LoadPipelines(stop_loading, shader_cache_filename, CACHE_VERSION, load_compute, load_graphics);
 

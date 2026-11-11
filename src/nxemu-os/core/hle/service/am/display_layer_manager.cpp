@@ -19,12 +19,20 @@ DisplayLayerManager::~DisplayLayerManager() {
     this->Finalize();
 }
 
-void DisplayLayerManager::Initialize(Core::System& system, Kernel::KProcess* process,
-                                     AppletId applet_id, LibraryAppletMode mode) {
+DisplayLayerManager::DisplayServices DisplayLayerManager::OpenDisplayServices(
+    Core::System& system) {
+    DisplayServices services;
     R_ASSERT(system.ServiceManager()
                  .GetService<VI::IManagerRootService>("vi:m", true)
-                 ->GetDisplayService(&m_display_service, VI::Policy::Compositor));
-    R_ASSERT(m_display_service->GetManagerDisplayService(&m_manager_display_service));
+                 ->GetDisplayService(&services.display, VI::Policy::Compositor));
+    R_ASSERT(services.display->GetManagerDisplayService(&services.manager));
+    return services;
+}
+
+void DisplayLayerManager::Initialize(DisplayServices services, Kernel::KProcess* process,
+                                     AppletId applet_id, LibraryAppletMode mode) {
+    m_display_service = std::move(services.display);
+    m_manager_display_service = std::move(services.manager);
 
     m_process = process;
     m_system_shared_buffer_id = 0;
@@ -142,10 +150,17 @@ bool DisplayLayerManager::GetWindowVisibility() const {
 }
 
 Result DisplayLayerManager::WriteAppletCaptureBuffer(bool* out_was_written,
-                                                     s32* out_fbshare_layer_index) {
+                                                     s32* out_fbshare_layer_index,
+                                                     VI::CaptureKind kind) {
     R_UNLESS(m_buffer_sharing_enabled, VI::ResultPermissionDenied);
     R_RETURN(m_display_service->GetContainer()->GetSharedBufferManager()->WriteAppletCaptureBuffer(
-        out_was_written, out_fbshare_layer_index));
+        out_was_written, out_fbshare_layer_index, kind));
+}
+
+Result DisplayLayerManager::ClearAppletCaptureBuffer(s32 fbshare_layer_index, u32 color) {
+    R_UNLESS(m_buffer_sharing_enabled, VI::ResultPermissionDenied);
+    R_RETURN(m_display_service->GetContainer()->GetSharedBufferManager()->ClearAppletCaptureBuffer(
+        fbshare_layer_index, color));
 }
 
 } // namespace Service::AM

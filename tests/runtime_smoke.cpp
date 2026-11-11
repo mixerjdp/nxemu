@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Exercises the actual DLLs, not copies of the loader's object files.
 #include <windows.h>
+#include <atomic>
 #include <chrono>
 #include <filesystem>
 #include <cstdlib>
@@ -22,12 +23,15 @@ struct Notifications final : INotification {
     void BreakPoint(const char* file, uint32_t line) override {
         std::cerr << "BREAKPOINT: " << file << ':' << line << std::endl;
     }
-    void AppInitDone() override {}
 };
 struct Window final : IRenderWindow {
     HWND handle{};
+    std::atomic<unsigned> frames{};
     void* RenderSurface() const override { return handle; }
+    void* DisplayConnection() const override { return nullptr; }
+    RenderWindowSystem WindowSystem() const override { return RenderWindowSystem::Windows; }
     float PixelRatio() const override { return 1.0f; }
+    void OnFramePresented(void*, uint32_t) override { ++frames; }
 };
 int main(int argc, char** argv) {
     if (argc != 4) { std::cerr << "Usage: runtime_smoke <repo> <isolated-user-dir> <rom>\n"; return 2; }
@@ -41,7 +45,8 @@ int main(int argc, char** argv) {
     const auto repo = std::filesystem::path(argv[1]);
     std::filesystem::create_directories(argv[2]);
     Notifications notify;
-    if (!AppInit(&notify, (repo / "bin/x64/Release").string().c_str(), argv[2])) return 3;
+    SetNotification(&notify);
+    if (!AppInit((repo / "bin/x64/Release").string().c_str(), argv[2])) return 3;
     auto& settings = SettingsStore::GetInstance();
     settings.SetString(NXCoreSetting::ModuleDirectory, (repo / "modules/x64").string().c_str());
     const auto instance = GetModuleHandle(nullptr);
@@ -59,7 +64,7 @@ int main(int argc, char** argv) {
             settings.SetBool("nxloader:CheckForUpdatedFirmware", false);
             if (const char* filter = std::getenv("NXEMU_LOG_FILTER"))
                 settings.SetString(NXCoreSetting::LogFilter, filter);
-            const bool loaded = modules.Modules().Systemloader().LoadRom(argv[3], 0, -1, ApplicationLaunchType::FrontendInitiated);
+            const bool loaded = modules.Modules().Systemloader().LoadRom(argv[3], 0, 0, -1, ApplicationLaunchType::FrontendInitiated);
             std::cout << "LoadRom=" << loaded << std::endl;
             if (loaded) {
                 const auto until = std::chrono::steady_clock::now() + std::chrono::seconds(20);
@@ -68,9 +73,10 @@ int main(int argc, char** argv) {
                     while (PeekMessageW(&message, nullptr, 0, 0, PM_REMOVE)) { TranslateMessage(&message); DispatchMessageW(&message); }
                     Sleep(10);
                 }
-                std::cout << "EmulationRunning=" << settings.GetBool(NXCoreSetting::EmulationRunning)
-                          << " DisplayedFrames=" << settings.GetBool(NXCoreSetting::DisplayedFrames) << std::endl;
-                result = 0;
+                const bool running = settings.GetBool(NXCoreSetting::EmulationRunning);
+                const unsigned frames = window.frames.load();
+                std::cout << "EmulationRunning=" << running << " PresentedFrames=" << frames << std::endl;
+                result = running && frames > 0 ? 0 : 7;
             } else result = 5;
             // The verdict is already printed; emulation threads can deadlock while modules
             // shut down, so skip teardown and terminate without DLL detach.

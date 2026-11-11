@@ -3,10 +3,12 @@
 
 #pragma once
 
+#include <string_view>
 #include <functional>
 #include <optional>
 #include <span>
 #include <utility>
+#include <vector>
 #include "yuzu_common/common_types.h"
 #include "yuzu_common/polyfill_thread.h"
 #include "yuzu_video_core/cache_types.h"
@@ -30,8 +32,18 @@ enum class LoadCallbackStage {
     Prepare,
     Build,
     Complete,
+    ReadProfile,
+    ImportProfile,
+    BuildProfile,
 };
 using DiskResourceLoadCallback = std::function<void(LoadCallbackStage, std::size_t, std::size_t)>;
+
+/// How guest memory sharing a host page with a CPU access can be exposed.
+enum class SharedPageAccess {
+    Current,  ///< Guest memory is current.
+    Flush,    ///< Guest memory must be downloaded first.
+    Deferred, ///< An asynchronous copy will publish it, and keeps it inaccessible until then.
+};
 
 class RasterizerInterface {
 public:
@@ -41,7 +53,10 @@ public:
     virtual void Draw(bool is_indexed, u32 instance_count) = 0;
 
     /// Dispatches an indirect draw invocation
-    virtual void DrawIndirect() {}
+    /// Returns false when the host needs the parameters of the draw on the CPU, nothing is drawn
+    virtual bool DrawIndirect() {
+        return true;
+    }
 
     /// Dispatches an draw texture invocation
     virtual void DrawTexture() = 0;
@@ -68,6 +83,12 @@ public:
     /// Signal a GPU based semaphore as a fence
     virtual void SignalFence(std::function<void()>&& func) = 0;
 
+    /// Arm an explicit memory-operation synchronization fence without blocking the DMA pusher.
+    virtual void SignalMemoryOperationFence(std::function<void()>&& func) = 0;
+
+    /// Signal a fence and wait for its deferred synchronization operations to complete.
+    virtual void WaitForFence() = 0;
+
     /// Send an operation to be done after a certain amount of flushes.
     virtual void SyncOperation(std::function<void()>&& func) = 0;
 
@@ -86,6 +107,34 @@ public:
     /// Notify rasterizer that any caches of the specified region should be flushed to Switch memory
     virtual void FlushRegion(DAddr addr, u64 size,
                              VideoCommon::CacheType which = VideoCommon::CacheType::All) = 0;
+
+    /// Synchronize native reads while retaining GPU cache ownership.
+    virtual void FlushNativeRegion(DAddr addr, u64 size) { FlushRegion(addr, size); }
+
+    /// Lock-free: false proves that guest memory sharing a host page with a CPU access is not
+    /// behind data the guest reads.
+    virtual bool MayFlushSharedPage(DAddr addr, u64 size) { return true; }
+
+    /// Check if guest memory sharing a host page with a CPU access is behind data the guest
+    /// reads, and let later asynchronous publications keep it current.
+    virtual SharedPageAccess ObserveSharedPage(DAddr addr, u64 size) {
+        return SharedPageAccess::Flush;
+    }
+    /// Lock-free: true when guest memory sharing a host page with a CPU access may wait for an
+    /// asynchronous copy that keeps it inaccessible until it is published.
+    virtual bool AwaitsProtectedDownload(DAddr addr, u64 size) { return false; }
+
+    /// Commit the pending readbacks. Return true when the CPU cannot see any readback in
+    /// flight before its publication, so a GPU signal may be published ahead of the GPU.
+    virtual bool CommitReadbacksForEarlySignal() { return true; }
+
+    /// True when a query result in the region is not written to guest memory yet.
+    virtual bool HasPendingResult(DAddr addr, u64 size) { return false; }
+
+    /// Append the ranges of a region holding pending query results that the GPU already
+    /// copied into its buffers: guest memory there still holds an older value.
+    virtual void GpuWrittenResults(DAddr addr, u64 size,
+                                   std::vector<std::pair<DAddr, u64>>& ranges) {}
 
     /// Check if the the specified memory area requires flushing to CPU Memory.
     virtual bool MustFlushRegion(DAddr addr, u64 size,
@@ -114,8 +163,10 @@ public:
     /// Unmap memory range
     virtual void UnmapMemory(DAddr addr, u64 size) = 0;
 
-    /// Remap GPU memory range. This means underneath backing memory changed
-    virtual void ModifyGPUMemory(size_t as_id, GPUVAddr addr, u64 size) = 0;
+    /// Invalidate textures before changing GPU backing memory or its layout.
+    /// Preserve their contents when the physical backing keeps its data.
+    virtual void ModifyGPUMemory(size_t as_id, GPUVAddr addr, u64 size,
+                                 bool preserve_contents = false) = 0;
 
     /// Notify rasterizer that any caches of the specified region should be flushed to Switch memory
     /// and invalidated
@@ -153,7 +204,7 @@ public:
     virtual void AccelerateInlineToMemory(GPUVAddr address, size_t copy_size, std::span<const u8> memory) = 0;
 
     /// Initialize disk cached resources for the game being emulated
-    virtual void LoadDiskResources(u64 title_id, std::stop_token stop_loading,  const DiskResourceLoadCallback& callback) {}
+    virtual void LoadDiskResources(u64 title_id, std::stop_token stop_loading,  const DiskResourceLoadCallback& callback, std::string_view content_identity = {}, std::string_view game_path = {}, std::string_view game_context = {}) {}
 
     virtual void InitializeChannel(Tegra::Control::ChannelState& channel) {}
 

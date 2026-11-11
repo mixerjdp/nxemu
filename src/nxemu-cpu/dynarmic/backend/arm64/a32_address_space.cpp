@@ -176,7 +176,9 @@ IR::Block A32AddressSpace::GenerateIR(IR::LocationDescriptor descriptor) const {
         Optimization::DeadCodeElimination(ir_block);
     }
     Optimization::IdentityRemovalPass(ir_block);
-    Optimization::VerificationPass(ir_block);
+    if (!conf.HasOptimization(OptimizationFlag::DisableVerification)) {
+        Optimization::VerificationPass(ir_block);
+    }
 
     return ir_block;
 }
@@ -318,12 +320,13 @@ void A32AddressSpace::EmitPrelude() {
 
         code.LDR(X0, l_this);
         code.MOV(X1, Xstate);
+        code.MOV(X2, SP);
         code.LDR(Xscratch0, l_addr);
         code.BLR(Xscratch0);
         code.BR(X0);
 
-        const auto fn = [](A32AddressSpace& self, A32JitState& context) -> CodePtr {
-            return self.GetOrEmit(context.GetLocationDescriptor());
+        const auto fn = [](A32AddressSpace& self, A32JitState& context, StackLayout& stack_layout) -> CodePtr {
+            return self.GetOrEmitWhileRunning(context.GetLocationDescriptor(), stack_layout);
         };
 
         code.align(8);

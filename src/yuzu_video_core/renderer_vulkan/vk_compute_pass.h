@@ -3,9 +3,12 @@
 
 #pragma once
 
+#include <array>
 #include <optional>
 #include <span>
 #include <utility>
+
+#include <boost/container/small_vector.hpp>
 
 #include "yuzu_common/common_types.h"
 #include "yuzu_video_core/engines/maxwell_3d.h"
@@ -47,6 +50,56 @@ protected:
 
 private:
     vk::ShaderModule module;
+};
+
+class ReadbackDeltaPass final : public ComputePass {
+public:
+    ReadbackDeltaPass(const Device& device, Scheduler& scheduler, DescriptorPool& pool,
+                     ComputePassDescriptorQueue& queue);
+    void Copy(VkBuffer source, VkBuffer reference, VkBuffer destination, VkBuffer flags,
+              u64 source_offset, u64 destination_offset, u64 size, u64 flag_offset,
+              u64 flags_size, const std::array<u32, 4>& valid_mask);
+private:
+    Scheduler& scheduler;
+    ComputePassDescriptorQueue& queue;
+};
+
+// Copies the pages of a buffer range that compute shaders marked in the write tracking bitmap
+class TrackedReadbackPass final : public ComputePass {
+public:
+    TrackedReadbackPass(const Device& device, Scheduler& scheduler, DescriptorPool& pool,
+                        ComputePassDescriptorQueue& queue);
+    void Copy(VkBuffer source, VkBuffer destination, VkBuffer flags, VkBuffer bitmap,
+              u64 source_offset, u64 destination_offset, u64 size, u64 flag_offset,
+              u64 flags_size, u64 bitmap_size, u64 device_addr);
+private:
+    Scheduler& scheduler;
+    ComputePassDescriptorQueue& queue;
+};
+
+// Prepares indexed indirect counts on the upload command buffer. The caller
+// must exclude inputs written by the current main command buffer.
+class IndirectCountPass final : public ComputePass {
+public:
+    IndirectCountPass(const Device& device, Scheduler& scheduler, DescriptorPool& pool);
+    void Convert(VkBuffer source, u64 source_offset, VkBuffer count, u64 count_offset,
+                 VkBuffer destination, u64 destination_offset, u32 max_draws, u32 stride);
+
+private:
+    Scheduler& scheduler;
+};
+
+/// Prepares an indirect draw whose vertex and geometry stages run as compute
+class VtgIndirectPass final : public ComputePass {
+public:
+    VtgIndirectPass(const Device& device, DescriptorPool& pool);
+
+    /// Records the preparation. The buffers are the draw arguments, the draw information read by
+    /// the stages, the dispatch and draw commands, and the capacity feedback. The parameters are
+    /// the first argument word, the topology, the capacity in vertices, the indices per
+    /// primitive and the mask the guest macro applies to the instance count.
+    void Record(vk::CommandBuffer cmdbuf, const std::array<VkDescriptorBufferInfo, 4>& buffers,
+                const std::array<u32, 5>& parameters);
 };
 
 class Uint8Pass final : public ComputePass {
@@ -129,6 +182,24 @@ private:
     StagingBufferPool& staging_buffer_pool;
     ComputePassDescriptorQueue& compute_pass_descriptor_queue;
     MemoryAllocator& memory_allocator;
+};
+
+class BlockLinearUnswizzle2DBufferPass final : public ComputePass {
+public:
+    BlockLinearUnswizzle2DBufferPass(const Device& device, Scheduler& scheduler,
+                                    DescriptorPool& pool, StagingBufferPool& staging,
+                                    ComputePassDescriptorQueue& queue);
+    ~BlockLinearUnswizzle2DBufferPass();
+
+    static bool IsSupported(const Image& image);
+
+    std::pair<VkBuffer, boost::container::small_vector<VkBufferImageCopy, 16>> Unswizzle(
+        Image& image, VkBuffer source, VkDeviceSize source_offset);
+
+private:
+    Scheduler& scheduler;
+    StagingBufferPool& staging_buffer_pool;
+    ComputePassDescriptorQueue& descriptor_queue;
 };
 
 class MSAACopyPass final : public ComputePass {

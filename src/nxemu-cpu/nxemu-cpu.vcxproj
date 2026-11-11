@@ -51,6 +51,7 @@
     <ClInclude Include="dynarmic\backend\arm64\address_space.h" />
     <ClInclude Include="dynarmic\backend\arm64\devirtualize.h" />
     <ClInclude Include="dynarmic\backend\arm64\emit_arm64.h" />
+    <ClInclude Include="dynarmic\backend\arm64\emit_arm64_far_branch.h" />
     <ClInclude Include="dynarmic\backend\arm64\emit_arm64_memory.h" />
     <ClInclude Include="dynarmic\backend\arm64\emit_context.h" />
     <ClInclude Include="dynarmic\backend\arm64\fastmem.h" />
@@ -393,6 +394,16 @@
     <ProjectReference Include="..\yuzu_common\yuzu_common.vcxproj">
       <Project>{250224f2-2e89-410e-8bdb-875959daba2c}</Project>
     </ProjectReference>
+  </ItemGroup>
+  <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
+    <Link>
+      <LinkTimeCodeGeneration>UseLinkTimeCodeGeneration</LinkTimeCodeGeneration>
+    </Link>
+  </ItemDefinitionGroup>
+  <ItemGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
+    <ClCompile Update="dynarmic\backend\x64\*.cpp;dynarmic\frontend\A64\**\*.cpp;dynarmic\ir\**\*.cpp;dynarmic\common\**\*.cpp;dynarmic\frontend\imm.cpp;dynarmic\backend\block_range_information.cpp">
+      <WholeProgramOptimization>true</WholeProgramOptimization>
+    </ClCompile>
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets">

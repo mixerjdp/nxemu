@@ -3,7 +3,9 @@
 #include <android/native_window_jni.h>
 #include <jni.h>
 #include <array>
+#include <cstdint>
 #include <string>
+#include <vector>
 
 #include <common/json.h>
 #include <nxemu-core/app_init.h>
@@ -16,6 +18,7 @@
 #include "emulation_session.h"
 #include "notification.h"
 #include "settings/settings_bridge.h"
+#include "settings/ui_settings.h"
 
 namespace
 {
@@ -35,6 +38,53 @@ namespace
         }
         return result;
     }
+
+    class FirmwareInstallListener final : public IFirmwareInstallObserver
+    {
+    public:
+        FirmwareInstallListener(JNIEnv * env, jobject listener) :
+            m_env(env),
+            m_listener(listener)
+        {
+            jclass clazz = env->GetObjectClass(listener);
+            m_onProgress = env->GetMethodID(clazz, "onProgress", "(IJJ)Z");
+            m_confirmReplace = env->GetMethodID(clazz, "confirmReplace", "(Ljava/lang/String;Ljava/lang/String;)Z");
+            env->DeleteLocalRef(clazz);
+        }
+
+        bool FirmwareInstallProgress(FirmwareInstallStage stage, uint64_t done, uint64_t total) override
+        {
+            const jboolean result = m_env->CallBooleanMethod(m_listener, m_onProgress, static_cast<jint>(stage), static_cast<jlong>(done), static_cast<jlong>(total));
+            return !ClearException() && result == JNI_TRUE;
+        }
+
+        bool ConfirmFirmwareReplacement(const char * packageVersion, const char * installedVersion) override
+        {
+            jstring package = m_env->NewStringUTF(packageVersion);
+            jstring installed = m_env->NewStringUTF(installedVersion);
+            const jboolean result = m_env->CallBooleanMethod(m_listener, m_confirmReplace, package, installed);
+            m_env->DeleteLocalRef(package);
+            m_env->DeleteLocalRef(installed);
+            return !ClearException() && result == JNI_TRUE;
+        }
+
+    private:
+        bool ClearException()
+        {
+            if (!m_env->ExceptionCheck())
+            {
+                return false;
+            }
+            m_env->ExceptionDescribe();
+            m_env->ExceptionClear();
+            return true;
+        }
+
+        JNIEnv * const m_env;
+        const jobject m_listener;
+        jmethodID m_onProgress = nullptr;
+        jmethodID m_confirmReplace = nullptr;
+    };
 
     std::string FailJson(const std::string & path, const char * err)
     {
@@ -75,11 +125,13 @@ Java_org_nxemu_NativeLibrary_appInit(JNIEnv * env, jclass /*clazz*/, jstring app
     __android_log_print(ANDROID_LOG_INFO, kLogTag, "baseDir: %s", baseDir.c_str());
     __android_log_print(ANDROID_LOG_INFO, kLogTag, "moduleDir: %s", moduleDir.c_str());
 
-    if (!AppInit(&AndroidNotification::GetInstance(), moduleDir.c_str(), baseDir.c_str()))
+    SetNotification(&AndroidNotification::GetInstance());
+    if (!AppInit(moduleDir.c_str(), baseDir.c_str()))
     {
         __android_log_print(ANDROID_LOG_ERROR, kLogTag, "AppInit failed (app=%s module=%s)", baseDir.c_str(), moduleDir.c_str());
         return;
     }
+    SetupUISetting();
 
     SettingsStore & store = SettingsStore::GetInstance();
     store.SetString(NXCoreSetting::ModuleDirectory, moduleDir.c_str());
@@ -117,10 +169,10 @@ Java_org_nxemu_NativeLibrary_queryRomMetadata(JNIEnv * env, jclass /*clazz*/, js
 }
 
 extern "C" JNIEXPORT jstring JNICALL
-Java_org_nxemu_NativeLibrary_queryRomInfo(JNIEnv * env, jclass /*clazz*/, jstring j_path)
+Java_org_nxemu_NativeLibrary_queryRomInfo(JNIEnv * env, jclass /*clazz*/, jstring j_path, jlong program_id)
 {
     const std::string path = JStringToUtf8(env, j_path);
-    const std::string json = EmulationSession::GetInstance().QueryRomInfo(path);
+    const std::string json = EmulationSession::GetInstance().QueryRomInfo(path, static_cast<uint64_t>(program_id));
     if (json.empty())
     {
         return env->NewStringUTF("{}");
@@ -130,7 +182,7 @@ Java_org_nxemu_NativeLibrary_queryRomInfo(JNIEnv * env, jclass /*clazz*/, jstrin
 
 extern "C" JNIEXPORT jboolean JNICALL
 Java_org_nxemu_NativeLibrary_emulationSurfaceReady(JNIEnv * env, jclass /*clazz*/, jobject jsurface,
-                                                   jfloat pixel_ratio, jstring jpath)
+                                                   jfloat pixel_ratio, jstring jpath, jlong program_id)
 {
     if (jsurface == nullptr || jpath == nullptr)
     {
@@ -153,13 +205,25 @@ Java_org_nxemu_NativeLibrary_emulationSurfaceReady(JNIEnv * env, jclass /*clazz*
         return JNI_FALSE;
     }
 
-    return EmulationSession::GetInstance().Run(nw, pixel_ratio, rom_path) ? JNI_TRUE : JNI_FALSE;
+    return EmulationSession::GetInstance().Run(nw, pixel_ratio, rom_path, static_cast<uint64_t>(program_id)) ? JNI_TRUE : JNI_FALSE;
+}
+
+extern "C" JNIEXPORT jint JNICALL
+Java_org_nxemu_NativeLibrary_processProgramEvents(JNIEnv * /*env*/, jclass /*clazz*/)
+{
+    return static_cast<jint>(EmulationSession::GetInstance().ProcessProgramEvents());
 }
 
 extern "C" JNIEXPORT void JNICALL
 Java_org_nxemu_NativeLibrary_emulationSurfaceDestroyed(JNIEnv * /*env*/, jclass /*clazz*/)
 {
     EmulationSession::GetInstance().SurfaceDestroyed();
+}
+
+extern "C" JNIEXPORT void JNICALL
+Java_org_nxemu_NativeLibrary_emulationStopped(JNIEnv * /*env*/, jclass /*clazz*/)
+{
+    EmulationSession::GetInstance().Stop();
 }
 
 extern "C" JNIEXPORT void JNICALL
@@ -176,13 +240,7 @@ Java_org_nxemu_NativeLibrary_surfaceChanged(JNIEnv * env, jclass /*clazz*/, jobj
         return;
     }
     EmulationSession & session = EmulationSession::GetInstance();
-    if (session.NativeWindow() == nw)
-    {
-        ANativeWindow_release(nw);
-        session.SurfaceChanged();
-        return;
-    }
-    ANativeWindow_release(nw);
+    session.SetNativeWindow(nw);
     session.SurfaceChanged();
 }
 
@@ -209,46 +267,81 @@ Java_org_nxemu_NativeLibrary_getFirmwareVersion(JNIEnv * env, jclass /*clazz*/)
 }
 
 extern "C" JNIEXPORT jstring JNICALL
+Java_org_nxemu_NativeLibrary_getGameCardFirmwareUpdate(JNIEnv * env, jclass /*clazz*/, jstring j_path)
+{
+    const std::string version = EmulationSession::GetInstance().GetGameCardFirmwareUpdate(JStringToUtf8(env, j_path));
+    return env->NewStringUTF(version.c_str());
+}
+
+extern "C" JNIEXPORT jint JNICALL
+Java_org_nxemu_NativeLibrary_installFirmware(JNIEnv * env, jclass /*clazz*/, jstring j_path, jobject j_listener)
+{
+    const std::string path = JStringToUtf8(env, j_path);
+    if (path.empty() || j_listener == nullptr)
+    {
+        return static_cast<jint>(FirmwareInstallStatus::SourceUnreadable);
+    }
+    FirmwareInstallListener listener(env, j_listener);
+    return static_cast<jint>(EmulationSession::GetInstance().InstallFirmware(path, listener));
+}
+
+extern "C" JNIEXPORT jstring JNICALL
 Java_org_nxemu_NativeLibrary_getAppVersion(JNIEnv * env, jclass /*clazz*/)
 {
     return env->NewStringUTF(VER_FILE_VERSION_STR);
 }
 
 extern "C" JNIEXPORT void JNICALL
-Java_org_nxemu_features_input_NativeInput_onTouchPressed(JNIEnv * /*env*/, jobject /*obj*/,
-                                                           jint /*fingerId*/, jfloat /*x*/, jfloat /*y*/)
+Java_org_nxemu_NativeLibrary_pauseEmulation(JNIEnv * /*env*/, jclass /*clazz*/)
 {
+    EmulationSession::GetInstance().SetPaused(true);
 }
 
 extern "C" JNIEXPORT void JNICALL
-Java_org_nxemu_features_input_NativeInput_onTouchMoved(JNIEnv * /*env*/, jobject /*obj*/,
-                                                         jint /*fingerId*/, jfloat /*x*/, jfloat /*y*/)
+Java_org_nxemu_NativeLibrary_unpauseEmulation(JNIEnv * /*env*/, jclass /*clazz*/)
 {
+    EmulationSession::GetInstance().SetPaused(false);
 }
 
-extern "C" JNIEXPORT void JNICALL
-Java_org_nxemu_features_input_NativeInput_onTouchReleased(JNIEnv * /*env*/, jobject /*obj*/,
-                                                           jint /*fingerId*/)
+extern "C" JNIEXPORT jboolean JNICALL
+Java_org_nxemu_NativeLibrary_isPaused(JNIEnv * /*env*/, jclass /*clazz*/)
 {
+    return EmulationSession::GetInstance().IsPaused() ? JNI_TRUE : JNI_FALSE;
 }
 
-extern "C" JNIEXPORT void JNICALL
-Java_org_nxemu_features_input_NativeInput_onOverlayButtonEventImpl(JNIEnv * /*env*/, jobject /*obj*/,
-                                                                   jint port, jint buttonId, jint action)
+extern "C" JNIEXPORT jbyteArray JNICALL
+Java_org_nxemu_NativeLibrary_getAppletCaptureBuffer(JNIEnv * env, jclass /*clazz*/)
 {
-    EmulationSession::GetInstance().SetOverlayButton(port, buttonId, action == 1);
-}
-
-extern "C" JNIEXPORT void JNICALL
-Java_org_nxemu_features_input_NativeInput_onOverlayJoystickEventImpl(JNIEnv * /*env*/, jobject /*obj*/,
-                                                                   jint port, jint stickId, jfloat x, jfloat y)
-{
-    EmulationSession::GetInstance().SetOverlayJoystick(port, stickId, x, y);
+    std::vector<uint8_t> bytes;
+    uint32_t width = 0;
+    uint32_t height = 0;
+    if (!EmulationSession::GetInstance().ReadAppletCapture(bytes, width, height) || bytes.empty())
+    {
+        return env->NewByteArray(0);
+    }
+    jbyteArray buffer = env->NewByteArray(static_cast<jsize>(bytes.size()));
+    if (buffer == nullptr)
+    {
+        return env->NewByteArray(0);
+    }
+    env->SetByteArrayRegion(buffer, 0, static_cast<jsize>(bytes.size()), reinterpret_cast<const jbyte *>(bytes.data()));
+    return buffer;
 }
 
 extern "C" JNIEXPORT jint JNICALL
-Java_org_nxemu_features_input_NativeInput_getStyleIndexImpl(JNIEnv * /*env*/, jobject /*obj*/,
-                                                            jint playerIndex)
+Java_org_nxemu_NativeLibrary_getAppletCaptureWidth(JNIEnv * /*env*/, jclass /*clazz*/)
 {
-    return EmulationSession::GetInstance().GetStyleIndex(playerIndex);
+    uint32_t width = 0;
+    uint32_t height = 0;
+    EmulationSession::GetInstance().AppletCaptureSize(width, height);
+    return static_cast<jint>(width);
+}
+
+extern "C" JNIEXPORT jint JNICALL
+Java_org_nxemu_NativeLibrary_getAppletCaptureHeight(JNIEnv * /*env*/, jclass /*clazz*/)
+{
+    uint32_t width = 0;
+    uint32_t height = 0;
+    EmulationSession::GetInstance().AppletCaptureSize(width, height);
+    return static_cast<jint>(height);
 }

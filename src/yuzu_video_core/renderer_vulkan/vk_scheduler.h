@@ -3,13 +3,17 @@
 
 #pragma once
 
+#include <algorithm>
+#include <chrono>
 #include <condition_variable>
 #include <cstddef>
 #include <functional>
 #include <memory>
+#include <optional>
 #include <thread>
 #include <utility>
 #include <queue>
+#include <vector>
 
 #include "yuzu_common/alignment.h"
 #include "yuzu_common/common_types.h"
@@ -40,7 +44,8 @@ public:
     ~Scheduler();
 
     /// Sends the current execution context to the GPU.
-    u64 Flush(VkSemaphore signal_semaphore = nullptr, VkSemaphore wait_semaphore = nullptr);
+    u64 Flush(VkSemaphore signal_semaphore = nullptr, VkSemaphore wait_semaphore = nullptr,
+              std::optional<std::chrono::nanoseconds> frame_budget = std::nullopt);
 
     /// Sends the current execution context to the GPU and waits for it to complete.
     void Finish(VkSemaphore signal_semaphore = nullptr, VkSemaphore wait_semaphore = nullptr);
@@ -53,11 +58,21 @@ public:
     void DispatchWork();
 
     /// Requests to begin a renderpass.
-    void RequestRenderpass(const Framebuffer* framebuffer);
+    void RequestRenderpass(const Framebuffer* framebuffer, u32 color_scratch_mask = 0);
 
     /// Requests the current execution context to be able to execute operations only allowed outside
     /// of a renderpass.
     void RequestOutsideRenderPassOperationContext();
+
+    [[nodiscard]] bool IsInsideRenderPass() const noexcept {
+        return state.renderpass != VK_NULL_HANDLE;
+    }
+
+    /// Pixels the current render pass stores and loads again if it is split.
+    [[nodiscard]] u64 RenderPassSplitCost() const noexcept {
+        return u64{state.render_area.width} * state.render_area.height *
+               std::max<u32>(num_renderpass_images, 1);
+    }
 
     /// Update the pipeline to the current execution context.
     bool UpdateGraphicsPipeline(GraphicsPipeline* pipeline);
@@ -67,6 +82,13 @@ public:
 
     /// Invalidates current command buffer state except for render passes
     void InvalidateState();
+
+    /// Notes that commands recorded on the current execution context write to a buffer.
+    void MarkBufferWrite(VkBuffer buffer);
+
+    /// Returns true when the current execution context writes to a buffer. Commands recorded on
+    /// the upload buffer run before these writes and would read the previous contents.
+    [[nodiscard]] bool IsBufferWritten(VkBuffer buffer) const noexcept;
 
     /// Assigns the query cache.
     void SetQueryCache(VideoCommon::QueryCacheBase<QueryCacheParams>& query_cache_) {
@@ -98,6 +120,12 @@ public:
             });
     }
 
+    /// Returns a value that changes each time a render pass ends and makes its attachment
+    /// writes visible to later reads.
+    [[nodiscard]] u64 RenderPassEndTick() const noexcept {
+        return render_pass_end_tick;
+    }
+
     /// Returns the current command buffer tick.
     [[nodiscard]] u64 CurrentTick() const noexcept {
         return master_semaphore->CurrentTick();
@@ -122,7 +150,8 @@ public:
         return *master_semaphore;
     }
 
-    std::mutex submit_mutex;
+    /// Publishes compute accesses before later dispatches, draws and transfers on the GPU.
+    static void ComputeMemoryBarrier(vk::CommandBuffer cmdbuf);
 
 private:
     class Command {
@@ -197,6 +226,8 @@ private:
             return submit;
         }
 
+        std::optional<std::chrono::nanoseconds> frame_budget;
+
     private:
         Command* first = nullptr;
         Command* last = nullptr;
@@ -219,7 +250,8 @@ private:
 
     void AllocateWorkerCommandBuffer();
 
-    u64 SubmitExecution(VkSemaphore signal_semaphore, VkSemaphore wait_semaphore);
+    u64 SubmitExecution(VkSemaphore signal_semaphore, VkSemaphore wait_semaphore,
+                        std::optional<std::chrono::nanoseconds> frame_budget = std::nullopt);
 
     void AllocateNewContext();
 
@@ -245,7 +277,11 @@ private:
 
     State state;
 
+    std::vector<VkBuffer> written_buffers;
+    bool all_buffers_written = false;
+
     u32 num_renderpass_images = 0;
+    u64 render_pass_end_tick = 0;
     std::array<VkImage, 9> renderpass_images{};
     std::array<VkImageSubresourceRange, 9> renderpass_image_ranges{};
 

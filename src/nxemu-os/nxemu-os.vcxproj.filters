@@ -22,9 +22,6 @@
     <Filter Include="Source Files\core\hle">
       <UniqueIdentifier>{d932bd7a-4b45-52a3-b751-05ddbb018f3c}</UniqueIdentifier>
     </Filter>
-    <Filter Include="Source Files\core\arm">
-      <UniqueIdentifier>{30c901f0-88be-a1e4-0e80-047d0b05a5ad}</UniqueIdentifier>
-    </Filter>
     <Filter Include="Source Files\core\hle\kernel">
       <UniqueIdentifier>{2c6e3276-2119-3f6f-8a89-0ade38033635}</UniqueIdentifier>
     </Filter>
@@ -561,6 +558,12 @@
     <ClInclude Include="core\core_timing.h">
       <Filter>Header Files\core</Filter>
     </ClInclude>
+    <ClInclude Include="core\shared_cpu_clock.h">
+      <Filter>Header Files\core</Filter>
+    </ClInclude>
+    <ClInclude Include="core\hle_execution_time.h">
+      <Filter>Header Files\core</Filter>
+    </ClInclude>
     <ClInclude Include="core\device_memory.h">
       <Filter>Header Files\core</Filter>
     </ClInclude>
@@ -768,6 +771,9 @@
     <ClInclude Include="core\hle\kernel\k_session_request.h">
       <Filter>Header Files\core\hle\kernel</Filter>
     </ClInclude>
+    <ClInclude Include="core\hle\kernel\ipc_wait_token.h">
+      <Filter>Header Files\core\hle\kernel</Filter>
+    </ClInclude>
     <ClInclude Include="core\hle\kernel\initial_process.h">
       <Filter>Header Files\core\hle\kernel</Filter>
     </ClInclude>
@@ -834,6 +840,9 @@
     <ClInclude Include="core\hle\service\hle_ipc.h">
       <Filter>Header Files\core\hle\service</Filter>
     </ClInclude>
+    <ClInclude Include="core\hle\service\ipc_reply_transaction.h">
+      <Filter>Header Files\core\hle\service</Filter>
+    </ClInclude>
     <ClInclude Include="core\hle\service\ipc_helpers.h">
       <Filter>Header Files\core\hle\service</Filter>
     </ClInclude>
@@ -895,9 +904,6 @@
       <Filter>Header Files\core\hle\service\am</Filter>
     </ClInclude>
     <ClInclude Include="core\hle\service\am\applet_manager.h">
-      <Filter>Header Files\core\hle\service\am</Filter>
-    </ClInclude>
-    <ClInclude Include="core\hle\service\am\applet_message_queue.h">
       <Filter>Header Files\core\hle\service\am</Filter>
     </ClInclude>
     <ClInclude Include="core\hle\service\am\display_layer_manager.h">
@@ -1185,6 +1191,9 @@
     <ClInclude Include="core\hle\service\ngc\ngc.h">
       <Filter>Header Files\core\hle\service\ngc</Filter>
     </ClInclude>
+    <ClInclude Include="core\hle\service\ngc\streamplay.h">
+      <Filter>Header Files\core\hle\service\ngc</Filter>
+    </ClInclude>
     <ClInclude Include="core\hle\service\nim\nim.h">
       <Filter>Header Files\core\hle\service\nim</Filter>
     </ClInclude>
@@ -1240,6 +1249,9 @@
       <Filter>Header Files\core\hle\service\ns</Filter>
     </ClInclude>
     <ClInclude Include="core\hle\service\ns\read_only_application_control_data_interface.h">
+      <Filter>Header Files\core\hle\service\ns</Filter>
+    </ClInclude>
+    <ClInclude Include="core\hle\service\ns\application_control_data.h">
       <Filter>Header Files\core\hle\service\ns</Filter>
     </ClInclude>
     <ClInclude Include="core\hle\service\ns\read_only_application_record_interface.h">
@@ -1340,6 +1352,9 @@
     </ClInclude>
     <ClInclude Include="core\hle\service\ptm\ts.h">
       <Filter>Header Files\core\hle\service\ptm</Filter>
+    </ClInclude>
+    <ClInclude Include="core\hle\service\ro\nce_runtime_module.h">
+      <Filter>Header Files\core\hle\service\ro</Filter>
     </ClInclude>
     <ClInclude Include="core\hle\service\ro\ro.h">
       <Filter>Header Files\core\hle\service\ro</Filter>
@@ -1646,6 +1661,9 @@
     </ClInclude>
     <ClInclude Include="core\hle\service\filesystem\fsp\save_data_transfer_prohibiter.h">
       <Filter>Header Files\core\hle\service\filesystem\fsp</Filter>
+    </ClInclude>
+    <ClInclude Include="core\frame_step.h">
+      <Filter>Header Files\core</Filter>
     </ClInclude>
     <ClInclude Include="core\perf_stats.h">
       <Filter>Header Files\core</Filter>
@@ -1986,6 +2004,9 @@
     <ClInclude Include="emu_thread.h">
       <Filter>Header Files</Filter>
     </ClInclude>
+    <ClInclude Include="launch_gate.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
     <ClInclude Include="applets\applet.h">
       <Filter>Header Files\applets</Filter>
     </ClInclude>
@@ -2124,6 +2145,33 @@
     <ClInclude Include="default_profile_image.h">
       <Filter>Header Files</Filter>
     </ClInclude>
+    <ClInclude Include="core\hle\service\am\event_observer.h">
+      <Filter>Header Files\core\hle\service\am</Filter>
+    </ClInclude>
+    <ClInclude Include="core\hle\service\am\hid_registration.h">
+      <Filter>Header Files\core\hle\service\am</Filter>
+    </ClInclude>
+    <ClInclude Include="core\hle\service\am\lifecycle_manager.h">
+      <Filter>Header Files\core\hle\service\am</Filter>
+    </ClInclude>
+    <ClInclude Include="core\hle\service\am\process_holder.h">
+      <Filter>Header Files\core\hle\service\am</Filter>
+    </ClInclude>
+    <ClInclude Include="core\hle\service\am\window_system.h">
+      <Filter>Header Files\core\hle\service\am</Filter>
+    </ClInclude>
+    <ClInclude Include="core\hle\service\am\service\applet_alternative_functions.h">
+      <Filter>Header Files\core\hle\service\am\service</Filter>
+    </ClInclude>
+    <ClInclude Include="core\hle\service\am\service\overlay_applet_proxy.h">
+      <Filter>Header Files\core\hle\service\am\service</Filter>
+    </ClInclude>
+    <ClInclude Include="core\hle\service\am\service\overlay_functions.h">
+      <Filter>Header Files\core\hle\service\am\service</Filter>
+    </ClInclude>
+    <ClInclude Include="core\hle\service\am\service\system_process_common_functions.h">
+      <Filter>Header Files\core\hle\service\am\service</Filter>
+    </ClInclude>
   </ItemGroup>
   <ItemGroup>
     <None Include="version.h.in">
@@ -2135,6 +2183,9 @@
       <Filter>Source Files</Filter>
     </ClCompile>
     <ClCompile Include="core\core_timing.cpp">
+      <Filter>Source Files\core</Filter>
+    </ClCompile>
+    <ClCompile Include="core\hle_execution_time.cpp">
       <Filter>Source Files\core</Filter>
     </ClCompile>
     <ClCompile Include="core\device_memory.cpp">
@@ -2467,9 +2518,6 @@
     <ClCompile Include="core\hle\service\am\applet_data_broker.cpp">
       <Filter>Source Files\core\hle\service\am</Filter>
     </ClCompile>
-    <ClCompile Include="core\hle\service\am\applet_message_queue.cpp">
-      <Filter>Source Files\core\hle\service\am</Filter>
-    </ClCompile>
     <ClCompile Include="core\hle\service\am\display_layer_manager.cpp">
       <Filter>Source Files\core\hle\service\am</Filter>
     </ClCompile>
@@ -2737,6 +2785,9 @@
     <ClCompile Include="core\hle\service\ngc\ngc.cpp">
       <Filter>Source Files\core\hle\service\ngc</Filter>
     </ClCompile>
+    <ClCompile Include="core\hle\service\ngc\streamplay.cpp">
+      <Filter>Source Files\core\hle\service\ngc</Filter>
+    </ClCompile>
     <ClCompile Include="core\hle\service\nim\nim.cpp">
       <Filter>Source Files\core\hle\service\nim</Filter>
     </ClCompile>
@@ -2795,6 +2846,9 @@
       <Filter>Source Files\core\hle\service\ns</Filter>
     </ClCompile>
     <ClCompile Include="core\hle\service\ns\read_only_application_control_data_interface.cpp">
+      <Filter>Source Files\core\hle\service\ns</Filter>
+    </ClCompile>
+    <ClCompile Include="core\hle\service\ns\application_control_data.cpp">
       <Filter>Source Files\core\hle\service\ns</Filter>
     </ClCompile>
     <ClCompile Include="core\hle\service\ns\application_manager_interface.cpp">
@@ -2879,6 +2933,9 @@
       <Filter>Source Files\core\hle\service\ptm</Filter>
     </ClCompile>
     <ClCompile Include="core\hle\service\ro\ro_nro_utils.cpp">
+      <Filter>Source Files\core\hle\service\ro</Filter>
+    </ClCompile>
+    <ClCompile Include="core\hle\service\ro\nce_runtime_module.cpp">
       <Filter>Source Files\core\hle\service\ro</Filter>
     </ClCompile>
     <ClCompile Include="core\hle\service\ro\ro.cpp">
@@ -3207,6 +3264,9 @@
     </ClCompile>
     <ClCompile Include="core\hle\service\filesystem\fsp\fsp_srv.cpp">
       <Filter>Source Files\core\hle\service\filesystem\fsp</Filter>
+    </ClCompile>
+    <ClCompile Include="core\frame_step.cpp">
+      <Filter>Source Files\core</Filter>
     </ClCompile>
     <ClCompile Include="core\perf_stats.cpp">
       <Filter>Source Files\core</Filter>
@@ -3540,6 +3600,30 @@
     </ClCompile>
     <ClCompile Include="default_profile_image.cpp">
       <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="core\hle\service\am\event_observer.cpp">
+      <Filter>Source Files\core\hle\service\am</Filter>
+    </ClCompile>
+    <ClCompile Include="core\hle\service\am\lifecycle_manager.cpp">
+      <Filter>Source Files\core\hle\service\am</Filter>
+    </ClCompile>
+    <ClCompile Include="core\hle\service\am\process_holder.cpp">
+      <Filter>Source Files\core\hle\service\am</Filter>
+    </ClCompile>
+    <ClCompile Include="core\hle\service\am\window_system.cpp">
+      <Filter>Source Files\core\hle\service\am</Filter>
+    </ClCompile>
+    <ClCompile Include="core\hle\service\am\service\applet_alternative_functions.cpp">
+      <Filter>Source Files\core\hle\service\am\service</Filter>
+    </ClCompile>
+    <ClCompile Include="core\hle\service\am\service\overlay_applet_proxy.cpp">
+      <Filter>Source Files\core\hle\service\am\service</Filter>
+    </ClCompile>
+    <ClCompile Include="core\hle\service\am\service\overlay_functions.cpp">
+      <Filter>Source Files\core\hle\service\am\service</Filter>
+    </ClCompile>
+    <ClCompile Include="core\hle\service\am\service\system_process_common_functions.cpp">
+      <Filter>Source Files\core\hle\service\am\service</Filter>
     </ClCompile>
   </ItemGroup>
 </Project>

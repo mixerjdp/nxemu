@@ -10,6 +10,7 @@
 namespace Shader::Backend::SPIRV {
 namespace {
 Id SharedPointer(EmitContext& ctx, Id offset, u32 index_offset = 0) {
+    offset = ctx.RemapSharedMemoryOffset(offset);
     const Id shift_id{ctx.Const(2U)};
     Id index{ctx.OpShiftRightArithmetic(ctx.U32[1], offset, shift_id)};
     if (index_offset > 0) {
@@ -51,6 +52,14 @@ std::pair<Id, Id> AtomicArgs(EmitContext& ctx) {
     return {scope, semantics};
 }
 
+Id GlobalAtomicU32(EmitContext& ctx, Id func, Id address, Id value) {
+    if (ctx.profile.support_int64) {
+        return ctx.OpFunctionCall(ctx.U32[1], func, address, value);
+    }
+    LOG_WARNING(Shader_SPIRV, "Int64 not supported, ignoring memory operation");
+    return ctx.u32_zero_value;
+}
+
 Id SharedAtomicU32(EmitContext& ctx, Id offset, Id value,
                    Id (Sirit::Module::*atomic_func)(Id, Id, Id, Id, Id)) {
     const Id pointer{SharedPointer(ctx, offset)};
@@ -70,7 +79,8 @@ Id StorageAtomicU64(EmitContext& ctx, const IR::Value& binding, const IR::Value&
                     Id (Sirit::Module::*atomic_func)(Id, Id, Id, Id, Id),
                     Id (Sirit::Module::*non_atomic_func)(Id, Id, Id)) {
     if (!ctx.profile.support_descriptor_aliasing) {
-        LOG_WARNING(Shader_SPIRV, "Descriptor aliasing not supported, this cannot be atomic.");
+        LOG_WARNING(Shader_SPIRV,
+                    "Storage descriptor aliasing not supported, this cannot be atomic.");
         return ctx.ConstantNull(ctx.U64);
     }
 
@@ -89,10 +99,42 @@ Id StorageAtomicU64(EmitContext& ctx, const IR::Value& binding, const IR::Value&
     return original_value;
 }
 
+// A reduction has no observer of the intermediate 64-bit value in this shader. Each low-word
+// wrap contributes exactly one carry to the high word, so concurrent additions lose no updates.
+// Do not use this for returning atomics or buffers also read/written by the shader: two word
+// operations do not provide an indivisible 64-bit snapshot.
+Id StorageAddReduction64(EmitContext& ctx, const IR::Value& binding, const IR::Value& offset,
+                         Id words) {
+    const Id ssbo{ctx.ssbos[binding.U32()].U32};
+    const Id index{StorageIndex(ctx, offset, sizeof(u32))};
+    const Id low_pointer{ctx.OpAccessChain(ctx.storage_types.U32.element, ssbo,
+                                          ctx.u32_zero_value, index)};
+    const Id high_index{ctx.OpIAdd(ctx.U32[1], index, ctx.Const(1U))};
+    const Id high_pointer{ctx.OpAccessChain(ctx.storage_types.U32.element, ssbo,
+                                           ctx.u32_zero_value, high_index)};
+    const Id low{ctx.OpCompositeExtract(ctx.U32[1], words, 0)};
+    const Id high{ctx.OpCompositeExtract(ctx.U32[1], words, 1)};
+    const auto [scope, semantics]{AtomicArgs(ctx)};
+    const Id original_low{ctx.OpAtomicIAdd(ctx.U32[1], low_pointer, scope, semantics, low)};
+    const Id sum_low{ctx.OpIAdd(ctx.U32[1], original_low, low)};
+    const Id overflow{ctx.OpULessThan(ctx.U1, sum_low, original_low)};
+    const Id carry{ctx.OpSelect(ctx.U32[1], overflow, ctx.Const(1U), ctx.u32_zero_value)};
+    const Id increment_high{ctx.OpIAdd(ctx.U32[1], high, carry)};
+    ctx.OpAtomicIAdd(ctx.U32[1], high_pointer, scope, semantics, increment_high);
+    return ctx.ConstantNull(ctx.U32[2]);
+}
+
+bool CanSplitAddReduction(const EmitContext& ctx, const IR::Inst& inst,
+                          const IR::Value& binding) {
+    return !ctx.profile.support_int64_atomics && !inst.HasUses() && binding.IsImmediate() &&
+           ctx.atomic64_add_reduction_buffers.test(binding.U32());
+}
+
 Id StorageAtomicU32x2(EmitContext& ctx, const IR::Value& binding, const IR::Value& offset, Id value,
                       Id (Sirit::Module::*non_atomic_func)(Id, Id, Id)) {
     if (!ctx.profile.support_descriptor_aliasing) {
-        LOG_WARNING(Shader_SPIRV, "Descriptor aliasing not supported, this cannot be atomic.");
+        LOG_WARNING(Shader_SPIRV,
+                    "Storage descriptor aliasing not supported, this cannot be atomic.");
         return ctx.ConstantNull(ctx.U32[2]);
     }
 
@@ -127,12 +169,14 @@ Id EmitSharedAtomicUMax32(EmitContext& ctx, Id offset, Id value) {
 }
 
 Id EmitSharedAtomicInc32(EmitContext& ctx, Id offset, Id value) {
+    offset = ctx.RemapSharedMemoryOffset(offset);
     const Id shift_id{ctx.Const(2U)};
     const Id index{ctx.OpShiftRightArithmetic(ctx.U32[1], offset, shift_id)};
     return ctx.OpFunctionCall(ctx.U32[1], ctx.increment_cas_shared, index, value);
 }
 
 Id EmitSharedAtomicDec32(EmitContext& ctx, Id offset, Id value) {
+    offset = ctx.RemapSharedMemoryOffset(offset);
     const Id shift_id{ctx.Const(2U)};
     const Id index{ctx.OpShiftRightArithmetic(ctx.U32[1], offset, shift_id)};
     return ctx.OpFunctionCall(ctx.U32[1], ctx.decrement_cas_shared, index, value);
@@ -245,8 +289,12 @@ Id EmitStorageAtomicExchange32(EmitContext& ctx, const IR::Value& binding, const
     return StorageAtomicU32(ctx, binding, offset, value, &Sirit::Module::OpAtomicExchange);
 }
 
-Id EmitStorageAtomicIAdd64(EmitContext& ctx, const IR::Value& binding, const IR::Value& offset,
-                           Id value) {
+Id EmitStorageAtomicIAdd64(EmitContext& ctx, IR::Inst* inst, const IR::Value& binding,
+                           const IR::Value& offset, Id value) {
+    if (CanSplitAddReduction(ctx, *inst, binding)) {
+        StorageAddReduction64(ctx, binding, offset, ctx.OpBitcast(ctx.U32[2], value));
+        return ctx.ConstantNull(ctx.U64);
+    }
     return StorageAtomicU64(ctx, binding, offset, value, &Sirit::Module::OpAtomicIAdd,
                             &Sirit::Module::OpIAdd);
 }
@@ -295,6 +343,11 @@ Id EmitStorageAtomicXor64(EmitContext& ctx, const IR::Value& binding, const IR::
 
 Id EmitStorageAtomicExchange64(EmitContext& ctx, const IR::Value& binding, const IR::Value& offset,
                                Id value) {
+    if (!ctx.profile.support_descriptor_aliasing) {
+        LOG_WARNING(Shader_SPIRV,
+                    "Storage descriptor aliasing not supported, this cannot be atomic.");
+        return ctx.ConstantNull(ctx.U64);
+    }
     if (ctx.profile.support_int64_atomics) {
         const Id pointer{StoragePointer(ctx, ctx.storage_types.U64, &StorageDefinitions::U64,
                                         binding, offset, sizeof(u64))};
@@ -305,12 +358,15 @@ Id EmitStorageAtomicExchange64(EmitContext& ctx, const IR::Value& binding, const
     const Id pointer{StoragePointer(ctx, ctx.storage_types.U32x2, &StorageDefinitions::U32x2,
                                     binding, offset, sizeof(u32[2]))};
     const Id original{ctx.OpBitcast(ctx.U64, ctx.OpLoad(ctx.U32[2], pointer))};
-    ctx.OpStore(pointer, value);
+    ctx.OpStore(pointer, ctx.OpBitcast(ctx.U32[2], value));
     return original;
 }
 
-Id EmitStorageAtomicIAdd32x2(EmitContext& ctx, const IR::Value& binding, const IR::Value& offset,
-                             Id value) {
+Id EmitStorageAtomicIAdd32x2(EmitContext& ctx, IR::Inst* inst, const IR::Value& binding,
+                             const IR::Value& offset, Id value) {
+    if (CanSplitAddReduction(ctx, *inst, binding)) {
+        return StorageAddReduction64(ctx, binding, offset, value);
+    }
     return StorageAtomicU32x2(ctx, binding, offset, value, &Sirit::Module::OpIAdd);
 }
 
@@ -351,6 +407,11 @@ Id EmitStorageAtomicXor32x2(EmitContext& ctx, const IR::Value& binding, const IR
 
 Id EmitStorageAtomicExchange32x2(EmitContext& ctx, const IR::Value& binding,
                                  const IR::Value& offset, Id value) {
+    if (!ctx.profile.support_descriptor_aliasing) {
+        LOG_WARNING(Shader_SPIRV,
+                    "Storage descriptor aliasing not supported, this cannot be atomic.");
+        return ctx.ConstantNull(ctx.U32[2]);
+    }
     LOG_WARNING(Shader_SPIRV, "Int64 atomics not supported, fallback to non-atomic");
     const Id pointer{StoragePointer(ctx, ctx.storage_types.U32x2, &StorageDefinitions::U32x2,
                                     binding, offset, sizeof(u32[2]))};
@@ -414,24 +475,24 @@ Id EmitStorageAtomicMaxF32x2(EmitContext& ctx, const IR::Value& binding, const I
     return ctx.OpPackHalf2x16(ctx.U32[1], result);
 }
 
-Id EmitGlobalAtomicIAdd32(EmitContext&) {
-    throw NotImplementedException("SPIR-V Instruction");
+Id EmitGlobalAtomicIAdd32(EmitContext& ctx, Id address, Id value) {
+    return GlobalAtomicU32(ctx, ctx.global_atomic_iadd_func_u32, address, value);
 }
 
-Id EmitGlobalAtomicSMin32(EmitContext&) {
-    throw NotImplementedException("SPIR-V Instruction");
+Id EmitGlobalAtomicSMin32(EmitContext& ctx, Id address, Id value) {
+    return GlobalAtomicU32(ctx, ctx.global_atomic_smin_func_u32, address, value);
 }
 
-Id EmitGlobalAtomicUMin32(EmitContext&) {
-    throw NotImplementedException("SPIR-V Instruction");
+Id EmitGlobalAtomicUMin32(EmitContext& ctx, Id address, Id value) {
+    return GlobalAtomicU32(ctx, ctx.global_atomic_umin_func_u32, address, value);
 }
 
-Id EmitGlobalAtomicSMax32(EmitContext&) {
-    throw NotImplementedException("SPIR-V Instruction");
+Id EmitGlobalAtomicSMax32(EmitContext& ctx, Id address, Id value) {
+    return GlobalAtomicU32(ctx, ctx.global_atomic_smax_func_u32, address, value);
 }
 
-Id EmitGlobalAtomicUMax32(EmitContext&) {
-    throw NotImplementedException("SPIR-V Instruction");
+Id EmitGlobalAtomicUMax32(EmitContext& ctx, Id address, Id value) {
+    return GlobalAtomicU32(ctx, ctx.global_atomic_umax_func_u32, address, value);
 }
 
 Id EmitGlobalAtomicInc32(EmitContext&) {
@@ -442,20 +503,20 @@ Id EmitGlobalAtomicDec32(EmitContext&) {
     throw NotImplementedException("SPIR-V Instruction");
 }
 
-Id EmitGlobalAtomicAnd32(EmitContext&) {
-    throw NotImplementedException("SPIR-V Instruction");
+Id EmitGlobalAtomicAnd32(EmitContext& ctx, Id address, Id value) {
+    return GlobalAtomicU32(ctx, ctx.global_atomic_and_func_u32, address, value);
 }
 
-Id EmitGlobalAtomicOr32(EmitContext&) {
-    throw NotImplementedException("SPIR-V Instruction");
+Id EmitGlobalAtomicOr32(EmitContext& ctx, Id address, Id value) {
+    return GlobalAtomicU32(ctx, ctx.global_atomic_or_func_u32, address, value);
 }
 
-Id EmitGlobalAtomicXor32(EmitContext&) {
-    throw NotImplementedException("SPIR-V Instruction");
+Id EmitGlobalAtomicXor32(EmitContext& ctx, Id address, Id value) {
+    return GlobalAtomicU32(ctx, ctx.global_atomic_xor_func_u32, address, value);
 }
 
-Id EmitGlobalAtomicExchange32(EmitContext&) {
-    throw NotImplementedException("SPIR-V Instruction");
+Id EmitGlobalAtomicExchange32(EmitContext& ctx, Id address, Id value) {
+    return GlobalAtomicU32(ctx, ctx.global_atomic_exchange_func_u32, address, value);
 }
 
 Id EmitGlobalAtomicIAdd64(EmitContext&) {

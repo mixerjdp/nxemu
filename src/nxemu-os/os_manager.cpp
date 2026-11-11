@@ -5,8 +5,11 @@
 #include "core/hle/kernel/k_process.h"
 #include "core/hle/service/acc/profile_manager.h"
 #include "core/hle/service/am/applet_manager.h"
+#include "core/hle/service/am/window_system.h"
 #include "core/hle/service/am/frontend/applets.h"
 #include "core/hle/service/filesystem/filesystem.h"
+#include "core/hle/service/filesystem/fsp/fs_i_file.h"
+#include "core/frame_step.h"
 #include "core/perf_stats.h"
 #include "os_settings.h"
 #include "os_settings_identifiers.h"
@@ -16,11 +19,17 @@
 #include "yuzu_common/string_util.h"
 #include "yuzu_hid_core/frontend/emulated_controller.h"
 #include "yuzu_hid_core/hid_core.h"
+#include "yuzu_input_common/drivers/android.h"
 #include "yuzu_input_common/drivers/keyboard.h"
 #include "yuzu_input_common/drivers/virtual_gamepad.h"
 #include "yuzu_input_common/main.h"
+#ifdef ANDROID
+#include <jni.h>
+#endif
 #include <nxemu-core/settings/identifiers.h>
 #include <filesystem>
+#include <chrono>
+#include <thread>
 
 namespace
 {
@@ -142,6 +151,7 @@ OSManager::OSManager(ISystemModules & modules) :
 
 OSManager::~OSManager()
 {
+    g_settings->UnregisterCallback(NXOsSetting::GameDockedMode, DockedModeChanged, this);
     if (m_applicationProcess != nullptr)
     {
         m_applicationProcess->Close();
@@ -149,17 +159,46 @@ OSManager::~OSManager()
     }
 }
 
+void OSManager::DockedModeChanged(const char *, void * userData)
+{
+    auto & system = static_cast<OSManager *>(userData)->m_coreSystem;
+    if (system.IsPoweredOn() && !system.IsShuttingDown())
+    {
+        system.GetAppletManager().OperationModeChanged();
+    }
+}
+
 void OSManager::EmulationStarting()
 {
+    {
+        std::scoped_lock lock(m_backgroundMutex);
+        m_backgroundNotified = false;
+    }
     g_settings->SetBool(NXOsSetting::UseSpeedLimit, true);
+    g_settings->SetBool(NXOsSetting::UncappedPresent, false);
 
+    if (m_emuThread && m_emuThread->AwaitingRelease())
+    {
+        m_emuThread->Release();
+        return;
+    }
     m_emuThread = std::make_unique<EmuThread>(m_coreSystem, m_applicationProcess);
     m_emuThread->Start();
 }
 
+void OSManager::StartEmulationThread(EmulationPrepareCallback prepare, void * userData)
+{
+    m_emuThread = std::make_unique<EmuThread>(m_coreSystem, m_applicationProcess);
+    m_emuThread->StartPrepared(prepare, userData);
+}
+
 void OSManager::EmulationStopping(bool wait)
 {
+    NotifyApplicationBackgroundedBeforeShutdown();
     g_settings->SetBool(NXOsSetting::UseSpeedLimit, true);
+    g_settings->SetBool(NXOsSetting::UncappedPresent, false);
+    g_settings->SetBool(NXCoreSetting::Is64BitProgram, false);
+    g_settings->SetBool(NXCoreSetting::Has36BitAddressSpace, false);
     g_settings->SetBool(NXCoreSetting::Has39BitAddressSpace, false);
 
     if (m_emuThread)
@@ -178,16 +217,85 @@ void OSManager::EmulationStopping(bool wait)
     }
 }
 
+void OSManager::NotifyApplicationBackgroundedBeforeShutdown()
+{
+    std::scoped_lock lock(m_backgroundMutex);
+    if (m_backgroundNotified || !m_emuThread || !m_emuThread->HasStarted() ||
+        !m_coreSystem.IsPoweredOn() ||
+        m_coreSystem.IsShuttingDown())
+    {
+        return;
+    }
+    const auto state = static_cast<EmulationState>(g_settings->GetInt(NXCoreSetting::EmulationState));
+    // The module manager has already set Stopping before calling EmulationStopping().
+    if (state != EmulationState::Running && state != EmulationState::Paused &&
+        state != EmulationState::Stopping)
+    {
+        return;
+    }
+    auto & windowSystem = m_coreSystem.GetAppletManager().GetWindowSystem();
+    if (!windowSystem.OnApplicationBackgrounded())
+    {
+        return;
+    }
+    m_backgroundNotified = true;
+
+    // A paused title must be able to consume the notification and commit its save index.
+    if (!m_emuThread->IsRunning())
+    {
+        m_emuThread->SetRunning(true);
+    }
+    using namespace std::chrono;
+    const auto deadline = steady_clock::now() + milliseconds(350);
+    while (windowSystem.IsApplicationFocusStateChangedPending() && steady_clock::now() < deadline)
+    {
+        std::this_thread::sleep_for(milliseconds(5));
+    }
+    const bool consumed = !windowSystem.IsApplicationFocusStateChangedPending();
+
+    // The game writes its save asynchronously after it consumes the event, and Commit() does not
+    // journal, so stopping mid-write truncates the file. Give the write time to start, then wait
+    // until file system changes have been quiet for a while, bounded so a stop cannot hang.
+    const auto minimumWait = consumed ? milliseconds(150) : milliseconds(0);
+    const auto quietPeriod = milliseconds(100);
+    const auto maximumWait = seconds(2);
+    const auto settleStart = steady_clock::now();
+    uint64_t lastWriteCount = Service::FileSystem::GetFileSystemWriteCount();
+    auto lastWrite = settleStart;
+    for (;;)
+    {
+        const auto now = steady_clock::now();
+        const uint64_t writeCount = Service::FileSystem::GetFileSystemWriteCount();
+        if (writeCount != lastWriteCount)
+        {
+            lastWriteCount = writeCount;
+            lastWrite = now;
+        }
+        if (now - settleStart >= maximumWait ||
+            (now - settleStart >= minimumWait && now - lastWrite >= quietPeriod))
+        {
+            break;
+        }
+        std::this_thread::sleep_for(milliseconds(5));
+    }
+}
+
 bool OSManager::Initialize(void)
 {
-    SetupOsSetting();
+    g_settings->RegisterCallback(NXOsSetting::GameDockedMode, DockedModeChanged, this);
     m_coreSystem.Initialize();
-    m_coreSystem.HIDCore().ReloadInputDevices();
     return true;
+}
+
+void OSManager::InitializeInput(void)
+{
+    m_coreSystem.InitializeInput();
+    m_coreSystem.HIDCore().ReloadInputDevices();
 }
 
 void OSManager::ShutDown()
 {
+    NotifyApplicationBackgroundedBeforeShutdown();
     m_coreSystem.SetShuttingDown(true);
     if (m_coreSystem.IsPoweredOn())
     {
@@ -214,6 +322,7 @@ void OSManager::ShutdownMainProcess()
 
 bool OSManager::SetupCurrentProcess(uint64_t codeSize, const IProgramMetadata & metaData, uint64_t aslr_space_start, uint64_t & baseAddress, uint64_t & processID, bool is_hbl)
 {
+    m_coreSystem.FrameStep().Reset();
     if (m_applicationProcess == nullptr)
     {
         return CreateApplicationProcess(codeSize, metaData, aslr_space_start, baseAddress, processID, is_hbl);
@@ -249,7 +358,7 @@ bool OSManager::CreateApplicationProcess(uint64_t codeSize, const IProgramMetada
     {
         return false;
     }
-    m_coreSystem.InitializeKernel(metaData.GetTitleID());
+    m_coreSystem.InitializeKernel(metaData.GetTitleID(), metaData.Is64BitProgram());
     Kernel::KernelCore & kernel = m_coreSystem.Kernel();
     m_applicationProcess = Kernel::KProcess::Create(kernel);
     if (m_applicationProcess == nullptr)
@@ -259,7 +368,6 @@ bool OSManager::CreateApplicationProcess(uint64_t codeSize, const IProgramMetada
     Kernel::KProcess::Register(kernel, m_applicationProcess);
     kernel.AppendNewProcess(m_applicationProcess);
     kernel.MakeApplicationProcess(m_applicationProcess);
-    g_settings->SetBool(NXCoreSetting::Has39BitAddressSpace, metaData.GetAddressSpaceType() == ProgramAddressSpaceType::Is39Bit);
 
     if (m_applicationProcess->LoadFromMetadata(metaData, codeSize, aslr_space_start, is_hbl).IsError())
     {
@@ -276,7 +384,8 @@ bool OSManager::CreateApplicationProcess(uint64_t codeSize, const IProgramMetada
         .previous_program_index = m_previousProgramIndex,
     };
     params.program_id = metaData.GetTitleID();
-    m_coreSystem.GetAppletManager().CreateAndInsertByFrontendAppletParameters(m_applicationProcess->GetProcessId(), params);
+    m_coreSystem.GetAppletManager().CreateAndInsertByFrontendAppletParameters(
+        m_applicationProcess->GetProcessId(), params, m_applicationProcess);
 
     m_programIndex = 0;
     m_previousProgramIndex = -1;
@@ -291,6 +400,7 @@ void OSManager::StartApplicationProcess(int32_t priority, int64_t stackSize, uin
 {
     m_coreSystem.AddGlueRegistrationForProcess(*m_applicationProcess, version, baseGameStorageId, updateStorageId, nacpData, nacpDataLen);
     m_applicationProcess->Run(priority, stackSize);
+    m_coreSystem.GetAppletManager().NotifyAppletStarted(m_applicationProcess->GetProcessId());
 }
 
 bool OSManager::LoadModule(const IModuleInfo & module, uint64_t baseAddress)
@@ -314,7 +424,10 @@ void OSManager::KeyboardKeyPress(int modifier, int keyIndex, int keyCode)
     std::shared_ptr<InputCommon::InputSubsystem> & input_subsystem = m_coreSystem.InputSubsystem();
     input_subsystem->GetKeyboard()->SetKeyboardModifiers(modifier);
     input_subsystem->GetKeyboard()->PressKeyboardKey(keyIndex);
-    input_subsystem->GetKeyboard()->PressKey(keyCode);
+    if (keyCode != 0)
+    {
+        input_subsystem->GetKeyboard()->PressKey(keyCode);
+    }
     input_subsystem->PumpEvents();
 }
 
@@ -323,13 +436,21 @@ void OSManager::KeyboardKeyRelease(int modifier, int keyIndex, int keyCode)
     std::shared_ptr<InputCommon::InputSubsystem> & input_subsystem = m_coreSystem.InputSubsystem();
     input_subsystem->GetKeyboard()->SetKeyboardModifiers(modifier);
     input_subsystem->GetKeyboard()->ReleaseKeyboardKey(keyIndex);
-    input_subsystem->GetKeyboard()->ReleaseKey(keyCode);
+    if (keyCode != 0)
+    {
+        input_subsystem->GetKeyboard()->ReleaseKey(keyCode);
+    }
     input_subsystem->PumpEvents();
 }
 
 void OSManager::GatherGPUDirtyMemory(ICacheInvalidator * invalidator)
 {
     m_coreSystem.GatherGPUDirtyMemory(invalidator);
+}
+
+void OSManager::GatherGPUDirtyMemoryForReadback(ICacheInvalidator * invalidator)
+{
+    m_coreSystem.GatherGPUDirtyMemory(invalidator, false);
 }
 
 uint64_t OSManager::GetGPUTicks()
@@ -388,6 +509,55 @@ IParamPackageList * OSManager::GetInputDevices() const
 IEmulatedController & OSManager::GetEmulatedController(NpadIdType index)
 {
     return *m_coreSystem.HIDCore().GetEmulatedController(index);
+}
+
+void OSManager::AndroidRegisterController(void * j_input_device)
+{
+#ifdef ANDROID
+    if (j_input_device == nullptr)
+    {
+        return;
+    }
+    InputCommon::Android * android = m_coreSystem.InputSubsystem()->GetAndroid();
+    if (android != nullptr)
+    {
+        android->RegisterController((jobject)j_input_device);
+    }
+#else
+    (void)j_input_device;
+#endif
+}
+
+void OSManager::SetButtonState(const char * guid, int32_t port, int32_t button_id, bool pressed)
+{
+#ifdef ANDROID
+    InputCommon::Android * android = m_coreSystem.InputSubsystem()->GetAndroid();
+    if (android != nullptr && guid != nullptr)
+    {
+        android->SetButtonState(guid, static_cast<size_t>(port), button_id, pressed);
+    }
+#else
+    (void)guid;
+    (void)port;
+    (void)button_id;
+    (void)pressed;
+#endif
+}
+
+void OSManager::SetAxisPosition(const char * guid, int32_t port, int32_t axis_id, float value)
+{
+#ifdef ANDROID
+    InputCommon::Android * android = m_coreSystem.InputSubsystem()->GetAndroid();
+    if (android != nullptr && guid != nullptr)
+    {
+        android->SetAxisPosition(guid, static_cast<size_t>(port), axis_id, value);
+    }
+#else
+    (void)guid;
+    (void)port;
+    (void)axis_id;
+    (void)value;
+#endif
 }
 
 ButtonNames OSManager::GetButtonName(const IParamPackage& param) const
@@ -452,6 +622,11 @@ void OSManager::PumpInputEvents() const
 PerfStatsResults OSManager::GetAndResetPerfStats()
 {
     return m_coreSystem.GetAndResetPerfStats();
+}
+
+void OSManager::MeasureGameFrames(bool measure)
+{
+    m_coreSystem.GetPerfStats().MeasureGameFrames(measure);
 }
 
 void OSManager::SetEmulationPaused(bool paused)
@@ -699,4 +874,9 @@ void OSManager::PushUserChannelEntry(const uint8_t * data, uint32_t size)
         return;
     }
     m_coreSystem.GetUserChannel().emplace_back(data, data + size);
+}
+
+void OSManager::SetFrameStepAddress(uint64_t address)
+{
+    m_coreSystem.FrameStep().AddAddress(m_coreSystem.ApplicationMemory(), address);
 }

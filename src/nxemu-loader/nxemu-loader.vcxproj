@@ -57,6 +57,7 @@
     <ClInclude Include="core\core.h" />
     <ClInclude Include="core\file_sys\bis_factory.h" />
     <ClInclude Include="core\file_sys\card_image.h" />
+    <ClInclude Include="core\file_sys\code_mods.h" />
     <ClInclude Include="core\file_sys\common_funcs.h" />
     <ClInclude Include="core\file_sys\content_archive.h" />
     <ClInclude Include="core\file_sys\control_metadata.h" />
@@ -91,6 +92,7 @@
     <ClInclude Include="core\file_sys\nca_metadata.h" />
     <ClInclude Include="core\file_sys\partition_filesystem.h" />
     <ClInclude Include="core\file_sys\patch_manager.h" />
+    <ClInclude Include="core\file_sys\patch_sets.h" />
     <ClInclude Include="core\file_sys\program_metadata.h" />
     <ClInclude Include="core\file_sys\registered_cache.h" />
     <ClInclude Include="core\file_sys\romfs.h" />
@@ -135,6 +137,7 @@
     <ClInclude Include="core\hle\service\set\settings_types.h" />
     <ClInclude Include="core\loader\deconstructed_rom_directory.h" />
     <ClInclude Include="core\loader\loader.h" />
+    <ClInclude Include="core\loader\loose_romfs_paths.h" />
     <ClInclude Include="core\loader\nca.h" />
     <ClInclude Include="core\loader\nro.h" />
     <ClInclude Include="core\loader\nso.h" />
@@ -142,6 +145,8 @@
     <ClInclude Include="core\loader\xci.h" />
     <ClInclude Include="loader_settings.h" />
     <ClInclude Include="loader_settings_identifiers.h" />
+    <ClInclude Include="firmware_install.h" />
+    <ClInclude Include="game_list_cache.h" />
     <ClInclude Include="rom_info.h" />
     <ClInclude Include="system_loader.h" />
   </ItemGroup>
@@ -171,6 +176,7 @@
     <ClCompile Include="core\file_sys\nca_metadata.cpp" />
     <ClCompile Include="core\file_sys\partition_filesystem.cpp" />
     <ClCompile Include="core\file_sys\patch_manager.cpp" />
+    <ClCompile Include="core\file_sys\patch_sets.cpp" />
     <ClCompile Include="core\file_sys\program_metadata.cpp" />
     <ClCompile Include="core\file_sys\registered_cache.cpp" />
     <ClCompile Include="core\file_sys\romfs.cpp" />
@@ -213,9 +219,11 @@
     <ClCompile Include="core\loader\nso.cpp" />
     <ClCompile Include="core\loader\nsp.cpp" />
     <ClCompile Include="core\loader\xci.cpp" />
+    <ClCompile Include="firmware_install.cpp" />
     <ClCompile Include="firmware_zip.cpp" />
     <ClCompile Include="loader_settings.cpp" />
     <ClCompile Include="nxemu-loader.cpp" />
+    <ClCompile Include="game_list_cache.cpp" />
     <ClCompile Include="rom_info.cpp" />
     <ClCompile Include="system_loader.cpp" />
   </ItemGroup>

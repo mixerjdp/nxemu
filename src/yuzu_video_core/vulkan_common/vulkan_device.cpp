@@ -19,10 +19,13 @@
 #include "yuzu_video_core/vulkan_common/vma.h"
 #include "yuzu_video_core/vulkan_common/vulkan_device.h"
 #include "yuzu_video_core/vulkan_common/vulkan_wrapper.h"
+#include <nxemu-module-spec/base.h>
 
 #if defined(ANDROID) && (defined(_M_ARM64) || defined(ARCHITECTURE_arm64))
 #include <adrenotools/bcenabler.h>
 #endif
+
+extern IModuleNotification * g_notify;
 
 namespace Vulkan
 {
@@ -41,6 +44,12 @@ constexpr std::array STENCIL8_UINT{
 constexpr std::array DEPTH24_UNORM_STENCIL8_UINT{
     VK_FORMAT_D32_SFLOAT_S8_UINT,
     VK_FORMAT_D16_UNORM_S8_UINT,
+    VK_FORMAT_UNDEFINED,
+};
+
+constexpr std::array DEPTH24_UNORM_DONTCARE8{
+    VK_FORMAT_D32_SFLOAT,
+    VK_FORMAT_D16_UNORM,
     VK_FORMAT_UNDEFINED,
 };
 
@@ -102,6 +111,8 @@ constexpr const VkFormat * GetFormatAlternatives(VkFormat format)
         return Alternatives::STENCIL8_UINT.data();
     case VK_FORMAT_D24_UNORM_S8_UINT:
         return Alternatives::DEPTH24_UNORM_STENCIL8_UINT.data();
+    case VK_FORMAT_X8_D24_UNORM_PACK32:
+        return Alternatives::DEPTH24_UNORM_DONTCARE8.data();
     case VK_FORMAT_D16_UNORM_S8_UINT:
         return Alternatives::DEPTH16_UNORM_STENCIL8_UINT.data();
     case VK_FORMAT_B5G6R5_UNORM_PACK16:
@@ -745,6 +756,11 @@ Device::Device(VkInstance instance_, vk::PhysicalDevice physical_, VkSurfaceKHR 
 
     if (is_mvk)
     {
+        // Metal has no uint8 index buffers. MoltenVK converts the entire bound
+        // buffer for every draw, including unused parts of our merged cache
+        // allocations. Use our draw-sized uint8 conversion instead.
+        RemoveExtensionFeature(extensions.index_type_uint8, features.index_type_uint8,
+                               VK_EXT_INDEX_TYPE_UINT8_EXTENSION_NAME);
         LOG_WARNING(Render_Vulkan, "MVK driver breaks when using more than 16 vertex attributes/bindings");
         properties.properties.limits.maxVertexInputAttributes = std::min(properties.properties.limits.maxVertexInputAttributes, 16U);
         properties.properties.limits.maxVertexInputBindings = std::min(properties.properties.limits.maxVertexInputBindings, 16U);
@@ -768,6 +784,41 @@ Device::Device(VkInstance instance_, vk::PhysicalDevice physical_, VkSurfaceKHR 
         RemoveExtensionFeature(extensions.extended_dynamic_state3, features.extended_dynamic_state3, VK_EXT_EXTENDED_DYNAMIC_STATE_3_EXTENSION_NAME);
         dynamic_state3_blending = false;
         dynamic_state3_enables = false;
+    }
+
+    // MoltenVK's large Metal argument-buffer limits apply only to layouts/pools
+    // created with UPDATE_AFTER_BIND. Keep the ordinary (including push) limits intact.
+    const auto& indexing = properties.descriptor_indexing;
+    update_after_bind_descriptor_sets =
+        is_mvk && indexing.maxPerStageDescriptorUpdateAfterBindSamplers >
+                      properties.properties.limits.maxPerStageDescriptorSamplers;
+    descriptor_set_limits = properties.properties.limits;
+    if (update_after_bind_descriptor_sets) {
+        descriptor_set_limits.maxPerStageDescriptorSamplers =
+            indexing.maxPerStageDescriptorUpdateAfterBindSamplers;
+        descriptor_set_limits.maxPerStageDescriptorSampledImages =
+            indexing.maxPerStageDescriptorUpdateAfterBindSampledImages;
+        descriptor_set_limits.maxPerStageDescriptorStorageImages =
+            indexing.maxPerStageDescriptorUpdateAfterBindStorageImages;
+        descriptor_set_limits.maxPerStageDescriptorUniformBuffers =
+            indexing.maxPerStageDescriptorUpdateAfterBindUniformBuffers;
+        descriptor_set_limits.maxPerStageDescriptorStorageBuffers =
+            indexing.maxPerStageDescriptorUpdateAfterBindStorageBuffers;
+        descriptor_set_limits.maxPerStageResources = indexing.maxPerStageUpdateAfterBindResources;
+        descriptor_set_limits.maxDescriptorSetSamplers =
+            indexing.maxDescriptorSetUpdateAfterBindSamplers;
+        descriptor_set_limits.maxDescriptorSetSampledImages =
+            indexing.maxDescriptorSetUpdateAfterBindSampledImages;
+        descriptor_set_limits.maxDescriptorSetStorageImages =
+            indexing.maxDescriptorSetUpdateAfterBindStorageImages;
+        descriptor_set_limits.maxDescriptorSetUniformBuffers =
+            indexing.maxDescriptorSetUpdateAfterBindUniformBuffers;
+        descriptor_set_limits.maxDescriptorSetStorageBuffers =
+            indexing.maxDescriptorSetUpdateAfterBindStorageBuffers;
+        LOG_INFO(Render_Vulkan, "Using MoltenVK argument-buffer descriptor sets: {} samplers, "
+                               "{} sampled images per stage",
+                 descriptor_set_limits.maxPerStageDescriptorSamplers,
+                 descriptor_set_limits.maxPerStageDescriptorSampledImages);
     }
 
     logical = vk::Device::Create(physical, queue_cis, ExtensionListForVulkan(loaded_extensions), first_next, dld);
@@ -794,10 +845,26 @@ Device::Device(VkInstance instance_, vk::PhysicalDevice physical_, VkSurfaceKHR 
     };
 
     vk::Check(vmaCreateAllocator(&allocator_info, &allocator));
+    if (is_mvk)
+    {
+        // Mixed buffer/image heaps on MoltenVK can corrupt optimal image contents
+        // during buffer writes (observed with BC1 startup textures). Separate
+        // their backing allocations while retaining suballocation within each heap.
+        const VkResult result = vmaCreateAllocator(&allocator_info, &image_allocator);
+        if (result != VK_SUCCESS)
+        {
+            vmaDestroyAllocator(allocator);
+            vk::Check(result);
+        }
+    }
 }
 
 Device::~Device()
 {
+    if (image_allocator)
+    {
+        vmaDestroyAllocator(image_allocator);
+    }
     vmaDestroyAllocator(allocator);
 }
 
@@ -833,10 +900,21 @@ VkFormat Device::GetSupportedFormat(VkFormat wanted_format, VkFormatFeatureFlags
 
 void Device::ReportLoss() const
 {
+    if (lost.exchange(true))
+    {
+        return;
+    }
     LOG_CRITICAL(Render_Vulkan, "Device loss occurred!");
+    if (g_notify != nullptr)
+    {
+        g_notify->DisplayError("The GPU stopped responding, so the game can no longer be shown. Stop the emulation and start the game again.", "Graphics error");
+    }
 
-    // Wait for the log to flush and for Nsight Aftermath to dump the results
-    std::this_thread::sleep_for(std::chrono::seconds{15});
+    if (nsight_aftermath_tracker)
+    {
+        // Wait for the log to flush and for Nsight Aftermath to dump the results
+        std::this_thread::sleep_for(std::chrono::seconds{15});
+    }
 }
 
 void Device::SaveShader(std::span<const u32> spirv) const
@@ -1138,12 +1216,18 @@ bool Device::GetSuitability(bool requires_swapchain)
     physical.GetFeatures2(features2);
     features.features = features2.features;
 
-    // Some features are mandatory. Check those.
-#define CHECK_FEATURE(feature, name)                                    \
-    if (!features.feature.name)                                         \
-    {                                                                   \
-        LOG_ERROR(Render_Vulkan, "Missing required feature {}", #name); \
-        suitable = false;                                               \
+    // Some features are mandatory. Check those. Metal has no geometry shaders or cull
+    // distances, and MoltenVK runs without them: not an error there.
+#ifdef __APPLE__
+#define LOG_MISSING_FEATURE LOG_WARNING
+#else
+#define LOG_MISSING_FEATURE LOG_ERROR
+#endif
+#define CHECK_FEATURE(feature, name)                                              \
+    if (!features.feature.name)                                                   \
+    {                                                                             \
+        LOG_MISSING_FEATURE(Render_Vulkan, "Missing required feature {}", #name); \
+        suitable = false;                                                         \
     }
 
 #define LOG_FEATURE(feature, name)                                           \
@@ -1157,6 +1241,7 @@ bool Device::GetSuitability(bool requires_swapchain)
 
 #undef LOG_FEATURE
 #undef CHECK_FEATURE
+#undef LOG_MISSING_FEATURE
 
     // Generate linked list of properties.
     properties2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2;
@@ -1193,7 +1278,17 @@ bool Device::GetSuitability(bool requires_swapchain)
         properties.transform_feedback.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TRANSFORM_FEEDBACK_PROPERTIES_EXT;
         SetNext(next, properties.transform_feedback);
     }
+    if (extensions.descriptor_indexing || instance_version >= VK_API_VERSION_1_2)
+    {
+        properties.descriptor_indexing.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_INDEXING_PROPERTIES;
+        SetNext(next, properties.descriptor_indexing);
+    }
 
+    if (instance_version >= VK_API_VERSION_1_2)
+    {
+        properties.depth_stencil_resolve.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DEPTH_STENCIL_RESOLVE_PROPERTIES;
+        SetNext(next, properties.depth_stencil_resolve);
+    }
     // Perform the property fetch.
     physical.GetProperties2(properties2);
     properties.properties = properties2.properties;
@@ -1421,8 +1516,17 @@ void Device::CollectPhysicalMemoryInfo()
 
         return;
     }
+    const u64 heap_budget = device_access_memory;
     const s64 available_memory = static_cast<s64>(device_access_memory - device_initial_usage);
     device_access_memory = static_cast<u64>(std::max<s64>(std::min<s64>(available_memory - 8_GiB, 4_GiB), std::min<s64>(local_memory, 4_GiB)));
+    if (GetDriverID() == VK_DRIVER_ID_MOLTENVK && extensions.memory_budget)
+    {
+        // Apple GPUs share system memory: use the Metal working set rather than the 4 GiB
+        // above, keeping headroom for the system and at most half of it.
+        const u64 reserve = std::clamp<u64>(heap_budget / 8, 2_GiB, 4_GiB);
+        const u64 free_budget = available_memory > static_cast<s64>(reserve) ? static_cast<u64>(available_memory) - reserve : 0;
+        device_access_memory = std::max(device_access_memory, std::min(free_budget, heap_budget / 2));
+    }
 }
 
 void Device::CollectToolingInfo()

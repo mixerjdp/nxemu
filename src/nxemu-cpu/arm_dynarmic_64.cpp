@@ -2,6 +2,9 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include "cpu_settings.h"
+#include <array>
+#include <limits>
+#include "yuzu_common/scope_exit.h"
 #include <yuzu_common/logging/log.h>
 #include "arm_dynarmic.h"
 #include "arm_dynarmic_64.h"
@@ -33,35 +36,39 @@ public:
 
     uint8_t MemoryRead8(uint64_t vaddr) override
     {
-        if (m_check_memory_access)
+        if (m_check_memory_access && !CheckMemoryAccess(vaddr, 1, CpuDebugWatchpointType::Read))
         {
-            CheckMemoryAccess(vaddr, 1, CpuDebugWatchpointType::Read);        
+            return 0;
         }
         return m_memory.Read8(vaddr);
     }
     uint16_t MemoryRead16(uint64_t vaddr) override
     {
-        if (m_check_memory_access)
+        if (m_check_memory_access && !CheckMemoryAccess(vaddr, 2, CpuDebugWatchpointType::Read))
         {
-            CheckMemoryAccess(vaddr, 2, CpuDebugWatchpointType::Read);
+            return 0;
         }
         return m_memory.Read16(vaddr);
     }
     uint32_t MemoryRead32(uint64_t vaddr) override
     {
-        if (m_check_memory_access)
+        if (m_check_memory_access && !CheckMemoryAccess(vaddr, 4, CpuDebugWatchpointType::Read))
         {
-            CheckMemoryAccess(vaddr, 4, CpuDebugWatchpointType::Read);
+            return 0;
         }
         return m_memory.Read32(vaddr);
     }
     uint64_t MemoryRead64(uint64_t vaddr) override
     {
-        if (m_check_memory_access)
+        if (m_check_memory_access && !CheckMemoryAccess(vaddr, 8, CpuDebugWatchpointType::Read))
         {
-            CheckMemoryAccess(vaddr, 8, CpuDebugWatchpointType::Read);
+            return 0;
         }
         return m_memory.Read64(vaddr);
+    }
+    void OnCompilation(bool compiling) override
+    {
+        m_system.Timing().CpuCompilation(m_parent.m_coreIndex, compiling);
     }
     std::optional<u32> MemoryReadCode(uint64_t vaddr) override
     {
@@ -69,13 +76,29 @@ public:
         {
             return std::nullopt;
         }
-        return m_memory.Read32(vaddr);
+
+        const uint64_t page_addr = vaddr & ~CODE_PAGE_MASK;
+        if (m_last_code_page != page_addr)
+        {
+            if (!m_memory.ReadBlock(page_addr, m_cached_code_page.data(), CODE_PAGE_SIZE))
+            {
+                return m_memory.Read32(vaddr);
+            }
+            m_last_code_page = page_addr;
+        }
+
+        return m_cached_code_page[(vaddr & CODE_PAGE_MASK) / sizeof(u32)];
+    }
+
+    void InstructionSynchronizationBarrierRaised() override
+    {
+        InvalidateCodePageCache();
     }
     Vector MemoryRead128(uint64_t vaddr) override
     {
-        if (m_check_memory_access)
+        if (m_check_memory_access && !CheckMemoryAccess(vaddr, 16, CpuDebugWatchpointType::Read))
         {
-            CheckMemoryAccess(vaddr, 16, CpuDebugWatchpointType::Read);
+            return {};
         }
         return {m_memory.Read64(vaddr), m_memory.Read64(vaddr + 8)};
     }
@@ -140,13 +163,14 @@ public:
         return CheckMemoryAccess(vaddr, 16, CpuDebugWatchpointType::Write) && m_memory.WriteExclusive128(vaddr, value[1], value[0], expected[1], expected[0]);
     }
 
-    void InterpreterFallback(uint64_t /*pc*/, uint64_t /*num_instructions*/) override
+    void InterpreterFallback(uint64_t /*pc*/, std::size_t /*num_instructions*/) override
     {
         g_notify->BreakPoint(__FILE__, __LINE__);
     }
 
     void InstructionCacheOperationRaised(Dynarmic::A64::InstructionCacheOperation op, uint64_t value) override
     {
+        InvalidateCodePageCache();
         switch (op)
         {
         case Dynarmic::A64::InstructionCacheOperation::InvalidateByVAToPoU:
@@ -202,15 +226,20 @@ public:
         m_parent.m_jit->HaltExecution(TranslateDynarmicHaltReason(CpuHaltReason::SupervisorCall));
     }
 
-    void AddTicks(uint64_t /*ticks*/) override
+    void AddTicks(uint64_t ticks) override
     {
-        g_notify->BreakPoint(__FILE__, __LINE__);
+        ASSERT_MSG(!m_parent.m_uses_wall_clock, "Dynarmic ticking disabled");
+
+        uint64_t amortized_ticks = ticks / Hardware::NUM_CPU_CORES;
+        amortized_ticks = std::max<uint64_t>(amortized_ticks, 1);
+        m_parent.m_system.Timing().AddTicks(amortized_ticks);
     }
 
     uint64_t GetTicksRemaining() override
     {
-        g_notify->BreakPoint(__FILE__, __LINE__);
-        return 0;
+        ASSERT_MSG(!m_parent.m_uses_wall_clock, "Dynarmic ticking disabled");
+
+        return std::max<int64_t>(m_parent.m_system.Timing().GetDowncount(), 0);
     }
 
     uint64_t GetCNTPCT() override
@@ -218,9 +247,38 @@ public:
         return m_parent.m_system.Timing().GetClockTicks();
     }
 
-    bool CheckMemoryAccess(uint64_t /*addr*/, uint64_t /*size*/, CpuDebugWatchpointType /*type*/)
+    void InvalidateCodePageCache()
+    {
+        m_last_code_page = INVALID_CODE_PAGE;
+    }
+
+    void InvalidateCodePageCacheRange(uint64_t addr, uint64_t size)
+    {
+        if (m_last_code_page == INVALID_CODE_PAGE || size == 0)
+        {
+            return;
+        }
+
+        const uint64_t end = addr + size - 1;
+        if (end < addr || (addr <= m_last_code_page + CODE_PAGE_MASK && end >= m_last_code_page))
+        {
+            InvalidateCodePageCache();
+        }
+    }
+
+    bool CheckMemoryAccess(uint64_t addr, uint64_t size, CpuDebugWatchpointType /*type*/)
     {
         if (!m_check_memory_access)
+        {
+            return true;
+        }
+        if (!m_memory.IsValidVirtualAddressRange(addr, size))
+        {
+            LOG_CRITICAL(Core_ARM, "Stopping execution due to unmapped memory access at {:#x}", addr);
+            m_parent.m_jit->HaltExecution(TranslateDynarmicHaltReason(CpuHaltReason::DataAbort));
+            return false;
+        }
+        if (!m_debugger_enabled)
         {
             return true;
         }
@@ -234,6 +292,13 @@ public:
         m_parent.m_breakpoint_context.pc = pc;
         m_parent.m_jit->HaltExecution(reason);
     }
+
+    static constexpr uint64_t CODE_PAGE_SIZE = 0x1000;
+    static constexpr uint64_t CODE_PAGE_MASK = CODE_PAGE_SIZE - 1;
+    static constexpr uint64_t INVALID_CODE_PAGE = std::numeric_limits<uint64_t>::max();
+
+    std::array<u32, CODE_PAGE_SIZE / sizeof(u32)> m_cached_code_page{};
+    uint64_t m_last_code_page = INVALID_CODE_PAGE;
 
     ArmDynarmic64 & m_parent;
     IMemory & m_memory;
@@ -255,6 +320,9 @@ ArmDynarmic64::ArmDynarmic64(ICoreSystem & system, bool uses_wall_clock, IKernel
     m_process(process),
     m_coreIndex(core_index)
 {
+    // Compilation and CPU-run boundaries keep device deadlines in guest time,
+    // independently of the optional HLE service CPU-cost accounting.
+    m_track_guest_clock = m_uses_wall_clock;
     m_jit = MakeJit(process);
     ScopedJitExecution::RegisterHandler();
 }
@@ -305,6 +373,7 @@ std::shared_ptr<Dynarmic::A64::Jit> ArmDynarmic64::MakeJit(IKernelProcess & proc
     // Timing
     config.wall_clock_cntpct = m_uses_wall_clock;
     config.enable_cycle_counting = !m_uses_wall_clock;
+    config.notify_compilation = m_track_guest_clock;
 
     // Code cache size
 #if defined(_M_ARM64) || defined(ARCHITECTURE_arm64)
@@ -314,14 +383,16 @@ std::shared_ptr<Dynarmic::A64::Jit> ArmDynarmic64::MakeJit(IKernelProcess & proc
 #endif
 
     // Allow memory fault handling to work
-    if (m_system.DebuggerEnabled())
-    {
-        config.check_halt_on_memory_access = true;
-    }
+    config.check_halt_on_memory_access = m_cb->m_check_memory_access;
+
+#if !defined(NDEBUG)
+    config.optimizations &= ~Dynarmic::OptimizationFlag::DisableVerification;
+#endif
 
     // Safe optimizations
     if (cpuSettings.cpu_debug_mode)
     {
+        config.optimizations &= ~Dynarmic::OptimizationFlag::DisableVerification;
         if (!cpuSettings.cpuopt_page_tables)
         {
             config.page_table = nullptr;
@@ -366,10 +437,6 @@ std::shared_ptr<Dynarmic::A64::Jit> ArmDynarmic64::MakeJit(IKernelProcess & proc
         if (!cpuSettings.cpuopt_recompile_exclusives)
         {
             config.recompile_on_exclusive_fastmem_failure = false;
-        }
-        if (!cpuSettings.cpuopt_ignore_memory_aborts)
-        {
-            config.check_halt_on_memory_access = true;
         }
     }
     else
@@ -434,15 +501,30 @@ CpuHaltReason ArmDynarmic64::RunThread(IKernelThread * thread)
     ScopedJitExecution sj(thread->GetOwnerProcess());
 
     m_jit->ClearExclusiveState();
-    return TranslateHaltReason(m_jit->Run());
+    const auto result = [&] {
+        if (m_track_guest_clock) m_system.Timing().BeginCpuRun(m_coreIndex);
+        SCOPE_EXIT {
+            if (m_track_guest_clock) m_system.Timing().EndCpuRun(m_coreIndex);
+        };
+        return m_jit->Run();
+    }();
+    return TranslateHaltReason(result);
 }
+
 
 CpuHaltReason ArmDynarmic64::StepThread(IKernelThread * thread)
 {
     ScopedJitExecution sj(thread->GetOwnerProcess());
 
     m_jit->ClearExclusiveState();
-    return TranslateHaltReason(m_jit->Step());
+    const auto result = [&] {
+        if (m_track_guest_clock) m_system.Timing().BeginCpuRun(m_coreIndex);
+        SCOPE_EXIT {
+            if (m_track_guest_clock) m_system.Timing().EndCpuRun(m_coreIndex);
+        };
+        return m_jit->Step();
+    }();
+    return TranslateHaltReason(result);
 }
 
 void ArmDynarmic64::LockThread(IKernelThread * /*thread*/)
@@ -552,11 +634,19 @@ void ArmDynarmic64::SignalInterrupt(IKernelThread * /*thread*/)
 
 void ArmDynarmic64::ClearInstructionCache()
 {
+    if (m_cb)
+    {
+        m_cb->InvalidateCodePageCache();
+    }
     m_jit->ClearCache();
 }
 
 void ArmDynarmic64::InvalidateCacheRange(uint64_t addr, uint64_t size)
 {
+    if (m_cb)
+    {
+        m_cb->InvalidateCodePageCacheRange(addr, size);
+    }
     m_jit->InvalidateCacheRange(addr, size);
 }
 
@@ -564,3 +654,15 @@ void ArmDynarmic64::Release()
 {
     delete this;
 }
+
+#if defined(__linux__) && !defined(__ANDROID__)
+ScopedJitExecution::ScopedJitExecution(IKernelProcess * /*process*/)
+{
+}
+
+ScopedJitExecution::~ScopedJitExecution() = default;
+
+void ScopedJitExecution::RegisterHandler()
+{
+}
+#endif

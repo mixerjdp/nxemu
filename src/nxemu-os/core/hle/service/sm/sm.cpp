@@ -1,15 +1,19 @@
 // SPDX-FileCopyrightText: Copyright 2018 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <chrono>
 #include <tuple>
 #include "yuzu_common/yuzu_assert.h"
 #include "yuzu_common/scope_exit.h"
 #include "core/core.h"
 #include "core/hle/kernel/k_client_port.h"
 #include "core/hle/kernel/k_client_session.h"
+#include "core/hle/kernel/k_light_client_session.h"
 #include "core/hle/kernel/k_port.h"
 #include "core/hle/kernel/k_scoped_resource_reservation.h"
 #include "core/hle/kernel/k_server_port.h"
+#include "core/hle/kernel/k_thread.h"
+#include "core/hle/kernel/svc_results.h"
 #include "core/hle/result.h"
 #include "core/hle/service/ipc_helpers.h"
 #include "core/hle/service/server_manager.h"
@@ -25,6 +29,40 @@ constexpr Result ResultNotRegistered(ErrorModule::SM, 7);
 
 ServiceManager::ServiceManager(Kernel::KernelCore& kernel_) : kernel{kernel_} {
     controller_interface = std::make_unique<Controller>(kernel.System());
+}
+
+bool ServiceManager::WaitForRegistration(std::unique_lock<std::mutex>& lk,
+                                         const std::string& name) const {
+    const auto registered = [&] { return registered_services.contains(name); };
+    auto* const thread = Kernel::GetCurrentThreadPointer(kernel);
+    if (thread == nullptr || thread->IsDummyThread()) {
+        // A host thread waits on the host: guest time can stop before the service registers,
+        // and Close must be able to end the wait.
+        ++host_waiters;
+        registration_cv.wait(lk, [&] { return closed || registered(); });
+        if (--host_waiters == 0) {
+            registration_cv.notify_all();
+        }
+        return registered();
+    }
+    // A guest thread must not block its core: sleep, releasing the registry lock so the
+    // registration can proceed.
+    using namespace std::literals::chrono_literals;
+    while (!registered()) {
+        lk.unlock();
+        Kernel::Svc::SleepThread(
+            kernel.System(), std::chrono::duration_cast<std::chrono::nanoseconds>(100ms).count());
+        lk.lock();
+    }
+    return true;
+}
+
+void ServiceManager::Close() {
+    std::unique_lock lk{lock};
+    closed = true;
+    registration_cv.notify_all();
+    // The host threads must have left their wait before what they use goes away.
+    registration_cv.wait(lk, [&] { return host_waiters == 0; });
 }
 
 ServiceManager::~ServiceManager() {
@@ -50,8 +88,10 @@ static Result ValidateServiceName(const std::string& name) {
 }
 
 Result ServiceManager::RegisterService(Kernel::KServerPort** out_server_port, std::string name,
-                                       u32 max_sessions, SessionRequestHandlerFactory handler) {
+                                       s32 max_sessions, SessionRequestHandlerFactory handler,
+                                       bool is_light) {
     R_TRY(ValidateServiceName(name));
+    R_UNLESS(max_sessions > 0, Kernel::ResultOutOfRange);
 
     std::scoped_lock lk{lock};
     if (registered_services.find(name) != registered_services.end()) {
@@ -60,13 +100,15 @@ Result ServiceManager::RegisterService(Kernel::KServerPort** out_server_port, st
     }
 
     auto* port = Kernel::KPort::Create(kernel);
-    port->Initialize(ServerSessionCountMax, false, 0);
+    R_UNLESS(port != nullptr, Kernel::ResultOutOfResource);
+    port->Initialize(max_sessions, is_light, 0);
 
     // Register the port.
     Kernel::KPort::Register(kernel, port);
 
     service_ports.emplace(name, std::addressof(port->GetClientPort()));
     registered_services.emplace(name, handler);
+    registration_cv.notify_all();
     if (deferral_event) {
         deferral_event->Signal();
     }
@@ -126,7 +168,7 @@ void SM::Initialize(HLERequestContext& ctx) {
 }
 
 void SM::GetServiceCmif(HLERequestContext& ctx) {
-    Kernel::KClientSession* client_session{};
+    Kernel::KAutoObject* client_session{};
     auto result = GetServiceImpl(&client_session, ctx);
     if (ctx.GetIsDeferred()) {
         // Don't overwrite the command buffer.
@@ -144,7 +186,7 @@ void SM::GetServiceCmif(HLERequestContext& ctx) {
 }
 
 void SM::GetServiceTipc(HLERequestContext& ctx) {
-    Kernel::KClientSession* client_session{};
+    Kernel::KAutoObject* client_session{};
     auto result = GetServiceImpl(&client_session, ctx);
     if (ctx.GetIsDeferred()) {
         // Don't overwrite the command buffer.
@@ -167,7 +209,7 @@ static std::string PopServiceName(IPC::RequestParser& rp) {
     return result;
 }
 
-Result SM::GetServiceImpl(Kernel::KClientSession** out_client_session, HLERequestContext& ctx) {
+Result SM::GetServiceImpl(Kernel::KAutoObject** out_client_session, HLERequestContext& ctx) {
     if (!ctx.GetManager()->GetIsInitializedForSm()) {
         return Service::SM::ResultInvalidClient;
     }
@@ -189,9 +231,19 @@ Result SM::GetServiceImpl(Kernel::KClientSession** out_client_session, HLEReques
         return Service::SM::ResultNotRegistered;
     }
 
-    // Create a new session.
-    Kernel::KClientSession* session{};
-    if (const auto result = client_port->CreateSession(&session); result.IsError()) {
+    Kernel::KAutoObject* session{};
+    Result result;
+    if (client_port->IsLight()) {
+        Kernel::KLightClientSession* light_session{};
+        result = client_port->CreateLightSession(&light_session);
+        session = light_session;
+    } else {
+        Kernel::KClientSession* regular_session{};
+        result = client_port->CreateSession(&regular_session);
+        session = regular_session;
+    }
+
+    if (result.IsError()) {
         LOG_ERROR(Service_SM, "called service={} -> error 0x{:08X}", name, result.raw);
         return result;
     }
@@ -204,8 +256,8 @@ void SM::RegisterServiceCmif(HLERequestContext& ctx) {
     IPC::RequestParser rp{ctx};
     std::string name(PopServiceName(rp));
 
-    const auto is_light = static_cast<bool>(rp.PopRaw<u32>());
-    const auto max_session_count = rp.PopRaw<u32>();
+    const auto is_light = rp.PopRaw<u8>() != 0;
+    const auto max_session_count = rp.PopRaw<s32>();
 
     this->RegisterServiceImpl(ctx, name, max_session_count, is_light);
 }
@@ -214,20 +266,20 @@ void SM::RegisterServiceTipc(HLERequestContext& ctx) {
     IPC::RequestParser rp{ctx};
     std::string name(PopServiceName(rp));
 
-    const auto max_session_count = rp.PopRaw<u32>();
-    const auto is_light = static_cast<bool>(rp.PopRaw<u32>());
+    const auto max_session_count = rp.PopRaw<s32>();
+    const auto is_light = rp.PopRaw<u8>() != 0;
 
     this->RegisterServiceImpl(ctx, name, max_session_count, is_light);
 }
 
-void SM::RegisterServiceImpl(HLERequestContext& ctx, std::string name, u32 max_session_count,
+void SM::RegisterServiceImpl(HLERequestContext& ctx, std::string name, s32 max_session_count,
                              bool is_light) {
     LOG_DEBUG(Service_SM, "called with name={}, max_session_count={}, is_light={}", name,
               max_session_count, is_light);
 
     Kernel::KServerPort* server_port{};
     if (const auto result = service_manager.RegisterService(std::addressof(server_port), name,
-                                                            max_session_count, nullptr);
+                                                            max_session_count, nullptr, is_light);
         result.IsError()) {
         LOG_ERROR(Service_SM, "failed to register service with error_code={:08X}", result.raw);
         IPC::ResponseBuilder rb{ctx, 2};

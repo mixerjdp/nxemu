@@ -3,11 +3,13 @@
 
 #include "yuzu_common/logging/log.h"
 #include "core/hle/result.h"
+#include "core/hle/kernel/k_process.h"
 #include "core/hle/service/am/am_results.h"
 #include "core/hle/service/am/frontend/applets.h"
 #include "core/hle/service/am/service/self_controller.h"
 #include "core/hle/service/caps/caps_su.h"
 #include "core/hle/service/cmif_serialization.h"
+#include "core/hle/service/lbl/lbl.h"
 #include "core/hle/service/sm/sm.h"
 #include "core/hle/service/vi/vi_results.h"
 
@@ -52,12 +54,12 @@ ISelfController::ISelfController(Core::System& system_, std::shared_ptr<Applet> 
         {63, D<&ISelfController::GetIdleTimeDetectionExtension>, "GetIdleTimeDetectionExtension"},
         {64, nullptr, "SetInputDetectionSourceSet"},
         {65, D<&ISelfController::ReportUserIsActive>, "ReportUserIsActive"},
-        {66, nullptr, "GetCurrentIlluminance"},
-        {67, nullptr, "IsIlluminanceAvailable"},
+        {66, D<&ISelfController::GetCurrentIlluminance>, "GetCurrentIlluminance"},
+        {67, D<&ISelfController::IsIlluminanceAvailable>, "IsIlluminanceAvailable"},
         {68, D<&ISelfController::SetAutoSleepDisabled>, "SetAutoSleepDisabled"},
         {69, D<&ISelfController::IsAutoSleepDisabled>, "IsAutoSleepDisabled"},
         {70, nullptr, "ReportMultimediaError"},
-        {71, nullptr, "GetCurrentIlluminanceEx"},
+        {71, D<&ISelfController::GetCurrentIlluminanceEx>, "GetCurrentIlluminanceEx"},
         {72, D<&ISelfController::SetInputDetectionPolicy>, "SetInputDetectionPolicy"},
         {80, nullptr, "SetWirelessPriorityMode"},
         {90, D<&ISelfController::GetAccumulatedSuspendedTickValue>, "GetAccumulatedSuspendedTickValue"},
@@ -66,15 +68,18 @@ ISelfController::ISelfController(Core::System& system_, std::shared_ptr<Applet> 
         {110, nullptr, "SetApplicationAlbumUserData"},
         {120, D<&ISelfController::SaveCurrentScreenshot>, "SaveCurrentScreenshot"},
         {130, D<&ISelfController::SetRecordVolumeMuted>, "SetRecordVolumeMuted"},
+        {230, D<&ISelfController::Unknown230>, "Unknown230"},
+        {240, D<&ISelfController::Unknown240>, "Unknown240"},
         {1000, nullptr, "GetDebugStorageChannel"},
     };
     // clang-format on
 
     RegisterHandlers(functions);
 
+    auto display_services = DisplayLayerManager::OpenDisplayServices(system);
     std::scoped_lock lk{m_applet->lock};
-    m_applet->display_layer_manager.Initialize(system, m_process, m_applet->applet_id,
-                                               m_applet->library_applet_mode);
+    m_applet->display_layer_manager.Initialize(std::move(display_services), m_process,
+                                               m_applet->applet_id, m_applet->library_applet_mode);
 }
 
 ISelfController::~ISelfController() {
@@ -85,8 +90,7 @@ ISelfController::~ISelfController() {
 Result ISelfController::Exit() {
     LOG_DEBUG(Service_AM, "called");
 
-    // TODO
-    system.Exit();
+    m_process->Terminate();
 
     R_SUCCEED();
 }
@@ -94,7 +98,14 @@ Result ISelfController::Exit() {
 Result ISelfController::LockExit() {
     LOG_DEBUG(Service_AM, "called");
 
-    system.SetExitLocked(true);
+    std::scoped_lock lk{m_applet->lock};
+
+    if (m_applet->lifecycle_manager.GetExitRequested()) {
+        m_process->Terminate();
+    } else {
+        m_applet->exit_locked = true;
+        system.SetExitLocked(true);
+    }
 
     R_SUCCEED();
 }
@@ -102,10 +113,13 @@ Result ISelfController::LockExit() {
 Result ISelfController::UnlockExit() {
     LOG_DEBUG(Service_AM, "called");
 
+    std::scoped_lock lk{m_applet->lock};
+
+    m_applet->exit_locked = false;
     system.SetExitLocked(false);
 
-    if (system.GetExitRequested()) {
-        system.Exit();
+    if (m_applet->lifecycle_manager.GetExitRequested()) {
+        m_process->Terminate();
     }
 
     R_SUCCEED();
@@ -154,7 +168,7 @@ Result ISelfController::SetOperationModeChangedNotification(bool enabled) {
     LOG_INFO(Service_AM, "called, enabled={}", enabled);
 
     std::scoped_lock lk{m_applet->lock};
-    m_applet->operation_mode_changed_notification_enabled = enabled;
+    m_applet->lifecycle_manager.SetOperationModeChangedNotificationEnabled(enabled);
 
     R_SUCCEED();
 }
@@ -163,17 +177,18 @@ Result ISelfController::SetPerformanceModeChangedNotification(bool enabled) {
     LOG_INFO(Service_AM, "called, enabled={}", enabled);
 
     std::scoped_lock lk{m_applet->lock};
-    m_applet->performance_mode_changed_notification_enabled = enabled;
+    m_applet->lifecycle_manager.SetPerformanceModeChangedNotificationEnabled(enabled);
 
     R_SUCCEED();
 }
 
 Result ISelfController::SetFocusHandlingMode(bool notify, bool background, bool suspend) {
-    LOG_WARNING(Service_AM, "(STUBBED) called, notify={} background={} suspend={}", notify,
-                background, suspend);
+    LOG_INFO(Service_AM, "called, notify={} background={} suspend={}", notify, background, suspend);
 
     std::scoped_lock lk{m_applet->lock};
-    m_applet->focus_handling_mode = {notify, background, suspend};
+    m_applet->lifecycle_manager.SetFocusStateChangedNotificationEnabled(notify);
+    m_applet->lifecycle_manager.SetFocusHandlingMode(suspend);
+    m_applet->UpdateSuspensionStateLocked(true);
 
     R_SUCCEED();
 }
@@ -182,7 +197,7 @@ Result ISelfController::SetRestartMessageEnabled(bool enabled) {
     LOG_INFO(Service_AM, "called, enabled={}", enabled);
 
     std::scoped_lock lk{m_applet->lock};
-    m_applet->restart_message_enabled = enabled;
+    m_applet->lifecycle_manager.SetResumeNotificationEnabled(enabled);
 
     R_SUCCEED();
 }
@@ -201,7 +216,8 @@ Result ISelfController::SetOutOfFocusSuspendingEnabled(bool enabled) {
     LOG_INFO(Service_AM, "called, enabled={}", enabled);
 
     std::scoped_lock lk{m_applet->lock};
-    m_applet->out_of_focus_suspension_enabled = enabled;
+    m_applet->lifecycle_manager.SetOutOfFocusSuspendingEnabled(enabled);
+    m_applet->UpdateSuspensionStateLocked(false);
 
     R_SUCCEED();
 }
@@ -301,6 +317,33 @@ Result ISelfController::ReportUserIsActive() {
     R_SUCCEED();
 }
 
+Result ISelfController::GetCurrentIlluminance(Out<f32> out_illuminance) {
+    LOG_DEBUG(Service_AM, "called");
+
+    // HOS forwards this to lbl and ignores over_limit.
+    *out_illuminance = Service::LBL::GetAmbientLightSensorState(system).lux;
+    R_SUCCEED();
+}
+
+Result ISelfController::IsIlluminanceAvailable(Out<bool> out_is_illuminance_available) {
+    LOG_DEBUG(Service_AM, "called");
+
+    // HOS forwards this to lbl.
+    *out_is_illuminance_available = Service::LBL::IsAmbientLightSensorAvailable(system);
+    R_SUCCEED();
+}
+
+Result ISelfController::GetCurrentIlluminanceEx(Out<bool> out_over_limit,
+                                                Out<f32> out_illuminance) {
+    LOG_DEBUG(Service_AM, "called");
+
+    // HOS forwards both values from lbl.
+    const auto state = Service::LBL::GetAmbientLightSensorState(system);
+    *out_over_limit = state.over_limit;
+    *out_illuminance = state.lux;
+    R_SUCCEED();
+}
+
 Result ISelfController::SetAutoSleepDisabled(bool is_auto_sleep_disabled) {
     LOG_DEBUG(Service_AM, "called. is_auto_sleep_disabled={}", is_auto_sleep_disabled);
 
@@ -386,6 +429,20 @@ Result ISelfController::SetRecordVolumeMuted(bool muted) {
 
     std::scoped_lock lk{m_applet->lock};
     m_applet->record_volume_muted = muted;
+
+    R_SUCCEED();
+}
+
+Result ISelfController::Unknown230(u32 in_val, Out<u16> out_val) {
+    LOG_WARNING(Service_AM, "(STUBBED) called, in_val={}", in_val);
+
+    *out_val = 0;
+
+    R_SUCCEED();
+}
+
+Result ISelfController::Unknown240(u32 in_val) {
+    LOG_WARNING(Service_AM, "(STUBBED) called, in_val={}", in_val);
 
     R_SUCCEED();
 }

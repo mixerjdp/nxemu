@@ -12,6 +12,7 @@
 #include "dynarmic/common/cast_util.h"
 #include "dynarmic/common/fp/fpcr.h"
 #include "dynarmic/interface/exclusive_monitor.h"
+#include <mcl/scope_exit.hpp>
 
 namespace Dynarmic::Backend::Arm64 {
 
@@ -60,9 +61,25 @@ CodePtr AddressSpace::GetOrEmit(IR::LocationDescriptor descriptor) {
         return block_entry;
     }
 
+    NotifyCompilation(true);
+    SCOPE_EXIT { NotifyCompilation(false); };
     IR::Block ir_block = GenerateIR(descriptor);
     const EmittedBlockInfo block_info = Emit(std::move(ir_block));
     return block_info.entry_point;
+}
+
+CodePtr AddressSpace::GetOrEmitWhileRunning(IR::LocationDescriptor descriptor, StackLayout& stack_layout) {
+    const u64 generation = cache_generation;
+    const CodePtr entry_point = GetOrEmit(descriptor);
+
+    if (generation != cache_generation) {
+        // The return stack buffer of the running frame still points into the code that was cleared.
+        for (RSBEntry& entry : stack_layout.rsb) {
+            entry.code_ptr = mcl::bit_cast<u64>(prelude_info.return_to_dispatcher);
+        }
+    }
+
+    return entry_point;
 }
 
 void AddressSpace::InvalidateBasicBlocks(const tsl::robin_set<IR::LocationDescriptor>& descriptors) {
@@ -85,6 +102,7 @@ void AddressSpace::InvalidateBasicBlocks(const tsl::robin_set<IR::LocationDescri
 }
 
 void AddressSpace::ClearCache() {
+    cache_generation++;
     block_entries.clear();
     reverse_block_entries.clear();
     block_infos.clear();

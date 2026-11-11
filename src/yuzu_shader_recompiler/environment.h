@@ -4,6 +4,7 @@
 #pragma once
 
 #include <array>
+#include <optional>
 
 #include "yuzu_common/common_types.h"
 #include "yuzu_shader_recompiler/program_header.h"
@@ -12,6 +13,16 @@
 
 namespace Shader {
 
+enum class TextureQueryKind { Type, Format, Integer };
+
+/// Sizes of the bound texture (TIC) and sampler (TSC) tables.
+struct TexturePoolInfo {
+    u32 num_textures{};
+    u32 num_samplers{};
+    /// The sampler is selected by the texture index instead of the handle's sampler field.
+    bool linked_samplers{};
+};
+
 class Environment {
 public:
     virtual ~Environment() = default;
@@ -19,6 +30,41 @@ public:
     [[nodiscard]] virtual u64 ReadInstruction(u32 address) = 0;
 
     [[nodiscard]] virtual u32 ReadCbufValue(u32 cbuf_index, u32 cbuf_offset) = 0;
+
+    // Preserve the source of a handle used only to classify a texture. Literal
+    // constant folding and branch-table reads still use ReadCbufValue directly.
+    [[nodiscard]] u32 ResolveTextureHandle(const TextureHandleSource& source) {
+        const u32 primary = (ReadCbufValue(source.cbuf_index, source.cbuf_offset)
+                             << source.shift_left) & source.mask;
+        const u32 secondary = source.has_secondary
+            ? ((ReadCbufValue(source.secondary_cbuf_index, source.secondary_cbuf_offset)
+                << source.secondary_shift_left) & source.secondary_mask)
+            : 0;
+        return primary | secondary | source.handle_or_bits;
+    }
+    [[nodiscard]] virtual u32 ReadTextureQuery(const TextureHandleSource& source, TextureQueryKind kind) {
+        return QueryTextureHandle(ResolveTextureHandle(source), kind);
+    }
+    [[nodiscard]] u32 QueryTextureHandle(u32 handle, TextureQueryKind kind) {
+        switch (kind) {
+        case TextureQueryKind::Type: return static_cast<u32>(ReadTextureType(handle));
+        case TextureQueryKind::Format: return static_cast<u32>(ReadTexturePixelFormat(handle));
+        case TextureQueryKind::Integer: return IsTexturePixelFormatInteger(handle);
+        }
+        return 0;
+    }
+
+    // Zero means this environment cannot provide the bound size (e.g. an old cache).
+    [[nodiscard]] virtual u32 ReadCbufSize([[maybe_unused]] u32 cbuf_index) { return 0; }
+
+    // Number of entries in the compute TIC table. Zero means unavailable.
+    [[nodiscard]] virtual u32 ReadTextureTableSize() { return 0; }
+
+    // Tables indexed by texture handles that are only known when the shader runs.
+    // Empty means this environment cannot provide them.
+    [[nodiscard]] virtual std::optional<TexturePoolInfo> ReadTexturePoolInfo() {
+        return std::nullopt;
+    }
 
     [[nodiscard]] virtual TextureType ReadTextureType(u32 raw_handle) = 0;
 

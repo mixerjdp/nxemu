@@ -10,6 +10,8 @@
 #include <memory>
 #include <optional>
 #include <span>
+#include <string>
+#include <string_view>
 #include <type_traits>
 #include <unordered_map>
 #include <vector>
@@ -19,12 +21,23 @@
 #include "yuzu_common/unique_function.h"
 #include "yuzu_shader_recompiler/environment.h"
 #include "yuzu_video_core/engines/maxwell_3d.h"
+#include "yuzu_video_core/snapshot_memory_budget.h"
+#include "yuzu_video_core/shader_profile_reuse.h"
+#include "yuzu_video_core/shader_profile_candidate_budget.h"
+#include "yuzu_video_core/shared_shader_bytes.h"
 
 namespace Tegra {
 class Memorymanager;
 }
 
 namespace VideoCommon {
+
+/// Bit of the size dependency mask set by shaders specialized on the texture pool sizes.
+inline constexpr u32 TEXTURE_POOL_SIZE_BIT = 1U << 31;
+
+/// Sizes of the graphics texture and sampler tables indexed by runtime handles.
+[[nodiscard]] Shader::TexturePoolInfo GraphicsTexturePoolInfo(
+    const Tegra::Engines::Maxwell3D::Regs& regs);
 
 class GenericEnvironment : public Shader::Environment {
 public:
@@ -48,6 +61,14 @@ public:
 
     void SetCachedSize(size_t size_bytes);
 
+    void SetCachedCode(std::shared_ptr<const std::vector<u64>> code_, size_t size_bytes);
+
+    std::shared_ptr<const std::vector<u64>> ShareCachedCode(size_t size_bytes);
+
+    void SetQueryRecording(bool enabled) noexcept { recording_queries=enabled; }
+
+    [[nodiscard]] const std::shared_ptr<const std::vector<u64>>& CachedProgram() const noexcept { return shared_code; }
+
     [[nodiscard]] size_t CachedSizeWords() const noexcept;
 
     [[nodiscard]] size_t CachedSizeBytes() const noexcept;
@@ -60,22 +81,35 @@ public:
 
     void Dump(u64 pipeline_hash, u64 shader_hash) override;
 
-    void Serialize(std::ofstream& file) const;
+    void Serialize(std::ostream& file) const;
 
     bool HasHLEMacroState() const override {
         return has_hle_engine_state;
     }
 
+    bool HasCbufReplacements() const noexcept {
+        return !cbuf_replacements.empty();
+    }
+
+    // Banks whose bound sizes were actually queried during shader translation.
+    [[nodiscard]] u32 CbufSizeMask() const noexcept;
+
 protected:
+    std::span<const u64> Code() const noexcept {
+        return shared_code ? std::span<const u64>(*shared_code) : std::span<const u64>(code);
+    }
     std::optional<u64> TryFindSize();
 
-    Tegra::Texture::TICEntry ReadTextureInfo(GPUVAddr tic_addr, u32 tic_limit,
-                                             bool via_header_index, u32 raw);
+    /// Returns std::nullopt when the handle points outside of the texture table, which the
+    /// texture cache binds as a null image view.
+    std::optional<Tegra::Texture::TICEntry> ReadTextureInfo(GPUVAddr tic_addr, u32 tic_limit,
+                                                            bool via_header_index, u32 raw);
 
     Tegra::MemoryManager* gpu_memory{};
     GPUVAddr program_base{};
 
     std::vector<u64> code;
+    std::shared_ptr<const std::vector<u64>> shared_code;
     std::unordered_map<u32, Shader::TextureType> texture_types;
     std::unordered_map<u32, Shader::TexturePixelFormat> texture_pixel_formats;
     std::unordered_map<u64, u32> cbuf_values;
@@ -97,19 +131,64 @@ protected:
 
     bool has_unbound_instructions = false;
     bool has_hle_engine_state = false;
+    bool frozen = false;
+    bool recording_queries = true;
 };
 
 class GraphicsEnvironment final : public GenericEnvironment {
 public:
+    struct Snapshot {
+        struct ConstantBuffer {
+            size_t data_offset{};
+            u32 size{};
+            bool enabled{};
+        };
+
+        std::array<std::array<ConstantBuffer, Tegra::Engines::Maxwell3D::Regs::MaxConstBuffers>,
+                   Tegra::Engines::Maxwell3D::Regs::MaxShaderStage>
+            constant_buffers{};
+        std::vector<u8> constant_buffer_data;
+        // Shared between snapshots while the guest descriptor table is unchanged.
+        std::shared_ptr<const std::vector<Tegra::Texture::TICEntry>> texture_descriptors;
+        std::unordered_map<u64, Shader::ReplaceConstant> cbuf_replacements;
+        Shader::TexturePoolInfo texture_pool{};
+        u32 texture_limit{};
+        u32 viewport_transform_state{1};
+        bool via_header_index{};
+    };
+
     explicit GraphicsEnvironment() = default;
     explicit GraphicsEnvironment(Tegra::Engines::Maxwell3D& maxwell3d_,
                                  Tegra::MemoryManager& gpu_memory_,
                                  Tegra::Engines::Maxwell3D::Regs::ShaderType program,
-                                 GPUVAddr program_base_, u32 start_address_);
+                                 GPUVAddr program_base_, u32 start_address_,
+                                 std::shared_ptr<const std::vector<u64>> cached_code = {},
+                                 size_t cached_size = 0);
 
     ~GraphicsEnvironment() override = default;
 
+    // Reuses the texture descriptor copy of the previous capture when the guest
+    // table did not change. Only accessed by the thread that captures snapshots.
+    struct SnapshotCache {
+        SnapshotMemoryBudget memory{64 * 1024 * 1024};
+        GPUVAddr texture_address{};
+        std::shared_ptr<const std::vector<Tegra::Texture::TICEntry>> texture_descriptors;
+    };
+
+    // Returns null when the bounded snapshot budget cannot accommodate the capture.
+    [[nodiscard]] static std::shared_ptr<const Snapshot> CaptureSnapshot(
+        Tegra::Engines::Maxwell3D& maxwell3d, Tegra::MemoryManager& gpu_memory,
+        u32 active_stage_mask, SnapshotCache& cache);
+
+    void SetSnapshot(std::shared_ptr<const Snapshot> snapshot_);
+
+    void ReleaseSnapshot();
+
     u32 ReadCbufValue(u32 cbuf_index, u32 cbuf_offset) override;
+
+    u32 ReadCbufSize(u32 cbuf_index) override;
+
+    std::optional<Shader::TexturePoolInfo> ReadTexturePoolInfo() override;
 
     Shader::TextureType ReadTextureType(u32 handle) override;
 
@@ -122,7 +201,10 @@ public:
     std::optional<Shader::ReplaceConstant> GetReplaceConstBuffer(u32 bank, u32 offset) override;
 
 private:
+    [[nodiscard]] std::optional<Tegra::Texture::TICEntry> ReadSnapshotTextureInfo(u32 raw) const;
+
     Tegra::Engines::Maxwell3D* maxwell3d{};
+    std::shared_ptr<const Snapshot> snapshot;
     size_t stage_index{};
 };
 
@@ -136,6 +218,10 @@ public:
     ~ComputeEnvironment() override = default;
 
     u32 ReadCbufValue(u32 cbuf_index, u32 cbuf_offset) override;
+
+    u32 ReadCbufSize(u32 cbuf_index) override;
+
+    u32 ReadTextureTableSize() override;
 
     Shader::TextureType ReadTextureType(u32 handle) override;
 
@@ -163,13 +249,79 @@ public:
     FileEnvironment(FileEnvironment&&) noexcept = default;
 
     FileEnvironment& operator=(const FileEnvironment&) = delete;
-    FileEnvironment(const FileEnvironment&) = delete;
+    [[nodiscard]] FileEnvironment CloneForDiagnostic() const { return FileEnvironment(*this); }
+    [[nodiscard]] const std::string& CompilationIdentity() const noexcept { return compilation_identity; }
+    [[nodiscard]] size_t SharedCodeBytes() const noexcept { return code ? code->size() * sizeof(u64) : 0; }
 
-    void Deserialize(std::ifstream& file);
+    void Deserialize(std::istream& file, std::shared_ptr<const std::vector<u64>> shared_program = {},
+                     std::string_view program_fingerprint = {});
+    [[nodiscard]] std::shared_ptr<const std::vector<u64>> ProgramStorage() const noexcept { return code; }
+
+    void BeginReuseProof(bool hle) {
+        reuse_hle=hle;reuse_proof_complete=false;reuse_viewport_queried=false;reuse_missing_pool=false;
+        replacement_queries.clear();
+        semantic_textures = {};
+    }
+    [[nodiscard]] u32 ReadTextureQuery(const Shader::TextureHandleSource& source,
+                                     Shader::TextureQueryKind kind) override;
+    // No instruction reads occur after synchronous pipeline preparation.
+    void SealReuseProof(bool relative_safe) noexcept {
+        reuse_relative_safe=relative_safe;reuse_proof_complete=true;code.reset();
+    }
+    [[nodiscard]] const std::string& ProgramDigest() const noexcept { return program_digest; }
+    [[nodiscard]] size_t ProgramBytes() const noexcept { return program_bytes; }
+    [[nodiscard]] bool HasReusableProgramLayout() const noexcept {
+        return program_bytes && read_lowest==start_address && read_highest>=read_lowest &&
+               u64{read_highest}-read_lowest+sizeof(u64)==program_bytes;
+    }
+    [[nodiscard]] bool ReusableAt(u32 target) const noexcept {
+        return reuse_proof_complete && reuse_relative_safe && start_address%32==target%32 &&
+               program_bytes<=UINT32_MAX-target;
+    }
+    [[nodiscard]] size_t ReuseProofBytes() const noexcept { return (replacement_queries.size()+semantic_textures.Units()+ShaderProfile::CandidateWarmupBudget::BaseProofUnits)*ShaderProfile::CandidateWarmupBudget::ProofUnitBytes; }
+    [[nodiscard]] ShaderProfile::DependencyProof ReuseProof() const noexcept {
+        return {stage,start_address,local_memory_size,shared_memory_size,texture_bound,
+            viewport_transform_state,workgroup_size,sph,gp_passthrough_mask,
+            texture_types,texture_pixel_formats,cbuf_values,cbuf_replacements,
+            &replacement_queries,reuse_proof_complete,reuse_hle.value_or(false),reuse_viewport_queried,reuse_missing_pool,&semantic_textures};
+    }
+
+    // A shared host key does not prove that compilation inputs are equivalent.
+    [[nodiscard]] bool HasSameCompilationInputs(const FileEnvironment& other) const noexcept;
+    [[nodiscard]] size_t CompilationInputBytes() const noexcept;
+    [[nodiscard]] bool HasCapturedCbufBank(u32 bank) const noexcept {
+        return std::ranges::any_of(cbuf_values,[bank](const auto& entry) {
+            return entry.first>>32==bank && static_cast<u32>(entry.first)!=UINT32_MAX;
+        });
+    }
+    [[nodiscard]] u32 CompilationDifferenceMask(const FileEnvironment& other) const noexcept;
+
+    // Records which questions the next translation asks (TakeQuestions). hle: translate as for an HLE macro
+    // draw, asking about every constant buffer replacement.
+    void TrackQuestions(bool hle = false) { asked.emplace(); asked->hle = hle; }
+    [[nodiscard]] std::optional<ShaderProfile::AskedQuestions> TakeQuestions() { return std::exchange(asked, std::nullopt); }
+    // A synthetic environment's questions answered by a live draw: the constant buffer reads its translation
+    // asked, the texture queries of the handles those reads return there, and the draw's own state. Empty,
+    // with the reason in mismatch, when an answer differs in a way the translated code depends on.
+    // relocatable: the program runs unchanged at the live start address. The answered environment holds the
+    // asked questions only, as a recorded one does.
+    [[nodiscard]] std::optional<FileEnvironment> AnswerLive(Shader::Environment& live, bool relocatable,
+                                                            const ShaderProfile::AskedQuestions& questions,
+                                                            const char*& mismatch) const;
+    // The stored form GenericEnvironment::Serialize writes, which Deserialize reads.
+    void Serialize(std::ostream& file) const;
 
     [[nodiscard]] u64 ReadInstruction(u32 address) override;
 
     [[nodiscard]] u32 ReadCbufValue(u32 cbuf_index, u32 cbuf_offset) override;
+
+    [[nodiscard]] u32 ReadCbufSize(u32 cbuf_index) override;
+
+    [[nodiscard]] u32 ReadTextureTableSize() override;
+
+    [[nodiscard]] std::optional<Shader::TexturePoolInfo> ReadTexturePoolInfo() override;
+
+    [[nodiscard]] u32 CbufSizeMask() const noexcept;
 
     [[nodiscard]] Shader::TextureType ReadTextureType(u32 handle) override;
 
@@ -191,13 +343,22 @@ public:
                                                                                u32 offset) override;
 
     [[nodiscard]] bool HasHLEMacroState() const override {
-        return cbuf_replacements.size() != 0;
+        return reuse_hle.value_or((asked && asked->hle) || !cbuf_replacements.empty());
     }
 
     void Dump(u64 pipeline_hash, u64 shader_hash) override;
 
 private:
-    std::vector<u64> code;
+    FileEnvironment(const FileEnvironment&) = default;
+    std::shared_ptr<const std::vector<u64>> code;
+    std::string compilation_identity,program_digest;
+    size_t program_bytes{};
+    std::optional<bool> reuse_hle;
+    std::optional<ShaderProfile::AskedQuestions> asked;
+    bool asking_texture{};
+    bool reuse_proof_complete{},reuse_viewport_queried{},reuse_relative_safe{},reuse_missing_pool{};
+    std::unordered_map<u64,std::optional<Shader::ReplaceConstant>> replacement_queries;
+    ShaderProfile::SemanticTextureProof semantic_textures;
     std::unordered_map<u32, Shader::TextureType> texture_types;
     std::unordered_map<u32, Shader::TexturePixelFormat> texture_pixel_formats;
     std::unordered_map<u64, u32> cbuf_values;
@@ -212,21 +373,75 @@ private:
     u32 viewport_transform_state = 1;
 };
 
+// A cached environment kept in its stored form until its pipeline is built. Startup
+// holds every record at once; decoded environments would copy their query maps per
+// pipeline. Copies share the stored bytes and the facts the loader needs.
+class StoredEnvironment {
+public:
+    StoredEnvironment() = default;
+    // Validates the bytes with a full decode. A known program_digest skips hashing the program.
+    static StoredEnvironment Decode(SharedShaderBytes bytes, std::string_view program_digest = {});
+    [[nodiscard]] FileEnvironment Expand() const;
+
+    [[nodiscard]] Shader::Stage ShaderStage() const noexcept { return parts->stage; }
+    [[nodiscard]] const Shader::ProgramHeader& SPH() const noexcept { return parts->sph; }
+    [[nodiscard]] u32 CbufSizeMask() const noexcept { return parts->cbuf_size_mask; }
+    [[nodiscard]] bool HasHLEMacroState() const noexcept { return parts->hle; }
+    [[nodiscard]] const std::string& CompilationIdentity() const noexcept { return parts->compilation_identity; }
+    [[nodiscard]] bool HasSameCompilationInputs(const StoredEnvironment& other) const noexcept {
+        return parts == other.parts || parts->compilation_identity == other.parts->compilation_identity;
+    }
+    // What the decoded environment would hold, for diagnostic size limits.
+    [[nodiscard]] size_t CompilationInputBytes() const noexcept { return parts->decoded_bytes; }
+    // What a decoded copy still holds once its reuse proof is sealed and its program released.
+    [[nodiscard]] size_t SealedBytes() const noexcept { return parts->sealed_bytes; }
+    // Bytes retained by this environment and by its program, which other environments can share.
+    [[nodiscard]] const void* Identity() const noexcept { return parts.get(); }
+    [[nodiscard]] size_t RetainedBytes() const noexcept;
+    [[nodiscard]] const void* ProgramIdentity() const noexcept { return parts->bytes.ProgramIdentity(); }
+    [[nodiscard]] size_t ProgramBytes() const noexcept {
+        return ProgramIdentity() ? parts->bytes.ProgramBytes().size() : 0;
+    }
+
+private:
+    struct Parts {
+        SharedShaderBytes bytes;
+        std::string program_digest, compilation_identity;
+        Shader::ProgramHeader sph{};
+        Shader::Stage stage{};
+        u32 cbuf_size_mask{};
+        size_t decoded_bytes{}, sealed_bytes{};
+        bool hle{};
+    };
+    std::shared_ptr<const Parts> parts;
+};
+
 void SerializePipeline(std::span<const char> key, std::span<const GenericEnvironment* const> envs,
-                       const std::filesystem::path& filename, u32 cache_version);
+                       const std::filesystem::path& filename, u32 cache_version, std::string_view context = {});
 
 template <typename Key, typename Envs>
 void SerializePipeline(const Key& key, const Envs& envs, const std::filesystem::path& filename,
-                       u32 cache_version) {
+                       u32 cache_version, std::string_view context = {}) {
     static_assert(std::is_trivially_copyable_v<Key>);
     static_assert(std::has_unique_object_representations_v<Key>);
     SerializePipeline(std::span(reinterpret_cast<const char*>(&key), sizeof(key)),
-                      std::span(envs.data(), envs.size()), filename, cache_version);
+                      std::span(envs.data(), envs.size()), filename, cache_version, context);
 }
 
+/// Copies every record of a legacy single-file cache into a local store, associated with
+/// context. Already stored records are deduplicated, so an interrupted migration can be
+/// repeated. Returns true once the whole legacy file was read; a torn or invalid legacy
+/// tail ends it like the legacy loader did.
+bool MigrateLegacyPipelines(std::stop_token stop_loading, const std::filesystem::path& legacy,
+                            const std::filesystem::path& store, u32 cache_version,
+                            size_t compute_key_size, size_t graphics_key_size,
+                            std::string_view context, size_t& migrated);
+
+/// Loads the pipelines of a cache file. The callbacks return false for a record that is not
+/// needed, such as a duplicate of an earlier one, and the file is rewritten without them.
 void LoadPipelines(
     std::stop_token stop_loading, const std::filesystem::path& filename, u32 expected_cache_version,
-    Common::UniqueFunction<void, std::ifstream&, FileEnvironment> load_compute,
-    Common::UniqueFunction<void, std::ifstream&, std::vector<FileEnvironment>> load_graphics);
+    Common::UniqueFunction<bool, std::istream&, FileEnvironment> load_compute,
+    Common::UniqueFunction<bool, std::istream&, std::vector<FileEnvironment>> load_graphics);
 
 } // namespace VideoCommon

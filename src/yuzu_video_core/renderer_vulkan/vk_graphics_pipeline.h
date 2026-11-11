@@ -7,13 +7,25 @@
 #include <array>
 #include <atomic>
 #include <condition_variable>
+#include <memory>
 #include <mutex>
+#include <optional>
+#include <span>
+#include <tuple>
 #include <type_traits>
+#include <utility>
+#include <vector>
 
-#include "yuzu_common/thread_worker.h"
+#include <boost/container/small_vector.hpp>
+#include <boost/container/static_vector.hpp>
+
+#include "yuzu_video_core/renderer_vulkan/native_pipeline_build_queue.h"
+#include "yuzu_shader_recompiler/backend/spirv/emit_spirv.h"
 #include "yuzu_shader_recompiler/shader_info.h"
+#include "yuzu_shader_recompiler/vtg_as_compute.h"
 #include "yuzu_video_core/engines/maxwell_3d.h"
 #include "yuzu_video_core/renderer_vulkan/fixed_pipeline_state.h"
+#include "yuzu_video_core/renderer_vulkan/descriptor_lookup.h"
 #include "yuzu_video_core/renderer_vulkan/vk_buffer_cache.h"
 #include "yuzu_video_core/renderer_vulkan/vk_descriptor_pool.h"
 #include "yuzu_video_core/renderer_vulkan/vk_texture_cache.h"
@@ -27,6 +39,9 @@ namespace Vulkan {
 
 struct GraphicsPipelineCacheKey {
     std::array<u64, 6> unique_hashes;
+    std::array<std::array<u32, 18>, 5> cbuf_sizes;
+    /// Texture and sampler table sizes, zero unless a shader indexes them with runtime handles
+    std::array<u32, 2> texture_pool;
     FixedPipelineState state;
 
     size_t Hash() const noexcept;
@@ -38,7 +53,7 @@ struct GraphicsPipelineCacheKey {
     }
 
     size_t Size() const noexcept {
-        return sizeof(unique_hashes) + state.Size();
+        return sizeof(unique_hashes) + sizeof(cbuf_sizes) + sizeof(texture_pool) + state.Size();
     }
 };
 static_assert(std::has_unique_object_representations_v<GraphicsPipelineCacheKey>);
@@ -65,6 +80,56 @@ class RescalingPushConstant;
 class RenderAreaPushConstant;
 class Scheduler;
 
+class StagingBufferPool;
+class VtgIndirectPass;
+
+/// Memory for the buffers shared between the stages of the draws running as compute
+class VtgScratchAllocator {
+public:
+    explicit VtgScratchAllocator(const Device& device, Scheduler& scheduler,
+                                 StagingBufferPool& staging_pool);
+
+    /// Returns a buffer and the offset of a region that lives until the tick following the
+    /// current one completes
+    [[nodiscard]] std::pair<VkBuffer, VkDeviceSize> Allocate(VkDeviceSize size);
+
+private:
+    Scheduler& scheduler;
+    StagingBufferPool& staging_pool;
+    VkDeviceSize alignment;
+    std::vector<StagingBufferRef> chunks;
+    VkBuffer buffer{};
+    VkDeviceSize base{};
+    VkDeviceSize capacity{};
+    VkDeviceSize used{};
+    u64 tick{};
+};
+
+/// Vertex and geometry stages of a pipeline running as compute before the draw
+struct VtgPipelineInfo {
+    static constexpr size_t VERTEX = 0;
+    static constexpr size_t GEOMETRY = 1;
+    static constexpr size_t NUM_COMPUTE_STAGES = 2;
+
+    std::array<vk::ShaderModule, NUM_COMPUTE_STAGES> modules;
+    /// Shader information of each stage, including the storage buffers added to it
+    std::array<Shader::Info, NUM_COMPUTE_STAGES> infos;
+    Shader::VtgVertexBindings vertex_bindings;
+    Shader::VtgGeometryBindings geometry_bindings;
+    Shader::VtgTopology topology{};
+    /// Words of a vertex written by each stage
+    u32 vertex_stride{};
+    u32 geometry_stride{};
+    VtgScratchAllocator* scratch{};
+    StagingBufferPool* staging_pool{};
+    /// Prepares draws whose arguments the guest GPU wrote
+    VtgIndirectPass* indirect_pass{};
+    /// Only the vertex stage runs as compute, to write what transform feedback captures on hosts
+    /// without it. The pipeline draws with its own shaders.
+    bool is_transform_feedback{};
+    Shader::VtgTransformFeedback transform_feedback;
+};
+
 class GraphicsPipeline {
     static constexpr size_t NUM_STAGES = Tegra::Engines::Maxwell3D::Regs::MaxShaderStage;
 
@@ -73,10 +138,12 @@ public:
         Scheduler& scheduler, BufferCache& buffer_cache, TextureCache& texture_cache,
         vk::PipelineCache& pipeline_cache, VideoCore::ShaderNotify* shader_notify,
         const Device& device, DescriptorPool& descriptor_pool,
-        GuestDescriptorQueue& guest_descriptor_queue, Common::ThreadWorker* worker_thread,
+        GuestDescriptorQueue& guest_descriptor_queue, NativePipelineBuildQueue* worker_thread,
         PipelineStatistics* pipeline_statistics, RenderPassCache& render_pass_cache,
         const GraphicsPipelineCacheKey& key, std::array<vk::ShaderModule, NUM_STAGES> stages,
-        const std::array<const Shader::Info*, NUM_STAGES>& infos);
+        const std::array<const Shader::Info*, NUM_STAGES>& infos, bool rasterizes_lines,
+        std::unique_ptr<VtgPipelineInfo> vtg_info = nullptr, bool urgent_build = false);
+    ~GraphicsPipeline();
 
     GraphicsPipeline& operator=(GraphicsPipeline&&) noexcept = delete;
     GraphicsPipeline(GraphicsPipeline&&) noexcept = delete;
@@ -84,29 +151,101 @@ public:
     GraphicsPipeline& operator=(const GraphicsPipeline&) = delete;
     GraphicsPipeline(const GraphicsPipeline&) = delete;
 
-    void AddTransition(GraphicsPipeline* transition);
+    void AddTransition(GraphicsPipeline* transition, const GraphicsPipelineCacheKey& transition_key);
 
-    void Configure(bool is_indexed) {
-        configure_func(this, is_indexed);
+    /// Registers the other key served by this pipeline, so both stay on the fast path of Next.
+    void SetSharedKey(const GraphicsPipelineCacheKey& shared_key_) noexcept {
+        shared_key = shared_key_;
+        has_shared_key = true;
+        shared_recipe_prefix = 0;
     }
 
-    [[nodiscard]] GraphicsPipeline* Next(const GraphicsPipelineCacheKey& current_key) noexcept {
+    void Configure(bool is_indexed);
+
+    /// recipe_prefix: the recipe recorder's memo for the matched key, valid until the next call.
+    [[nodiscard]] GraphicsPipeline* Next(const GraphicsPipelineCacheKey& current_key,
+                                         u64*& recipe_prefix) noexcept {
         if (key == current_key) {
+            recipe_prefix = &key_recipe_prefix;
+            return this;
+        }
+        if (has_shared_key && shared_key == current_key) {
+            recipe_prefix = &shared_recipe_prefix;
             return this;
         }
         const auto it{std::find(transition_keys.begin(), transition_keys.end(), current_key)};
-        return it != transition_keys.end() ? transitions[std::distance(transition_keys.begin(), it)]
-                                           : nullptr;
+        if (it == transition_keys.end()) {
+            return nullptr;
+        }
+        const auto index{std::distance(transition_keys.begin(), it)};
+        recipe_prefix = &transition_recipe_prefixes[index];
+        return transitions[index];
     }
 
+    /// Helps build a queued pipeline if the shared compiler limit has a free slot
+    void BuildIfQueued();
+
     [[nodiscard]] bool IsBuilt() const noexcept {
-        return is_built.load(std::memory_order::relaxed);
+        return is_built.load(std::memory_order_acquire);
+    }
+
+    [[nodiscard]] bool IsFailed() const noexcept {
+        return build_complete.load(std::memory_order_acquire) && !IsBuilt();
+    }
+
+    [[nodiscard]] VkPipelineStageFlags ImageWriteStages() const noexcept {
+        return image_write_stages;
     }
 
     template <typename Spec>
     static auto MakeConfigureSpecFunc() {
         return [](GraphicsPipeline* pl, bool is_indexed) { pl->ConfigureImpl<Spec>(is_indexed); };
     }
+
+    /// Whether a pipeline of this key takes its topology from the draw: list and strip topologies
+    /// of the same class then translate to the same pipeline, so a draw can use the pipeline of
+    /// its twin key (TopologyTwin)
+    [[nodiscard]] static bool UsesDynamicTopology(const GraphicsPipelineCacheKey& key) noexcept;
+
+    /// The key of the same draw with the other topology of its class (list for strip and strip for
+    /// list), for a key that UsesDynamicTopology
+    [[nodiscard]] static GraphicsPipelineCacheKey TopologyTwin(GraphicsPipelineCacheKey key) noexcept;
+
+    /// Returns true when the pipeline takes its topology from the draw
+    [[nodiscard]] bool HasDynamicTopology() const noexcept {
+        return dynamic_topology;
+    }
+
+    /// Returns true when the vertex and geometry stages run as compute before the draw
+    [[nodiscard]] bool IsVtgAsCompute() const noexcept {
+        return vtg != nullptr;
+    }
+
+    /// Returns true when the vertex stage runs as compute to write what transform feedback captures
+    [[nodiscard]] bool IsTransformFeedbackEmulated() const noexcept {
+        return xfb != nullptr;
+    }
+
+    /// Sets the number of instances of the next draw, zero when its vertex stage cannot run as
+    /// compute
+    void SetVtgInstanceCount(u32 instance_count) noexcept;
+
+    /// Returns true when the stages running as compute can take the arguments of a single
+    /// non-indexed draw from GPU memory
+    [[nodiscard]] bool CanDrawVtgIndirect() const noexcept;
+
+    /// Makes the next draw read its arguments from the bound indirect buffer, with the mask the
+    /// guest macro applies to the instance count
+    void SetVtgIndirect(bool indirect, u32 instance_mask) noexcept;
+
+    /// Index buffer, its offset and the number of indices drawing the output of the stages
+    /// running as compute. The count is zero when there is nothing to draw.
+    [[nodiscard]] std::tuple<VkBuffer, VkDeviceSize, u32> VtgDraw() const noexcept;
+
+    /// Indexed indirect command drawing the output of the stages, when the last draw read its
+    /// arguments from GPU memory. The index buffer is the one of VtgDraw.
+    [[nodiscard]] std::optional<std::pair<VkBuffer, VkDeviceSize>> VtgIndirectDraw()
+        const noexcept;
 
     void SetEngine(Tegra::Engines::Maxwell3D* maxwell3d_, Tegra::MemoryManager* gpu_memory_) {
         maxwell3d = maxwell3d_;
@@ -117,14 +256,34 @@ private:
     template <typename Spec>
     void ConfigureImpl(bool is_indexed);
 
+    void ConfigureVtg(bool is_indexed);
+
+    /// Runs the vertex stage as compute to write what transform feedback captures
+    void ConfigureTransformFeedback(bool is_indexed);
+
+    /// Returns the color attachments the draw writes
+    [[nodiscard]] u32 ColorWriteMask() const;
+
     void ConfigureDraw(const RescalingPushConstant& rescaling,
                        const RenderAreaPushConstant& render_are);
+
+    /// Reads the pixel local textures of the fragment stage from the color attachments they
+    /// sample when the draw allows it, unbinding their views. Returns the shader selectors.
+    u32 SelectAttachmentReads(std::span<VideoCommon::ImageViewInOut> views);
+
+    VkDescriptorSet WorkerDescriptorSet(const void* data, u64 tick);
 
     void MakePipeline(VkRenderPass render_pass);
 
     void Validate();
 
     const GraphicsPipelineCacheKey key;
+    GraphicsPipelineCacheKey shared_key;
+    bool has_shared_key{};
+    // One memo per key this pipeline matches, each tied to that key's words.
+    u64 key_recipe_prefix{};
+    u64 shared_recipe_prefix{};
+    std::vector<u64> transition_recipe_prefixes;
     Tegra::Engines::Maxwell3D* maxwell3d;
     Tegra::MemoryManager* gpu_memory;
     const Device& device;
@@ -142,20 +301,68 @@ private:
     std::array<vk::ShaderModule, NUM_STAGES> spv_modules;
 
     std::array<Shader::Info, NUM_STAGES> stage_infos;
+    std::array<u8, Maxwell::NumVertexAttributes> vertex_attribute_components{};
+    VertexInputMapping vertex_input_mapping;
+    VkPipelineStageFlags image_write_stages{};
     std::array<u32, 5> enabled_uniform_buffer_masks{};
     VideoCommon::UniformBufferSizes uniform_buffer_sizes{};
     u32 num_textures{};
+    u32 num_image_elements{};
+    size_t num_descriptor_entries{};
+
+    // Used only by the GPU thread; queued commands use GuestDescriptorQueue's own copies.
+    boost::container::small_vector<VideoCommon::ImageViewInOut, 64> descriptor_views;
+    boost::container::small_vector<VideoCommon::SamplerId, 64> descriptor_samplers;
+    std::unique_ptr<DrawDescriptorCache<VideoCommon::SamplerId>> sampler_lookup;
+
+    // Pixel local texture reads of the fragment stage in selector order, and their views
+    boost::container::static_vector<Shader::PixelLocalRead, Shader::MAX_PIXEL_LOCAL_READS>
+        attachment_read_kinds;
+    std::array<size_t, Shader::MAX_PIXEL_LOCAL_READS> attachment_read_views{};
+    u32 attachment_reads{Shader::Backend::SPIRV::NO_ATTACHMENT_READS};
 
     vk::DescriptorSetLayout descriptor_set_layout;
     DescriptorAllocator descriptor_allocator;
+
+    // Texture and sampler tables indexed by runtime handles, bound as descriptor set 1.
+    // The set is only written again when its contents change or a new tick starts.
+    bool uses_texture_table{};
+    vk::DescriptorSetLayout texture_table_set_layout;
+    DescriptorAllocator texture_table_allocator;
+    boost::container::small_vector<VkDescriptorSetLayoutBinding, 4> texture_table_bindings;
+    // Used only by the GPU thread
+    std::vector<VkDescriptorImageInfo> texture_table_scratch;
+    std::shared_ptr<const std::vector<VkDescriptorImageInfo>> texture_table_data;
+    u64 texture_table_tick{};
+    u64 texture_table_version{};
+    // Used only by the scheduler worker
+    VkDescriptorSet texture_table_set{};
+    u64 texture_table_set_version{};
+    VkDescriptorSet texture_table_bound_set{};
+
     vk::PipelineLayout pipeline_layout;
     vk::DescriptorUpdateTemplate descriptor_update_template;
+    vk::DescriptorUpdateTemplate small_descriptor_update_template;
+    std::vector<VkDescriptorUpdateTemplateEntry> large_image_entries;
     vk::Pipeline pipeline;
 
     std::condition_variable build_condvar;
     std::mutex build_mutex;
     std::atomic_bool is_built{false};
+    std::atomic_bool build_complete{false};
+    NativePipelineBuildQueue* build_queue{};
+    NativePipelineBuildQueue::Handle queued_build;
     bool uses_push_descriptor{false};
+    const bool rasterizes_lines;
+    bool dynamic_topology{};
+    // Used only by the GPU thread: the topology the last draw set while this pipeline was bound
+    VkPrimitiveTopology bound_topology{};
+
+    struct VtgState;
+    std::unique_ptr<VtgState> vtg;
+
+    struct XfbState;
+    std::unique_ptr<XfbState> xfb;
 };
 
 } // namespace Vulkan

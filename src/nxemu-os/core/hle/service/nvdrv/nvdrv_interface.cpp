@@ -2,6 +2,7 @@
 // SPDX-FileCopyrightText: 2021 Skyline Team and Contributors
 // SPDX-License-Identifier: GPL-3.0-or-later
 
+#include <utility>
 #include "yuzu_common/logging/log.h"
 #include "yuzu_common/nvdata.h"
 #include "yuzu_common/scope_exit.h"
@@ -12,9 +13,21 @@
 #include "core/hle/kernel/k_readable_event.h"
 #include "core/hle/service/ipc_helpers.h"
 #include "core/hle/service/nvdrv/nvdrv.h"
+#include "core/hle/service/nvdrv/core/syncpoint_wait.h"
 #include "core/hle/service/nvdrv/nvdrv_interface.h"
 
 namespace Service::Nvidia {
+
+namespace {
+struct NvDrvStatus {
+    u32_le free_size{};
+    u32_le allocatable_size{};
+    u32_le minimum_free_size{};
+    u32_le minimum_allocatable_size{};
+    u64_le reserved[2]{};
+};
+static_assert(sizeof(NvDrvStatus) == 0x20, "NvDrvStatus is incorrect size");
+} // namespace
 
 void NVDRV::Open(HLERequestContext& ctx) {
     LOG_DEBUG(Service_NVDRV, "called");
@@ -52,6 +65,18 @@ void NVDRV::ServiceError(HLERequestContext& ctx, NvResult result) {
     rb.PushEnum(result);
 }
 
+void NVDRV::PrepareOutputBuffer(HLERequestContext& ctx, Common::ScratchBuffer<u8>& buffer,
+                               size_t index) {
+    const auto size = ctx.GetWriteBufferSize(index);
+    if (ctx.ResponseBuffersDeferred() && size && !output_pool)
+        output_pool = std::make_shared<IpcResponseBufferPool>();
+    if (ctx.ResponseBuffersDeferred() && size > buffer.capacity()) {
+        buffer = output_pool->Acquire(size);
+    } else {
+        buffer.resize_destructive(size);
+    }
+}
+
 void NVDRV::Ioctl1(HLERequestContext& ctx) {
     IPC::RequestParser rp{ctx};
     const auto fd = rp.Pop<DeviceFD>();
@@ -64,13 +89,40 @@ void NVDRV::Ioctl1(HLERequestContext& ctx) {
         return;
     }
 
-    // Check device
-    output_buffer.resize_destructive(ctx.GetWriteBufferSize(0));
-    const auto input_buffer = ctx.ReadBuffer(0);
+    auto pending = deferred_ioctls.find(&ctx);
+    if (pending != deferred_ioctls.end()) {
+        const bool signalled = pending->second.wait->IsSignalled();
+        const auto fd_status = nvdrv->VerifyFD(fd);
+        if (!signalled && fd_status == NvResult::Success) {
+            ctx.SetIsDeferred();
+            return;
+        }
+    }
 
+    // Deferred requests keep their first input snapshot and their original deadline.
+    PrepareOutputBuffer(ctx, output_buffer, 0);
+    const auto input_buffer = pending == deferred_ioctls.end()
+                                  ? ctx.ReadBuffer(0)
+                                  : std::span<const u8>{pending->second.input};
     const auto nv_result = nvdrv->Ioctl1(fd, command, input_buffer, output_buffer);
+    if (pending != deferred_ioctls.end()) {
+        // Also cancel the timer/callback on errors, such as a descriptor closed by another session.
+        deferred_ioctls.erase(pending);
+    } else if (nv_result == NvResult::Timeout) {
+        const auto wait = nvdrv->GetSyncpointWait(fd, command, input_buffer);
+        if (wait && wait->timeout_ms != 0) {
+            DeferredIoctl deferred{
+                std::vector<u8>{input_buffer.begin(), input_buffer.end()},
+                std::make_unique<NvCore::SyncpointWait>(system.GetVideo(), system.CoreTiming(),
+                    nvdrv->GetDeferralEvent(), wait->id, wait->threshold, wait->timeout_ms)};
+            deferred_ioctls.emplace(&ctx, std::move(deferred));
+            ctx.SetIsDeferred();
+            return;
+        }
+    }
+
     if (command.is_out != 0) {
-        ctx.WriteBuffer(output_buffer);
+        ctx.WriteBufferPooled(std::move(output_buffer), 0, output_pool);
     }
 
     IPC::ResponseBuilder rb{ctx, 3};
@@ -92,12 +144,12 @@ void NVDRV::Ioctl2(HLERequestContext& ctx) {
 
     const auto input_buffer = ctx.ReadBuffer(0);
     const auto input_inlined_buffer = ctx.ReadBuffer(1);
-    output_buffer.resize_destructive(ctx.GetWriteBufferSize(0));
+    PrepareOutputBuffer(ctx, output_buffer, 0);
 
     const auto nv_result =
         nvdrv->Ioctl2(fd, command, input_buffer, input_inlined_buffer, output_buffer);
     if (command.is_out != 0) {
-        ctx.WriteBuffer(output_buffer);
+        ctx.WriteBufferPooled(std::move(output_buffer), 0, output_pool);
     }
 
     IPC::ResponseBuilder rb{ctx, 3};
@@ -118,14 +170,14 @@ void NVDRV::Ioctl3(HLERequestContext& ctx) {
     }
 
     const auto input_buffer = ctx.ReadBuffer(0);
-    output_buffer.resize_destructive(ctx.GetWriteBufferSize(0));
-    inline_output_buffer.resize_destructive(ctx.GetWriteBufferSize(1));
+    PrepareOutputBuffer(ctx, output_buffer, 0);
+    PrepareOutputBuffer(ctx, inline_output_buffer, 1);
 
     const auto nv_result =
         nvdrv->Ioctl3(fd, command, input_buffer, output_buffer, inline_output_buffer);
     if (command.is_out != 0) {
-        ctx.WriteBuffer(output_buffer, 0);
-        ctx.WriteBuffer(inline_output_buffer, 1);
+        ctx.WriteBufferPooled(std::move(output_buffer), 0, output_pool);
+        ctx.WriteBufferPooled(std::move(inline_output_buffer), 1, output_pool);
     }
 
     IPC::ResponseBuilder rb{ctx, 3};
@@ -224,10 +276,16 @@ void NVDRV::SetGraphicsFirmwareMemoryMarginEnabled(HLERequestContext& ctx) {
 }
 
 void NVDRV::GetStatus(HLERequestContext& ctx) {
-    LOG_WARNING(Service_NVDRV, "(STUBBED) called");
+    LOG_DEBUG(Service_NVDRV, "called");
 
-    IPC::ResponseBuilder rb{ctx, 3};
+    if (!is_initialized) {
+        ServiceError(ctx, NvResult::NotInitialized);
+        return;
+    }
+
+    IPC::ResponseBuilder rb{ctx, 11};
     rb.Push(ResultSuccess);
+    rb.PushRaw(NvDrvStatus{});
     rb.PushEnum(NvResult::Success);
 }
 
@@ -263,6 +321,8 @@ NVDRV::NVDRV(Core::System& system_, std::shared_ptr<Module> nvdrv_, const char* 
 }
 
 NVDRV::~NVDRV() {
+    // Unregister GPU callbacks and drain timer callbacks before releasing session resources.
+    deferred_ioctls.clear();
     if (is_initialized) {
         auto& container = nvdrv->GetContainer();
         container.CloseSession(session_id);

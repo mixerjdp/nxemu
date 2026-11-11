@@ -62,6 +62,10 @@ public:
     bool BufferToImage(const Tegra::DMA::ImageCopy& copy_info, const Tegra::DMA::BufferOperand& src,
                        const Tegra::DMA::ImageOperand& dst) override;
 
+    bool ImageToImage(Tegra::MemoryManager& gpu_memory, const Tegra::DMA::ImageCopy& copy_info,
+                      const Tegra::DMA::ImageOperand& src,
+                      const Tegra::DMA::ImageOperand& dst) override;
+
 private:
     template <bool IS_IMAGE_UPLOAD>
     bool DmaBufferImageCopy(const Tegra::DMA::ImageCopy& copy_info,
@@ -82,7 +86,7 @@ public:
     ~RasterizerOpenGL() override;
 
     void Draw(bool is_indexed, u32 instance_count) override;
-    void DrawIndirect() override;
+    bool DrawIndirect() override;
     void DrawTexture() override;
     void Clear(u32 layer_count) override;
     void DispatchCompute() override;
@@ -103,8 +107,10 @@ public:
     bool OnCPUWrite(PAddr addr, u64 size) override;
     void InvalidateGPUCache() override;
     void UnmapMemory(DAddr addr, u64 size) override;
-    void ModifyGPUMemory(size_t as_id, GPUVAddr addr, u64 size) override;
+    void ModifyGPUMemory(size_t as_id, GPUVAddr addr, u64 size, bool preserve_contents = false) override;
     void SignalFence(std::function<void()>&& func) override;
+    void SignalMemoryOperationFence(std::function<void()>&& func) override;
+    void WaitForFence() override;
     void SyncOperation(std::function<void()>&& func) override;
     void SignalSyncPoint(u32 value) override;
     void SignalReference() override;
@@ -124,7 +130,7 @@ public:
     void AccelerateInlineToMemory(GPUVAddr address, size_t copy_size,
                                   std::span<const u8> memory) override;
     void LoadDiskResources(u64 title_id, std::stop_token stop_loading,
-                           const VideoCore::DiskResourceLoadCallback& callback) override;
+                           const VideoCore::DiskResourceLoadCallback& callback, std::string_view content_identity = {}, std::string_view game_path = {}, std::string_view game_context = {}) override;
 
     /// Returns true when there are commands queued to the OpenGL server.
     bool AnyCommandQueued() const {

@@ -1,7 +1,6 @@
 #include "settings_bridge.h"
+#include "ui/ui_util.h"
 #include "ui_identifiers.h"
-#include "ui_settings.h"
-#include <android/log.h>
 #include <nxemu-core/settings/identifiers.h>
 #include <nxemu-core/settings/settings.h>
 #include <yuzu_common/android/java_bridge.h>
@@ -16,7 +15,6 @@ namespace
 
     void OnSettingChanged(const char * setting, void * /*userData*/)
     {
-        __android_log_print(ANDROID_LOG_INFO, kLogTag, "OnSettingChanged setting: %s", setting);
         if (s_native_library_class == nullptr || s_on_setting_changed == nullptr || setting == nullptr)
         {
             return;
@@ -43,8 +41,6 @@ extern "C" JNIEXPORT jstring JNICALL Java_org_nxemu_NativeLibrary_getSettingStri
 {
     const char * key = env->GetStringUTFChars(setting, nullptr);
     const char * value = SettingsStore::GetInstance().GetString(key);
-    __android_log_print(ANDROID_LOG_INFO, kLogTag, "Get Setting key: %s", key);
-    __android_log_print(ANDROID_LOG_INFO, kLogTag, "Get Setting value: %s", value);
     env->ReleaseStringUTFChars(setting, key);
     return env->NewStringUTF(value != nullptr ? value : "");
 }
@@ -65,17 +61,48 @@ extern "C" JNIEXPORT void JNICALL Java_org_nxemu_NativeLibrary_setSettingString(
 {
     const char * key = env->GetStringUTFChars(setting, nullptr);
     const char * val = env->GetStringUTFChars(value, nullptr);
-    __android_log_print(ANDROID_LOG_INFO, kLogTag, "Set Setting key: %s", key);
-    __android_log_print(ANDROID_LOG_INFO, kLogTag, "Set Setting value: %s", val);
     SettingsStore::GetInstance().SetString(key, val);
     env->ReleaseStringUTFChars(value, val);
     env->ReleaseStringUTFChars(setting, key);
 }
 
+extern "C" JNIEXPORT void JNICALL Java_org_nxemu_NativeLibrary_setSettingBool(JNIEnv * env, jclass /*clazz*/, jstring setting, jboolean value)
+{
+    if (setting == nullptr)
+    {
+        return;
+    }
+    const char * key = env->GetStringUTFChars(setting, nullptr);
+    SettingsStore::GetInstance().SetBool(key, value == JNI_TRUE);
+    env->ReleaseStringUTFChars(setting, key);
+}
+
+extern "C" JNIEXPORT jint JNICALL Java_org_nxemu_NativeLibrary_getSettingInt(JNIEnv * env, jclass /*clazz*/, jstring setting)
+{
+    if (setting == nullptr)
+    {
+        return 0;
+    }
+    const char * key = env->GetStringUTFChars(setting, nullptr);
+    const int32_t value = SettingsStore::GetInstance().GetInt(key);
+    env->ReleaseStringUTFChars(setting, key);
+    return value;
+}
+
+extern "C" JNIEXPORT void JNICALL Java_org_nxemu_NativeLibrary_setSettingInt(JNIEnv * env, jclass /*clazz*/, jstring setting, jint value)
+{
+    if (setting == nullptr)
+    {
+        return;
+    }
+    const char * key = env->GetStringUTFChars(setting, nullptr);
+    SettingsStore::GetInstance().SetInt(key, value);
+    env->ReleaseStringUTFChars(setting, key);
+}
+
 extern "C" JNIEXPORT void JNICALL Java_org_nxemu_NativeLibrary_saveSettings(JNIEnv * /*env*/, jclass /*clazz*/)
 {
-    SaveUISetting();
-    SettingsStore::GetInstance().Save();
+    UiUtil::SaveSettings();
 }
 
 void SettingsChange_Start(JavaVM * /*javaVm*/, JNIEnv * env)
@@ -87,6 +114,7 @@ void SettingsChange_Start(JavaVM * /*javaVm*/, JNIEnv * env)
 
     SettingsStore & store = SettingsStore::GetInstance();
     store.RegisterCallback(NXUISetting::GameDirectories, OnSettingChanged, nullptr);
+    store.RegisterCallback(NXUISetting::ThemeMode, OnSettingChanged, nullptr);
     store.RegisterCallback(NXCoreSetting::DisplayedFrames, OnSettingChanged, nullptr);
 }
 
@@ -94,6 +122,7 @@ void SettingsChange_Stop(JNIEnv * env)
 {
     SettingsStore & store = SettingsStore::GetInstance();
     store.UnregisterCallback(NXUISetting::GameDirectories, OnSettingChanged, nullptr);
+    store.UnregisterCallback(NXUISetting::ThemeMode, OnSettingChanged, nullptr);
     store.UnregisterCallback(NXCoreSetting::DisplayedFrames, OnSettingChanged, nullptr);
 
     s_on_setting_changed = nullptr;

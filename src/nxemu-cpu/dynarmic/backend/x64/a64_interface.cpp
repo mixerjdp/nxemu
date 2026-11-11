@@ -265,6 +265,8 @@ private:
     CodePtr GetBlock(IR::LocationDescriptor current_location) {
         if (auto block = emitter.GetBasicBlock(current_location))
             return block->entrypoint;
+        if (conf.notify_compilation) conf.callbacks->OnCompilation(true);
+        SCOPE_EXIT { if (conf.notify_compilation) conf.callbacks->OnCompilation(false); };
 
         constexpr size_t MINIMUM_REMAINING_CODESIZE = 1 * 1024 * 1024;
         if (block_of_code.SpaceRemaining() < MINIMUM_REMAINING_CODESIZE) {
@@ -274,10 +276,13 @@ private:
         }
         block_of_code.EnsureMemoryCommitted(MINIMUM_REMAINING_CODESIZE);
 
-        // JIT Compile
+        // JIT Compile. Reuse the IR block so cold compilation does not allocate a large
+        // instruction arena for every guest block.
         const auto get_code = [this](u64 vaddr) { return conf.callbacks->MemoryReadCode(vaddr); };
-        IR::Block ir_block = A64::Translate(A64::LocationDescriptor{current_location}, get_code,
-                                            {conf.define_unpredictable_behaviour, conf.wall_clock_cntpct});
+        const auto descriptor = A64::LocationDescriptor{current_location};
+        ir_block.Reset(descriptor);
+        A64::Translate(ir_block, descriptor, get_code,
+                       {conf.define_unpredictable_behaviour, conf.wall_clock_cntpct});
         Optimization::PolyfillPass(ir_block, polyfill_options);
         Optimization::A64CallbackConfigPass(ir_block, conf);
         Optimization::NamingPass(ir_block);
@@ -292,8 +297,11 @@ private:
         if (conf.HasOptimization(OptimizationFlag::MiscIROpt)) {
             Optimization::A64MergeInterpretBlocksPass(ir_block, conf.callbacks);
         }
-        Optimization::VerificationPass(ir_block);
-        return emitter.Emit(ir_block).entrypoint;
+        if (!conf.HasOptimization(OptimizationFlag::DisableVerification)) {
+            Optimization::VerificationPass(ir_block);
+        }
+        const auto entrypoint = emitter.Emit(ir_block).entrypoint;
+        return entrypoint;
     }
 
     void PerformRequestedCacheInvalidation(HaltReason hr) {
@@ -320,6 +328,7 @@ private:
 
     bool is_executing = false;
 
+    IR::Block ir_block{IR::LocationDescriptor{0}};
     const UserConfig conf;
     A64JitState jit_state;
     BlockOfCode block_of_code;

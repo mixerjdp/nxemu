@@ -48,6 +48,7 @@ add_library(nxemu-cpu SHARED
     cpu_settings.cpp
     cpu_settings.h
     cpu_settings_identifiers.h
+    patch/runtime_code_patch.h
     patch/patch_collection.cpp
     patch/patch_collection.h
     dynarmic_cp15.cpp
@@ -322,11 +323,28 @@ if(ARCHITECTURE_x86_64)
         XBYAK_STRICT_CHECK_MEM_REG_SIZE=0
         XBYAK_OLD_DISP_CHECK=1
     )
+    if(WIN32)
+        target_compile_definitions(nxemu-cpu PRIVATE
+            DYNARMIC_ENABLE_CPU_FEATURE_DETECTION=1
+            MCL_IGNORE_ASSERTS=1
+            BOOST_ASIO_DISABLE_CONCEPTS
+            _HAS_DEPRECATED_RESULT_OF
+            _WIN32_WINNT=0x0A00
+            WINVER=0x0A00
+        )
+    endif()
+    if(MSVC)
+        target_compile_options(nxemu-cpu PRIVATE /bigobj)
+    endif()
+    if(WIN32)
+        target_sources(nxemu-cpu PRIVATE dynarmic/backend/x64/exception_handler_windows.cpp)
+    else()
+        target_sources(nxemu-cpu PRIVATE dynarmic/backend/exception_handler_posix.cpp)
+    endif()
  
     target_sources(nxemu-cpu PRIVATE
         dynarmic/common/spin_lock_x64.cpp
         dynarmic/common/x64_disassemble.cpp
-        dynarmic/backend/exception_handler_posix.cpp
         dynarmic/backend/x64/a32_emit_x64.cpp
         dynarmic/backend/x64/a32_emit_x64_memory.cpp
         dynarmic/backend/x64/a32_interface.cpp
@@ -377,13 +395,12 @@ if(ARCHITECTURE_arm64)
 
     enable_language(C ASM)
     set(CMAKE_ASM_FLAGS "${CMAKE_ASM_FLAGS} -x assembler-with-cpp")
-    if(NOT MSVC)
+    if(UNIX AND NOT APPLE)
         target_compile_options(nxemu-cpu PRIVATE $<$<COMPILE_LANGUAGE:ASM>:-Wa,--noexecstack>)
         target_link_options(nxemu-cpu PRIVATE -Wl,-z,noexecstack)
     endif()
 
     target_sources(nxemu-cpu PRIVATE
-        dynarmic/backend/exception_handler_generic.cpp
         dynarmic/common/spin_lock_arm64.cpp
         dynarmic/backend/arm64/a32_jitstate.cpp
         dynarmic/backend/arm64/a32_address_space.cpp
@@ -403,6 +420,7 @@ if(ARCHITECTURE_arm64)
         dynarmic/backend/arm64/emit_arm64_data_processing.cpp
         dynarmic/backend/arm64/emit_arm64_floating_point.cpp
         dynarmic/backend/arm64/emit_arm64_memory.cpp
+        dynarmic/backend/arm64/emit_arm64_far_branch.h
         dynarmic/backend/arm64/emit_arm64_memory.h
         dynarmic/backend/arm64/emit_arm64_packed.cpp
         dynarmic/backend/arm64/emit_arm64_saturation.cpp
@@ -419,18 +437,101 @@ if(ARCHITECTURE_arm64)
         dynarmic/backend/arm64/stack_layout.h
         dynarmic/backend/arm64/verbose_debugging_output.cpp
         dynarmic/backend/arm64/verbose_debugging_output.h
-        nce/arm_nce_asm_definitions.h
-        nce/arm_nce.cpp
-        nce/arm_nce.h
-        nce/arm_nce.s
-        nce/guest_context.h
-        nce/instructions.h
-        nce/interpreter_visitor.cpp
-        nce/interpreter_visitor.h
-        nce/patcher.cpp
-        nce/patcher.h
-        nce/visitor_base.h
     )
+
+    if(APPLE)
+        find_program(NXEMU_MIG_EXECUTABLE mig REQUIRED)
+
+        find_path(NXEMU_MACH_EXC_INCLUDE_DIR mach/mach_exc.defs)
+        if(NOT NXEMU_MACH_EXC_INCLUDE_DIR)
+            execute_process(
+                COMMAND xcrun --sdk macosx --show-sdk-path
+                OUTPUT_VARIABLE NXEMU_MACOS_SDK
+                OUTPUT_STRIP_TRAILING_WHITESPACE
+                COMMAND_ERROR_IS_FATAL ANY
+            )
+            if(EXISTS "${NXEMU_MACOS_SDK}/usr/include/mach/mach_exc.defs")
+                set(NXEMU_MACH_EXC_INCLUDE_DIR "${NXEMU_MACOS_SDK}/usr/include")
+            endif()
+        endif()
+        if(NOT NXEMU_MACH_EXC_INCLUDE_DIR)
+            message(FATAL_ERROR "Unable to locate mach/mach_exc.defs required by Dynarmic fastmem on macOS")
+        endif()
+
+        set(_nxemu_mig_dir "${CMAKE_CURRENT_BINARY_DIR}/dynarmic/backend/arm64/mig")
+        set(_nxemu_mig_user_c "${_nxemu_mig_dir}/mach_exc_user.c")
+        set(_nxemu_mig_user_h "${_nxemu_mig_dir}/mach_exc_user.h")
+        set(_nxemu_mig_server_c "${_nxemu_mig_dir}/mach_exc_server.c")
+        set(_nxemu_mig_server_h "${_nxemu_mig_dir}/mach_exc_server.h")
+
+        add_custom_command(
+            OUTPUT
+                "${_nxemu_mig_user_c}"
+                "${_nxemu_mig_user_h}"
+                "${_nxemu_mig_server_c}"
+                "${_nxemu_mig_server_h}"
+            COMMAND ${CMAKE_COMMAND} -E make_directory "${_nxemu_mig_dir}"
+            COMMAND "${NXEMU_MIG_EXECUTABLE}"
+                -arch arm64
+                -user "${_nxemu_mig_user_c}"
+                -header "${_nxemu_mig_user_h}"
+                -server "${_nxemu_mig_server_c}"
+                -sheader "${_nxemu_mig_server_h}"
+                "${NXEMU_MACH_EXC_INCLUDE_DIR}/mach/mach_exc.defs"
+            DEPENDS "${NXEMU_MACH_EXC_INCLUDE_DIR}/mach/mach_exc.defs"
+            VERBATIM
+            COMMENT "Generating Dynarmic Mach exception server for arm64"
+        )
+        add_custom_target(nxemu-dynarmic-mig DEPENDS
+            "${_nxemu_mig_user_c}"
+            "${_nxemu_mig_user_h}"
+            "${_nxemu_mig_server_c}"
+            "${_nxemu_mig_server_h}"
+        )
+        add_dependencies(nxemu-cpu nxemu-dynarmic-mig)
+        target_include_directories(nxemu-cpu PRIVATE "${CMAKE_CURRENT_BINARY_DIR}")
+        target_sources(nxemu-cpu PRIVATE
+            dynarmic/backend/exception_handler_macos.cpp
+            dynarmic/backend/exception_handler_macos_mig.c
+        )
+        target_compile_definitions(nxemu-cpu PRIVATE NXEMU_HAS_NCE=1)
+        target_sources(nxemu-cpu PRIVATE
+            nce/arm_nce_asm_definitions.h
+            nce/arm_nce.cpp
+            nce/arm_nce.h
+            nce/arm_nce_darwin.cpp
+            nce/arm_nce_darwin.S
+            nce/decode.cpp
+            nce/decode.h
+            nce/guest_context.h
+            nce/instructions.h
+            nce/interpreter_visitor.cpp
+            nce/interpreter_visitor.h
+            nce/patcher.cpp
+            nce/patcher.h
+            nce/visitor_base.h
+        )
+    elseif(ANDROID OR CMAKE_SYSTEM_NAME STREQUAL "Linux")
+        target_compile_definitions(nxemu-cpu PRIVATE NXEMU_HAS_NCE=1)
+        target_sources(nxemu-cpu PRIVATE
+            dynarmic/backend/exception_handler_generic.cpp
+            nce/arm_nce_asm_definitions.h
+            nce/arm_nce.cpp
+            nce/arm_nce.h
+            nce/arm_nce.s
+            nce/decode.cpp
+            nce/decode.h
+            nce/guest_context.h
+            nce/instructions.h
+            nce/interpreter_visitor.cpp
+            nce/interpreter_visitor.h
+            nce/patcher.cpp
+            nce/patcher.h
+            nce/visitor_base.h
+        )
+    else()
+        target_sources(nxemu-cpu PRIVATE dynarmic/backend/exception_handler_generic.cpp)
+    endif()
 
     if(TARGET merry::oaknut)
         target_link_libraries(nxemu-cpu PRIVATE merry::oaknut)
@@ -453,12 +554,34 @@ target_include_directories(nxemu-cpu PRIVATE
     ${CMAKE_SOURCE_DIR}/external/xbyak
 )
 
+# Optimize the x64 JIT together at link time in native MSVC Release builds.
+# Keep other compilers, architectures and configurations on their existing path.
+if(ARCHITECTURE_x86_64 AND CMAKE_CXX_COMPILER_ID STREQUAL "MSVC")
+    get_target_property(_nxemu_jit_sources nxemu-cpu SOURCES)
+    foreach(_nxemu_jit_source IN LISTS _nxemu_jit_sources)
+        if(_nxemu_jit_source MATCHES "^dynarmic/(backend/x64|frontend/A64|ir|common)/.*[.]cpp$"
+           OR _nxemu_jit_source STREQUAL "dynarmic/frontend/imm.cpp"
+           OR _nxemu_jit_source STREQUAL "dynarmic/backend/block_range_information.cpp")
+            set_property(SOURCE ${_nxemu_jit_source} APPEND PROPERTY
+                COMPILE_OPTIONS "$<$<CONFIG:Release>:/GL>")
+        endif()
+    endforeach()
+    target_link_options(nxemu-cpu PRIVATE
+        "$<$<CONFIG:Release>:/LTCG:INCREMENTAL>"
+        "$<$<CONFIG:Release>:/LTCGOUT:$<TARGET_FILE_DIR:nxemu-cpu>/nxemu-cpu.iobj>")
+endif()
+
 target_link_libraries(nxemu-cpu PRIVATE
     common
     fmt
     merry::mcl
     yuzu_common
 )
+
+# libstdc++'s std::array deduction guide instantiates a fold over the full
+# opcode table (more than Clang's default 256 expression nesting levels).
+set_property(SOURCE dynarmic/ir/opcodes.cpp APPEND PROPERTY COMPILE_OPTIONS
+    "$<$<CXX_COMPILER_ID:Clang,AppleClang>:-fbracket-depth=1024>")
 
 if(ANDROID)
     target_link_libraries(nxemu-cpu PRIVATE log)

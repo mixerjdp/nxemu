@@ -42,17 +42,18 @@ vk::PipelineLayout CreateWrappedPipelineLayout(const Device& device,
                                                vk::DescriptorSetLayout& layout);
 vk::Pipeline CreateWrappedPipeline(const Device& device, vk::RenderPass& renderpass,
                                    vk::PipelineLayout& layout,
-                                   std::tuple<vk::ShaderModule&, vk::ShaderModule&> shaders);
+                                   std::tuple<vk::ShaderModule&, vk::ShaderModule&> shaders,
+                                   bool write_alpha = true);
 vk::Pipeline CreateWrappedPremultipliedBlendingPipeline(
     const Device& device, vk::RenderPass& renderpass, vk::PipelineLayout& layout,
-    std::tuple<vk::ShaderModule&, vk::ShaderModule&> shaders);
+    std::tuple<vk::ShaderModule&, vk::ShaderModule&> shaders, bool write_alpha = true);
 vk::Pipeline CreateWrappedCoverageBlendingPipeline(
     const Device& device, vk::RenderPass& renderpass, vk::PipelineLayout& layout,
     std::tuple<vk::ShaderModule&, vk::ShaderModule&> shaders);
 VkWriteDescriptorSet CreateWriteDescriptorSet(std::vector<VkDescriptorImageInfo>& images,
                                               VkSampler sampler, VkImageView view,
                                               VkDescriptorSet set, u32 binding);
-vk::Sampler CreateBilinearSampler(const Device& device);
+vk::Sampler CreateBilinearSampler(const Device& device, VkSamplerAddressMode address_mode = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_BORDER);
 vk::Sampler CreateNearestNeighborSampler(const Device& device);
 
 void BeginRenderPass(vk::CommandBuffer& cmdbuf, VkRenderPass render_pass, VkFramebuffer framebuffer,

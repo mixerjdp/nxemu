@@ -8,11 +8,19 @@
 #include "yuzu_common/yuzu_assert.h"
 #include "core/core.h"
 #include "core/core_timing.h"
+#include "core/frame_step.h"
 #include "core/hle/service/nvdrv/core/container.h"
 #include "core/hle/service/nvdrv/core/nvmap.h"
 #include "core/hle/service/nvdrv/devices/nvdisp_disp0.h"
 #include "core/perf_stats.h"
 #include <nxemu-module-spec/video.h>
+#ifdef __ANDROID__
+#include "os_settings.h"
+#include "yuzu_common/android/frame_interval.h"
+#include <nxemu-video/video_settings_identifiers.h>
+
+extern IModuleSettings* g_settings;
+#endif
 
 namespace Service::Nvidia::Devices {
 
@@ -57,7 +65,20 @@ NvResult nvdisp_disp0::Ioctl3(DeviceFD fd, Ioctl command, std::span<const u8> in
 void nvdisp_disp0::OnOpen(NvCore::SessionId session_id, DeviceFD fd) {}
 void nvdisp_disp0::OnClose(DeviceFD fd) {}
 
-void nvdisp_disp0::Composite(std::span<const Nvnflinger::HwcLayer> sorted_layers) {
+void nvdisp_disp0::Composite(std::span<const Nvnflinger::HwcLayer> sorted_layers,
+                            u32 swap_interval, float compose_speed_scale) {
+    u32 frame_interval_ns = 0;
+#ifdef __ANDROID__
+    // Match VI's requested cadence and speed controls, including video playback.
+    float speed_scale = osSettings.use_speed_limit
+                            ? (osSettings.speed_limit / 100.f) * compose_speed_scale
+                            : 0.f;
+    if (system.GetNVDECActive() &&
+        osSettings.use_video_framerate) {
+        speed_scale = 1.f;
+    }
+    frame_interval_ns = Common::Android::FrameIntervalNs(swap_interval, speed_scale);
+#endif
     std::vector<VideoFramebufferConfig> output_layers;
     std::vector<VideoNvFence> output_fences;
     output_layers.reserve(sorted_layers.size());
@@ -77,20 +98,39 @@ void nvdisp_disp0::Composite(std::span<const Nvnflinger::HwcLayer> sorted_layers
             .cropRight = layer.crop_rect.right,
             .cropBottom = layer.crop_rect.bottom,
             .blending = (uint32_t)ConvertBlending(layer.blending),
+            .frameIntervalNs = frame_interval_ns,
         });
 
         for (size_t i = 0; i < layer.acquire_fence.num_fences; i++) {
+            const auto& fence = layer.acquire_fence.fences[i];
+            if (fence.id < 0) {
+                continue;
+            }
+            if (static_cast<u32>(fence.id) >= MaxSyncPoints) {
+                LOG_WARNING(Service_NVDRV, "Ignoring invalid display acquire fence id={} value={}",
+                            fence.id, fence.value);
+                continue;
+            }
+
             output_fences.emplace_back(VideoNvFence{
-                .id = layer.acquire_fence.fences[i].id,
-                .value = layer.acquire_fence.fences[i].value
+                .id = fence.id,
+                .value = fence.value,
             });
         }
     }
 
     system.GetVideo().RequestComposite(output_layers.data(), (uint32_t)output_layers.size(), output_fences.data(), (uint32_t)output_fences.size());
-    system.SpeedLimiter().DoSpeedLimiting(system.CoreTiming().GetGlobalTimeUs());
+    system.FrameStep().OnPresent(system.ApplicationMemory(), system.GetNVDECActive());
     system.GetPerfStats().EndSystemFrame();
     system.GetPerfStats().BeginSystemFrame();
+}
+
+void nvdisp_disp0::WaitForComposite() {
+    system.GetVideo().WaitForComposite();
+}
+
+void nvdisp_disp0::CancelPendingComposite() {
+    system.GetVideo().CancelPendingComposite();
 }
 
 Kernel::KEvent* nvdisp_disp0::QueryEvent(u32 event_id) {

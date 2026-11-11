@@ -3,15 +3,20 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
+#include <bit>
 #include <cstring>
 #include <span>
 #include <vector>
 
 #include "yuzu_video_core/renderer_vulkan/vk_buffer_cache.h"
+#include "yuzu_common/readback_reference.h"
+#include "yuzu_shader_recompiler/backend/spirv/emit_spirv.h"
 
 #include "yuzu_video_core/renderer_vulkan/maxwell_to_vk.h"
 #include "yuzu_video_core/renderer_vulkan/vk_scheduler.h"
 #include "yuzu_video_core/renderer_vulkan/vk_staging_buffer_pool.h"
+#include "yuzu_video_core/renderer_vulkan/vk_state_tracker.h"
 #include "yuzu_video_core/renderer_vulkan/vk_update_descriptor.h"
 #include "yuzu_video_core/vulkan_common/vulkan_device.h"
 #include "yuzu_video_core/vulkan_common/vulkan_memory_allocator.h"
@@ -19,6 +24,21 @@
 #include "video_settings.h"
 
 namespace Vulkan {
+struct ReadbackShadowBudget {
+    std::atomic<u64> used{};
+    u64 capacity{};
+};
+struct ReadbackShadow {
+    std::shared_ptr<ReadbackShadowBudget> budget;
+    u64 bytes;
+    vk::Buffer buffer;
+    Common::ReadbackReference reference;
+    std::shared_ptr<Common::ReadbackCpuReference> cpu_reference;
+    ReadbackShadow(std::shared_ptr<ReadbackShadowBudget> budget_, u64 bytes_, vk::Buffer buffer_)
+        : budget{std::move(budget_)}, bytes{bytes_}, buffer{std::move(buffer_)},
+          cpu_reference{std::make_shared<Common::ReadbackCpuReference>(bytes_)} {}
+    ~ReadbackShadow() { budget->used.fetch_sub(bytes, std::memory_order_relaxed); }
+};
 namespace {
 VkBufferCopy MakeBufferCopy(const VideoCommon::BufferCopy& copy) {
     return VkBufferCopy{
@@ -98,9 +118,23 @@ Buffer::Buffer(BufferCacheRuntime& runtime, DAddr cpu_addr_, u64 size_bytes_)
 }
 
 VkBufferView Buffer::View(u32 offset, u32 size, VideoCore::Surface::PixelFormat format) {
+    const BufferView* view{FindOrCreateView(offset, size, format)};
+    return view ? *view->handle : VK_NULL_HANDLE;
+}
+
+VkBufferView Buffer::SizeView(u32 offset, u32 size, VideoCore::Surface::PixelFormat format) {
+    const BufferView* view{FindOrCreateView(offset, size, format)};
+    if (!view) {
+        return VK_NULL_HANDLE;
+    }
+    return view->size_handle ? *view->size_handle : *view->handle;
+}
+
+const Buffer::BufferView* Buffer::FindOrCreateView(u32 offset, u32 size,
+                                                   VideoCore::Surface::PixelFormat format) {
     if (!device) {
         // Null buffer supported, return a null descriptor
-        return VK_NULL_HANDLE;
+        return nullptr;
     } else if (is_null) {
         // Null buffer not supported, adjust offset and size
         offset = 0;
@@ -110,23 +144,40 @@ VkBufferView Buffer::View(u32 offset, u32 size, VideoCore::Surface::PixelFormat 
         return offset == view.offset && size == view.size && format == view.format;
     })};
     if (it != views.end()) {
-        return *it->handle;
+        return &*it;
     }
-    views.push_back({
-        .offset = offset,
-        .size = size,
-        .format = format,
-        .handle = device->GetLogical().CreateBufferView({
+    MoltenVK::TexelBufferRange range{offset, size, size, true};
+    if (device->NeedsTexelBufferPad() && !is_null) {
+        range = MoltenVK::AlignedTexelBufferRange(
+            static_cast<u32>(device->GetTexelBufferOffsetAlignment()), offset, size,
+            VideoCore::Surface::BytesPerBlock(format));
+        if (!range.aligned) {
+            LOG_WARNING(Render_Vulkan,
+                        "Texel buffer view at {} is not aligned to the texel size of format {}",
+                        offset, static_cast<u32>(format));
+        }
+    }
+    const auto create_view{[&](u32 view_size) {
+        return device->GetLogical().CreateBufferView({
             .sType = VK_STRUCTURE_TYPE_BUFFER_VIEW_CREATE_INFO,
             .pNext = nullptr,
             .flags = 0,
             .buffer = *buffer,
             .format = MaxwellToVK::SurfaceFormat(*device, FormatType::Buffer, false, format).format,
-            .offset = offset,
-            .range = size,
-        }),
+            .offset = range.offset,
+            .range = view_size,
+        });
+    }};
+    views.push_back({
+        .offset = offset,
+        .size = size,
+        .format = format,
+        .handle = create_view(range.size),
+        // Both views are the same unless the range was moved back to an aligned offset
+        .size_handle = range.size_view_size != range.size ? create_view(range.size_view_size)
+                                                          : vk::BufferView{},
     });
-    return *views.back().handle;
+    return &views.back();
 }
 
 class QuadIndexBuffer {
@@ -321,6 +372,22 @@ private:
     }
 };
 
+void BufferCacheRuntime::NotifyVertexBufferStride(
+    u32 index, u32 stride, Tegra::Engines::Maxwell3D::DirtyState::Flags& dirty) noexcept {
+    if (!track_vertex_input_strides) {
+        return;
+    }
+    const u32 bit = 1U << index;
+    if ((known_vertex_input_strides & bit) != 0 && vertex_input_strides[index] == stride) {
+        return;
+    }
+    known_vertex_input_strides |= bit;
+    vertex_input_strides[index] = stride;
+    // Configure updates buffers before UpdateDynamicStates. Reuse the engine flag
+    // so clean draws pay no extra poll, and channel invalidation stays authoritative.
+    dirty[Dirty::VertexInput] = true;
+}
+
 BufferCacheRuntime::BufferCacheRuntime(const Device& device_, MemoryAllocator& memory_allocator_,
                                        Scheduler& scheduler_, StagingBufferPool& staging_pool_,
                                        GuestDescriptorQueue& guest_descriptor_queue_,
@@ -329,7 +396,15 @@ BufferCacheRuntime::BufferCacheRuntime(const Device& device_, MemoryAllocator& m
     : device{device_}, memory_allocator{memory_allocator_}, scheduler{scheduler_},
       staging_pool{staging_pool_}, guest_descriptor_queue{guest_descriptor_queue_},
       quad_index_pass(device, scheduler, descriptor_pool, staging_pool,
-                      compute_pass_descriptor_queue) {
+                      compute_pass_descriptor_queue),
+      readback_descriptor_queue{compute_pass_descriptor_queue},
+      readback_descriptor_pool{descriptor_pool} {
+    // vkCmdBindVertexBuffers2EXT already updates strides with extended dynamic state.
+    // Without it, vkCmdSetVertexInputEXT must update strides when they actually change.
+    track_vertex_input_strides =
+        SupportsDirectVertexInput(device) && !device.IsExtExtendedDynamicStateSupported();
+    readback_shadow_budget = std::make_shared<ReadbackShadowBudget>();
+    readback_shadow_budget->capacity = std::min<u64>(512ULL << 20, GetDeviceLocalMemory() / 16);
     if (device.GetDriverID() != VK_DRIVER_ID_QUALCOMM_PROPRIETARY) {
         // TODO: FixMe: Uint8Pass compute shader does not build on some Qualcomm drivers.
         uint8_pass = std::make_unique<Uint8Pass>(device, scheduler, descriptor_pool, staging_pool,
@@ -349,6 +424,81 @@ StagingBufferRef BufferCacheRuntime::DownloadStagingBuffer(size_t size, bool def
     return staging_pool.Request(size, MemoryUsage::Download, deferred);
 }
 
+bool BufferCacheRuntime::CanDifferentialReadback(const Buffer& buffer,
+                                                const VideoCommon::BufferCopy& copy) const {
+    if (!differential_readback_enabled) return false;
+
+    if (copy.size < (1ULL << 20) ||
+        copy.size > Common::ReadbackReference::MaxCopySize ||
+        ((copy.src_offset | copy.dst_offset | copy.size) & 3) != 0 ||
+        copy.size + device.GetStorageBufferAlignment() > device.GetMaxStorageBufferRange()) {
+        return false;
+    }
+    if (buffer.SizeBytes() > (128ULL << 20)) {
+        return false;
+    }
+    if (buffer.readback_shadow) return true;
+    const u64 used = readback_shadow_budget->used.load(std::memory_order_relaxed);
+    const bool fits = used <= readback_shadow_budget->capacity &&
+                      buffer.SizeBytes() <= readback_shadow_budget->capacity - used;
+    return fits;
+}
+
+void BufferCacheRuntime::InvalidateReadbackReference(Buffer& buffer, u64 offset, u64 size) {
+    if (buffer.readback_shadow) buffer.readback_shadow->reference.Invalidate(offset, size);
+}
+
+std::shared_ptr<Common::ReadbackCpuReference>
+BufferCacheRuntime::GetReadbackCpuReference(const Buffer& buffer) const {
+    return buffer.readback_shadow->cpu_reference;
+}
+
+bool BufferCacheRuntime::DifferentialReadback(Buffer& buffer, const StagingBufferRef& data,
+                                             const StagingBufferRef& flags,
+                                             const VideoCommon::BufferCopy& copy,
+                                             u64 flag_offset) {
+    if (!CanDifferentialReadback(buffer, copy)) return false;
+    try {
+        if (!readback_delta_pass) {
+            readback_delta_pass = std::make_unique<ReadbackDeltaPass>(
+                device, scheduler, readback_descriptor_pool, readback_descriptor_queue);
+        }
+        if (!buffer.readback_shadow) {
+            const u64 bytes = buffer.SizeBytes();
+            u64 used = readback_shadow_budget->used.load(std::memory_order_relaxed);
+            do {
+                if (used > readback_shadow_budget->capacity ||
+                    bytes > readback_shadow_budget->capacity - used) return false;
+            } while (!readback_shadow_budget->used.compare_exchange_weak(
+                used, used + bytes, std::memory_order_relaxed));
+            try {
+                buffer.readback_shadow = std::make_shared<ReadbackShadow>(
+                    readback_shadow_budget, bytes, CreateBuffer(device, memory_allocator, bytes));
+            } catch (...) {
+                readback_shadow_budget->used.fetch_sub(bytes, std::memory_order_relaxed);
+                throw;
+            }
+            has_readback_references = true;
+        }
+        auto& reference = buffer.readback_shadow->reference;
+        const auto valid = reference.ValidMask(copy.src_offset, copy.size);
+        readback_delta_pass->Copy(buffer.Handle(), *buffer.readback_shadow->buffer,
+                                 data.buffer, flags.buffer, copy.src_offset, copy.dst_offset,
+                                 copy.size, flags.offset + flag_offset,
+                                 flags.offset + flags.mapped_span.size(), valid);
+        reference.Scheduled(copy.src_offset, copy.size);
+        return true;
+    } catch (const vk::Exception& exception) {
+        LOG_WARNING(Render_Vulkan, "Differential GPU readback disabled: {}", exception.what());
+        differential_readback_enabled = false;
+        return false;
+    } catch (const std::bad_alloc&) {
+        LOG_WARNING(Render_Vulkan, "Differential GPU readback disabled: host reference allocation failed");
+        differential_readback_enabled = false;
+        return false;
+    }
+}
+
 void BufferCacheRuntime::FreeDeferredStagingBuffer(StagingBufferRef& ref) {
     staging_pool.FreeDeferred(ref);
 }
@@ -365,14 +515,106 @@ bool BufferCacheRuntime::CanReportMemoryUsage() const {
     return device.CanReportMemoryUsage();
 }
 
+bool BufferCacheRuntime::ShouldStreamUniformBuffer(const Buffer& buffer, u32 offset, u32 size) const {
+    // Updating constants already used by this frame otherwise ends the render pass
+    // for an ordered upload. Stream a snapshot on drivers that benefit from it.
+    // The caller requires CPU-modified data and excludes GPU-modified ranges.
+    const auto driver = device.GetDriverID();
+    return driver == VK_DRIVER_ID_MOLTENVK && buffer.IsRegionUsed(offset, size);
+}
+
 u32 BufferCacheRuntime::GetStorageBufferAlignment() const {
     return static_cast<u32>(device.GetStorageBufferAlignment());
 }
 
 void BufferCacheRuntime::TickFrame(Common::SlotVector<Buffer>& slot_buffers) noexcept {
-    for (auto it = slot_buffers.begin(); it != slot_buffers.end(); it++) {
-        it->ResetUsageTracking();
+    slot_buffers.ForEachOccupied([](Buffer& buffer) { buffer.ResetUsageTracking(); });
+}
+
+void BufferCacheRuntime::MarkHostWrite(const Buffer& buffer) {
+    scheduler.MarkBufferWrite(buffer.Handle());
+}
+
+VkBuffer BufferCacheRuntime::WriteTrackBitmap() {
+    if (!write_track_bitmap) {
+        constexpr u64 size = Shader::Backend::SPIRV::WRITE_TRACK_WORDS * sizeof(u32);
+        write_track_bitmap = CreateBuffer(device, memory_allocator, size);
+        scheduler.RequestOutsideRenderPassOperationContext();
+        scheduler.Record([buffer = *write_track_bitmap](vk::CommandBuffer cmdbuf) {
+            cmdbuf.FillBuffer(buffer, 0, VK_WHOLE_SIZE, 0);
+            const VkMemoryBarrier barrier{VK_STRUCTURE_TYPE_MEMORY_BARRIER, nullptr,
+                                          VK_ACCESS_TRANSFER_WRITE_BIT,
+                                          VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT};
+            cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_TRANSFER_BIT,
+                                   VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, barrier);
+        });
     }
+    return *write_track_bitmap;
+}
+
+bool BufferCacheRuntime::CanTrackedReadback(const VideoCommon::BufferCopy& copy,
+                                            DAddr device_addr) const {
+    // No page has been marked before the first tracking shader bound the bitmap
+    return write_track_bitmap && ((device_addr | copy.src_offset | copy.dst_offset | copy.size) & 3) == 0 &&
+           copy.size + device.GetStorageBufferAlignment() <= device.GetMaxStorageBufferRange();
+}
+
+void BufferCacheRuntime::PreTrackedReadbackBarrier() {
+    // Every store of the marking shaders and every earlier write of the sources is visible
+    static constexpr VkMemoryBarrier BARRIER{
+        .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+        .pNext = nullptr,
+        .srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT | VK_ACCESS_MEMORY_READ_BIT,
+        .dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT,
+    };
+    scheduler.RequestOutsideRenderPassOperationContext();
+    scheduler.Record([](vk::CommandBuffer cmdbuf) {
+        cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                               VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, BARRIER);
+    });
+}
+
+void BufferCacheRuntime::PostTrackedReadbackBarrier() {
+    static constexpr VkMemoryBarrier BARRIER{
+        .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+        .pNext = nullptr,
+        .srcAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT,
+        .dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT |
+                         VK_ACCESS_HOST_READ_BIT,
+    };
+    scheduler.RequestOutsideRenderPassOperationContext();
+    scheduler.Record([](vk::CommandBuffer cmdbuf) {
+        cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                               VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, 0,
+                               BARRIER);
+    });
+}
+
+void BufferCacheRuntime::TrackedReadback(Buffer& buffer, const StagingBufferRef& data,
+                                         const StagingBufferRef& flags,
+                                         const VideoCommon::BufferCopy& copy, u64 flag_offset,
+                                         DAddr device_addr) {
+    if (!tracked_readback_pass) {
+        tracked_readback_pass = std::make_unique<TrackedReadbackPass>(
+            device, scheduler, readback_descriptor_pool, readback_descriptor_queue);
+    }
+    tracked_readback_pass->Copy(buffer.Handle(), data.buffer, flags.buffer, *write_track_bitmap,
+                                copy.src_offset, copy.dst_offset, copy.size,
+                                flags.offset + flag_offset, flags.offset + flags.mapped_span.size(),
+                                Shader::Backend::SPIRV::WRITE_TRACK_WORDS * sizeof(u32),
+                                device_addr);
+}
+
+u64 BufferCacheRuntime::CurrentTick() const noexcept {
+    return scheduler.CurrentTick();
+}
+
+bool BufferCacheRuntime::IsFree(u64 tick) const noexcept {
+    return scheduler.IsFree(tick);
+}
+
+void BufferCacheRuntime::Wait(u64 tick) {
+    scheduler.Wait(tick);
 }
 
 void BufferCacheRuntime::Finish() {
@@ -421,6 +663,7 @@ void BufferCacheRuntime::CopyBuffer(VkBuffer dst_buffer, VkBuffer src_buffer,
         return;
     }
 
+    scheduler.MarkBufferWrite(dst_buffer);
     scheduler.RequestOutsideRenderPassOperationContext();
     scheduler.Record([src_buffer, dst_buffer, vk_copies, barrier](vk::CommandBuffer cmdbuf) {
         if (barrier) {
@@ -480,6 +723,7 @@ void BufferCacheRuntime::ClearBuffer(VkBuffer dest_buffer, u32 offset, size_t si
         .dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT,
     };
 
+    scheduler.MarkBufferWrite(dest_buffer);
     scheduler.RequestOutsideRenderPassOperationContext();
     scheduler.Record([dest_buffer, offset, size, value](vk::CommandBuffer cmdbuf) {
         cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
@@ -492,7 +736,7 @@ void BufferCacheRuntime::ClearBuffer(VkBuffer dest_buffer, u32 offset, size_t si
 
 void BufferCacheRuntime::BindIndexBuffer(PrimitiveTopology topology, IndexFormat index_format,
                                          u32 base_vertex, u32 num_indices, VkBuffer buffer,
-                                         u32 offset, [[maybe_unused]] u32 size) {
+                                         u32 offset, u32 size) {
     VkIndexType vk_index_type = MaxwellToVK::IndexFormat(index_format);
     VkDeviceSize vk_offset = offset;
     VkBuffer vk_buffer = buffer;
@@ -503,8 +747,10 @@ void BufferCacheRuntime::BindIndexBuffer(PrimitiveTopology topology, IndexFormat
                                      topology == PrimitiveTopology::QuadStrip);
     } else if (vk_index_type == VK_INDEX_TYPE_UINT8_EXT && !device.IsExtIndexTypeUint8Supported()) {
         vk_index_type = VK_INDEX_TYPE_UINT16;
-        if (uint8_pass) {
-            std::tie(vk_buffer, vk_offset) = uint8_pass->Assemble(num_indices, buffer, offset);
+        if (uint8_pass && size != 0 && buffer != VK_NULL_HANDLE) {
+            // The binding includes firstIndex's prefix; DrawIndexed still uses
+            // that firstIndex after conversion. Never read beyond the guest range.
+            std::tie(vk_buffer, vk_offset) = uint8_pass->Assemble(size, buffer, offset);
         }
     }
     if (vk_buffer == VK_NULL_HANDLE) {
@@ -514,6 +760,31 @@ void BufferCacheRuntime::BindIndexBuffer(PrimitiveTopology topology, IndexFormat
     }
     scheduler.Record([vk_buffer, vk_offset, vk_index_type](vk::CommandBuffer cmdbuf) {
         cmdbuf.BindIndexBuffer(vk_buffer, vk_offset, vk_index_type);
+    });
+}
+
+void BufferCacheRuntime::BindHostUint8IndexBuffer(std::span<const u8> indices, u32 skip,
+                                                  bool primitive_restart) {
+    // The staging pool keeps the allocation until the submission using it retires. The draw
+    // reads from skip on, so bind before the widened indices rather than staging the prefix.
+    const size_t prefix = size_t{skip} * sizeof(u16);
+    auto staging = staging_pool.Request(indices.size() * sizeof(u16), MemoryUsage::Upload);
+    u16* widened = reinterpret_cast<u16*>(staging.mapped_span.data());
+    if (staging.offset >= prefix) {
+        staging.offset -= prefix;
+    } else {
+        staging = staging_pool.Request(prefix + indices.size() * sizeof(u16), MemoryUsage::Upload);
+        widened = reinterpret_cast<u16*>(staging.mapped_span.data()) + skip;
+    }
+    if (primitive_restart) {
+        // Vulkan only restarts on the all-ones value of the index type
+        std::ranges::transform(indices, widened,
+                               [](u8 index) { return index == 0xFF ? u16{0xFFFF} : u16{index}; });
+    } else {
+        std::ranges::copy(indices, widened);
+    }
+    scheduler.Record([buffer = staging.buffer, offset = staging.offset](vk::CommandBuffer cmdbuf) {
+        cmdbuf.BindIndexBuffer(buffer, offset, VK_INDEX_TYPE_UINT16);
     });
 }
 
@@ -537,6 +808,7 @@ void BufferCacheRuntime::BindQuadIndexBuffer(PrimitiveTopology topology, u32 fir
 
 void BufferCacheRuntime::BindVertexBuffer(u32 index, VkBuffer buffer, u32 offset, u32 size,
                                           u32 stride) {
+    index = vertex_binding_map[index];
     if (index >= device.GetMaxVertexInputBindings()) {
         return;
     }
@@ -560,6 +832,54 @@ void BufferCacheRuntime::BindVertexBuffer(u32 index, VkBuffer buffer, u32 offset
 }
 
 void BufferCacheRuntime::BindVertexBuffers(VideoCommon::HostBindings<Buffer>& bindings) {
+    if (compact_vertex_bindings) {
+        std::array<VkBuffer, 32> buffers{};
+        std::array<VkDeviceSize, 32> offsets{};
+        std::array<VkDeviceSize, 32> sizes{};
+        std::array<VkDeviceSize, 32> strides{};
+        u32 mask{};
+        for (u32 index = 0; index < bindings.buffers.size(); ++index) {
+            const u32 host = vertex_binding_map[bindings.min_index + index];
+            if (host >= device.GetMaxVertexInputBindings()) {
+                continue;
+            }
+            buffers[host] = bindings.buffers[index]->Handle();
+            offsets[host] = bindings.offsets[index];
+            sizes[host] = bindings.sizes[index];
+            strides[host] = bindings.strides[index];
+            if (buffers[host] == VK_NULL_HANDLE) {
+                offsets[host] = 0;
+                sizes[host] = VK_WHOLE_SIZE;
+                if (!device.HasNullDescriptor()) {
+                    ReserveNullBuffer();
+                    buffers[host] = *null_buffer;
+                }
+            }
+            mask |= 1U << host;
+        }
+        if (mask != 0) {
+            scheduler.Record([buffers, offsets, sizes, strides, mask,
+                              dynamic = device.IsExtExtendedDynamicStateSupported()]
+                             (vk::CommandBuffer cmdbuf) {
+                u32 remaining = mask;
+                while (remaining != 0) {
+                    const u32 first = static_cast<u32>(std::countr_zero(remaining));
+                    const u32 count = static_cast<u32>(std::countr_one(remaining >> first));
+                    if (dynamic) {
+                        cmdbuf.BindVertexBuffers2EXT(first, count, buffers.data() + first,
+                                                    offsets.data() + first, sizes.data() + first,
+                                                    strides.data() + first);
+                    } else {
+                        cmdbuf.BindVertexBuffers(first, count, buffers.data() + first,
+                                                 offsets.data() + first);
+                    }
+                    const u32 range = count == 32 ? ~0U : ((1U << count) - 1) << first;
+                    remaining &= ~range;
+                }
+            });
+        }
+        return;
+    }
     boost::container::small_vector<VkBuffer, 32> buffer_handles;
     for (u32 index = 0; index < bindings.buffers.size(); ++index) {
         auto handle = bindings.buffers[index]->Handle();
@@ -621,7 +941,25 @@ void BufferCacheRuntime::BindTransformFeedbackBuffer(u32 index, VkBuffer buffer,
 
 void BufferCacheRuntime::BindTransformFeedbackBuffers(VideoCommon::HostBindings<Buffer>& bindings) {
     if (!device.IsExtTransformFeedbackSupported()) {
-        // Already logged in the rasterizer
+        // Kept for the shaders writing what transform feedback would capture
+        for (size_t index = 0; index < emulated_xfb_buffers.size(); ++index) {
+            EmulatedTransformFeedbackBuffer next{};
+            if (index < bindings.buffers.size() && bindings.buffers[index] != nullptr) {
+                Buffer& buffer{*bindings.buffers[index]};
+                const u64 offset{bindings.offsets[index]};
+                next.buffer = buffer.Handle();
+                next.offset = static_cast<u32>(offset);
+                next.size = static_cast<u32>(bindings.sizes[index]);
+                next.capacity = buffer.SizeBytes() > offset ? buffer.SizeBytes() - offset : 0;
+            }
+            EmulatedTransformFeedbackBuffer& current{emulated_xfb_buffers[index]};
+            // Draws keep capturing after each other while the buffer stays the same
+            if (next.buffer == current.buffer && next.offset == current.offset &&
+                next.size == current.size) {
+                next.written = current.written;
+            }
+            current = next;
+        }
         return;
     }
     boost::container::small_vector<VkBuffer, 4> buffer_handles;
@@ -669,5 +1007,4 @@ vk::Buffer BufferCacheRuntime::CreateNullBuffer() {
 
     return ret;
 }
-
 } // namespace Vulkan

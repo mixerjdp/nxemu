@@ -295,13 +295,26 @@ Node SiblingFromNephew(Node uncle, Node nephew) noexcept {
 }
 
 bool AreOrdered(Node left_sibling, Node right_sibling) noexcept {
+    if (left_sibling == right_sibling) {
+        return false;
+    }
     const Node end{right_sibling->up->children.end()};
-    for (auto it = right_sibling; it != end; ++it) {
-        if (it == left_sibling) {
+    // Advance from both siblings. The shorter side establishes the ordering,
+    // without walking the full tail after right_sibling on every query.
+    for (Node left = left_sibling, right = right_sibling;;) {
+        if (++right == left_sibling) {
+            return false;
+        }
+        if (right == end) {
+            return true;
+        }
+        if (++left == right_sibling) {
+            return true;
+        }
+        if (left == end) {
             return false;
         }
     }
-    return true;
 }
 
 bool NeedsLift(Node goto_stmt, Node label_stmt) noexcept {
@@ -881,16 +894,17 @@ private:
             if (node.type != Type::Block) {
                 continue;
             }
-            if (branch_depth > 1) {
-                // Skip reordering nested demote branches.
-                continue;
-            }
+            bool collected_demote = false;
             for (const IR::Inst& inst : node.data.block->Instructions()) {
                 const IR::Opcode op{inst.GetOpcode()};
-                if (op == IR::Opcode::DemoteToHelperInvocation) {
+                if (op == IR::Opcode::DemoteToHelperInvocation && branch_depth <= 1 &&
+                    !collected_demote) {
+                    // Only move demotes at the supported branch depth.
                     demote_blocks.push_back(node.data.block);
-                    break;
+                    collected_demote = true;
                 }
+                // Count all returns, including nested early exits. Moving a
+                // demote past one would let discarded fragments write color.
                 if (op == IR::Opcode::Epilogue) {
                     ++num_epilogues;
                 }
@@ -899,8 +913,9 @@ private:
         if (demote_blocks.size() == 0) {
             return;
         }
-        if (num_epilogues > 1) {
-            LOG_DEBUG(Shader, "Combining demotes with more than one return is not implemented.");
+        if (num_epilogues != 1) {
+            // Reordering needs a unique return block, including in shaders with no exit.
+            LOG_DEBUG(Shader, "Combining demotes requires exactly one return.");
             return;
         }
         s64 last_iterator_offset{};

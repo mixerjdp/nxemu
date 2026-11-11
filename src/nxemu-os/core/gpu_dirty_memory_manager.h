@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include <algorithm>
 #include <atomic>
 #include <bit>
 #include <functional>
@@ -22,39 +23,42 @@ public:
     ~GPUDirtyMemoryManager() = default;
 
     void Collect(PAddr address, size_t size) {
-        TransformAddress t = BuildTransform(address, size);
-        TransformAddress tmp, original;
-        do {
-            tmp = current.load(std::memory_order_acquire);
-            original = tmp;
-            if (tmp.address != t.address) {
-                if (IsValid(tmp.address)) {
-                    std::scoped_lock lk(guard);
-                    back_buffer.emplace_back(tmp);
-                    current.exchange(t, std::memory_order_relaxed);
-                    return;
-                }
-                tmp.address = t.address;
-                tmp.mask = 0;
-            }
-            if ((tmp.mask | t.mask) == tmp.mask) {
-                return;
-            }
-            tmp.mask |= t.mask;
-        } while (!current.compare_exchange_weak(original, tmp, std::memory_order_release,
-                                                std::memory_order_relaxed));
+        // The mask represents one 2-KiB window. A CPU block write can cross
+        // that boundary (including a full 4-KiB guest page), so retain each part.
+        while (size != 0) {
+            const size_t chunk = std::min<size_t>(size, page_size - (address & page_mask));
+            CollectSingleWindow(address, chunk);
+            address += chunk;
+            size -= chunk;
+        }
+    }
+
+    // Collect widens writes to 64-byte blocks. A block can also hold GPU writes not downloaded
+    // yet, which invalidating it would replace with stale guest memory: keep known ranges exact.
+    void CollectExact(PAddr address, size_t size) {
+        std::scoped_lock lk(guard);
+        exact_back_buffer.emplace_back(address, size);
     }
 
     void Gather(ICacheInvalidator * invalidator)
     {
+        // Video decode and GPU cache flushes can gather from different threads.
+        // Protect the entire traversal, not only the buffer swap, because the
+        // front buffers are reused by the next Gather call.
+        std::scoped_lock gather_lock(gather_guard);
         {
             std::scoped_lock lk(guard);
             TransformAddress t = current.exchange(default_transform, std::memory_order_relaxed);
             front_buffer.swap(back_buffer);
+            exact_front_buffer.swap(exact_back_buffer);
             if (IsValid(t.address)) {
                 front_buffer.emplace_back(t);
             }
         }
+        for (const auto& [address, size] : exact_front_buffer) {
+            invalidator->OnCacheInvalidation(address, static_cast<uint32_t>(size));
+        }
+        exact_front_buffer.clear();
         for (auto& transform : front_buffer) {
             size_t offset = 0;
             u64 mask = transform.mask;
@@ -89,17 +93,16 @@ private:
     constexpr static TransformAddress default_transform = {.address = ~0U, .mask = 0U};
 
     bool IsValid(PAddr address) {
-        return address < (1ULL << 39);
+        // TransformAddress stores a 2-KiB window index, not a byte address.
+        // In particular, the all-ones empty sentinel must not be considered valid.
+        return address < (1ULL << (39 - page_bits));
     }
 
     template <typename T>
     T CreateMask(size_t top_bit, size_t minor_bit) {
-        T mask = ~T(0);
-        mask <<= (sizeof(T) * 8 - top_bit);
-        mask >>= (sizeof(T) * 8 - top_bit);
-        mask >>= minor_bit;
-        mask <<= minor_bit;
-        return mask;
+        // Non-empty fragments guarantee 1 <= top_bit <= width and minor_bit < width.
+        // Two shifts suffice, including a full-window mask, without a width-sized shift.
+        return (~T{0} >> (sizeof(T) * 8 - top_bit)) & (~T{0} << minor_bit);
     }
 
     TransformAddress BuildTransform(PAddr address, size_t size) {
@@ -112,10 +115,47 @@ private:
         return result;
     }
 
+    void CollectSingleWindow(PAddr address, size_t size) {
+        TransformAddress t = BuildTransform(address, size);
+        TransformAddress tmp, original;
+        for (;;) {
+            tmp = current.load(std::memory_order_acquire);
+            original = tmp;
+            if (tmp.address != t.address) {
+                if (IsValid(tmp.address)) {
+                    std::scoped_lock lk(guard);
+                    // The value can change while waiting for the buffer lock.
+                    // Exchange would overwrite another collector's range; only
+                    // retire the value we actually observed.
+                    back_buffer.emplace_back(tmp);
+                    if (current.compare_exchange_strong(original, t, std::memory_order_release,
+                                                        std::memory_order_relaxed)) {
+                        return;
+                    }
+                    back_buffer.pop_back();
+                    continue;
+                }
+                tmp.address = t.address;
+                tmp.mask = 0;
+            }
+            if ((tmp.mask | t.mask) == tmp.mask) {
+                return;
+            }
+            tmp.mask |= t.mask;
+            if (current.compare_exchange_weak(original, tmp, std::memory_order_release,
+                                              std::memory_order_relaxed)) {
+                return;
+            }
+        }
+    }
+
     std::atomic<TransformAddress> current{};
     std::mutex guard;
+    std::mutex gather_guard;
     std::vector<TransformAddress> back_buffer;
     std::vector<TransformAddress> front_buffer;
+    std::vector<std::pair<PAddr, size_t>> exact_back_buffer;
+    std::vector<std::pair<PAddr, size_t>> exact_front_buffer;
 };
 
 } // namespace Core

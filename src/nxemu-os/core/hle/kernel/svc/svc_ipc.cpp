@@ -53,22 +53,7 @@ Result ReplyAndReceiveImpl(KernelCore& kernel, int32_t* out_index, uintptr_t mes
 
     // Receive a message.
     {
-        // Convert the timeout from nanoseconds to ticks.
-        // NOTE: Nintendo does not use this conversion logic in WaitSynchronization...
-        s64 timeout;
-        if (timeout_ns > 0) {
-            const s64 offset_tick(timeout_ns);
-            if (offset_tick > 0) {
-                timeout = kernel.HardwareTimer().GetTick() + offset_tick + 2;
-                if (timeout <= 0) {
-                    timeout = std::numeric_limits<s64>::max();
-                }
-            } else {
-                timeout = std::numeric_limits<s64>::max();
-            }
-        } else {
-            timeout = timeout_ns;
-        }
+        const s64 timeout = kernel.HardwareTimer().GetTimeoutDeadlineNs(timeout_ns);
 
         // Wait for a message.
         while (true) {
@@ -175,6 +160,11 @@ Result SendSyncRequestWithUserBuffer(Core::System& system, uint64_t message, uin
 Result SendAsyncRequestWithUserBuffer(Core::System& system, Handle* out_event_handle,
                                       uint64_t message, uint64_t buffer_size,
                                       Handle session_handle) {
+    R_UNLESS(Common::IsAligned(message, PageSize), ResultInvalidAddress);
+    R_UNLESS(buffer_size > 0, ResultInvalidSize);
+    R_UNLESS(Common::IsAligned(buffer_size, PageSize), ResultInvalidSize);
+    R_UNLESS(message < message + buffer_size, ResultInvalidCurrentMemory);
+
     // Get the process and handle table.
     auto& process = GetCurrentProcess(system.Kernel());
     auto& handle_table = process.GetHandleTable();
@@ -191,6 +181,15 @@ Result SendAsyncRequestWithUserBuffer(Core::System& system, Handle* out_event_ha
     // Get the parent, and persist a reference to it until we're done.
     KScopedAutoObject parent = session->GetParent();
     ASSERT(parent.IsNotNull());
+
+    // A successful enqueue transfers buffer ownership to the request's reply/cleanup path.
+    auto& page_table = process.GetKPageTable();
+    R_TRY(page_table.LockForIpcUserBuffer(nullptr, message, buffer_size));
+    bool readable_handle_created = false;
+    ON_RESULT_FAILURE {
+        if (readable_handle_created) handle_table.Remove(*out_event_handle);
+        page_table.UnlockForIpcUserBuffer(message, buffer_size);
+    };
 
     // Create a new event.
     KEvent* event = KEvent::Create(system.Kernel());
@@ -214,10 +213,7 @@ Result SendAsyncRequestWithUserBuffer(Core::System& system, Handle* out_event_ha
     // Add the readable event to the handle table.
     R_TRY(handle_table.Add(out_event_handle, std::addressof(event->GetReadableEvent())));
 
-    // Ensure that if we fail to send the request, we close the readable handle.
-    ON_RESULT_FAILURE {
-        handle_table.Remove(*out_event_handle);
-    };
+    readable_handle_created = true;
 
     // Send the async request.
     R_RETURN(session->SendAsyncRequest(event, message, buffer_size));

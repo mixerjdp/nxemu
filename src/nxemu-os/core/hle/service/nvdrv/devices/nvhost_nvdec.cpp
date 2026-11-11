@@ -81,7 +81,7 @@ void nvhost_nvdec::OnOpen(NvCore::SessionId session_id, DeviceFD fd)
 {
     LOG_INFO(Service_NVDRV, "NVDEC video stream started");
     system.SetNVDECActive(true);
-    sessions[fd] = session_id;
+    sessions[fd] = core.GetSessionReference(session_id);
 }
 
 void nvhost_nvdec::OnClose(DeviceFD fd)
@@ -93,12 +93,13 @@ void nvhost_nvdec::OnClose(DeviceFD fd)
     {
         system.GetVideo().ClearCdmaInstance(iter->second);
     }
-    system.SetNVDECActive(false);
     auto it = sessions.find(fd);
     if (it != sessions.end())
     {
         sessions.erase(it);
     }
+    // A game may open more than one stream for a video; it plays until the last one closes
+    system.SetNVDECActive(!sessions.empty());
 }
 
 } // namespace Service::Nvidia::Devices

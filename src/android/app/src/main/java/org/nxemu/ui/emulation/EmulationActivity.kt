@@ -1,6 +1,8 @@
 package org.nxemu.ui.emulation
 
+import android.content.Intent
 import android.content.res.Configuration
+import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.graphics.ImageDecoder
 import android.graphics.PixelFormat
@@ -11,27 +13,42 @@ import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
+import android.os.SystemClock
 import android.util.Base64
 import android.util.Log
+import android.view.Gravity
+import android.view.InputDevice
+import android.view.KeyEvent
+import android.view.MotionEvent
 import android.view.SurfaceHolder
 import android.view.SurfaceView
 import android.view.View
 import android.view.WindowManager
 import android.widget.ImageView
 import android.widget.TextView
+import android.widget.Toast
 import androidx.activity.ComponentActivity
+import androidx.activity.OnBackPressedCallback
 import androidx.core.view.WindowCompat
 import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.WindowInsetsControllerCompat
+import androidx.drawerlayout.widget.DrawerLayout
 import org.nxemu.NXCoreSetting
+import org.nxemu.NXUISetting
 import org.nxemu.NativeLibrary
 import org.nxemu.R
 import org.nxemu.overlay.InputOverlay
 import org.nxemu.overlay.model.OverlayLayout
+import org.nxemu.ui.main.SettingsActivity
+import org.nxemu.utils.InputHandler
+import org.nxemu.utils.NativeConfig
+import org.nxemu.utils.Translation.tr
+import org.nxemu.utils.Translation.trCount
 import org.json.JSONObject
 import java.nio.ByteBuffer
 import java.util.Locale
 import java.util.concurrent.Executors
+import java.util.concurrent.RejectedExecutionException
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 
@@ -40,6 +57,11 @@ class EmulationActivity : ComponentActivity(), SurfaceHolder.Callback {
         Thread(r, "nxemu-emu").apply { isDaemon = true }
     }
     private val nativeSurfaceSessionOpen = AtomicBoolean(false)
+    private var explicitExit = false
+    private var leavingApp = false
+    private lateinit var pausedFrameImage: ImageView
+    private val captureInFlight = AtomicBoolean(false)
+    private val pausedFrameListener = { updatePauseLabel() }
     private val perfStatsHandler = Handler(Looper.getMainLooper())
     private var perfStatsUpdater: Runnable? = null
     private lateinit var loadingIndicator: View
@@ -50,9 +72,40 @@ class EmulationActivity : ComponentActivity(), SurfaceHolder.Callback {
     private lateinit var showFpsText: TextView
     private lateinit var showDeviceText: TextView
     private lateinit var surfaceInputOverlay: InputOverlay
+    private lateinit var drawerLayout: DrawerLayout
+    private lateinit var pauseItem: TextView
+    private lateinit var pausedIcon: ImageView
+    private lateinit var lockDrawerItem: TextView
     private lateinit var overlayAppVersion: String
     private lateinit var overlayPhoneModel: String
     private lateinit var overlaySoc: String
+    private var drawerStickY = 0
+    private val drawerStickRepeat = object : Runnable {
+        override fun run() {
+            if (drawerStickY == 0 || !::drawerLayout.isInitialized || !drawerLayout.isDrawerOpen(Gravity.START)) {
+                return
+            }
+            moveDrawerFocus(drawerStickY)
+            perfStatsHandler.postDelayed(this, DRAWER_REPEAT_MS)
+        }
+    }
+
+    private val programEventListener: () -> Unit = {
+        try {
+            executor.execute {
+                when (NativeLibrary.processProgramEvents()) {
+                    NativeLibrary.PROGRAM_EVENT_RELOADED -> runOnUiThread { showLoading() }
+                    NativeLibrary.PROGRAM_EVENT_EXITED -> runOnUiThread { exitGame() }
+                    NativeLibrary.PROGRAM_EVENT_FAILED -> runOnUiThread {
+                        Toast.makeText(this, tr("Could not start the next part of this game."), Toast.LENGTH_LONG).show()
+                        exitGame()
+                    }
+                }
+            }
+        } catch (_: RejectedExecutionException) {
+            // The activity is closing and its teardown stops the game.
+        }
+    }
 
     private val settingChangedListener: (String) -> Unit = { setting ->
         if (setting == NXCoreSetting.DisplayedFrames) {
@@ -74,16 +127,46 @@ class EmulationActivity : ComponentActivity(), SurfaceHolder.Callback {
         loadingImage = findViewById(R.id.loading_image)
         loadingTitle = findViewById(R.id.loading_title)
         loadingTitle.text = getString(R.string.app_name)
+        findViewById<TextView>(R.id.loading_text).text = tr("Loading...")
         showFpsText = findViewById(R.id.show_fps_text)
         showDeviceText = findViewById(R.id.show_device_text)
         surfaceInputOverlay = findViewById(R.id.surface_input_overlay)
         surfaceInputOverlay.setZOrderMediaOverlay(true)
         surfaceInputOverlay.holder.setFormat(PixelFormat.TRANSLUCENT)
+        drawerLayout = findViewById(R.id.drawer_layout)
+        pauseItem = findViewById(R.id.menu_pause)
+        pausedIcon = findViewById(R.id.paused_icon)
+        pausedFrameImage = findViewById(R.id.paused_frame_image)
+        frameListener = pausedFrameListener
+        pausedIcon.setOnClickListener {
+            if (NativeLibrary.isPaused()) {
+                resumeAfterBackground.set(false)
+                NativeLibrary.unpauseEmulation()
+                clearPausedFrame()
+                updatePauseLabel()
+            }
+        }
+        lockDrawerItem = findViewById(R.id.menu_lock_drawer)
+        setupInGameDrawer()
         updateInputOverlayLayout()
         cacheDeviceOverlayInfo()
 
         NativeLibrary.addSettingChangedListener(settingChangedListener)
+        NativeLibrary.addProgramEventListener(programEventListener)
         hideLoadingIfFirstFrame()
+
+        onBackPressedDispatcher.addCallback(
+            this,
+            object : OnBackPressedCallback(true) {
+                override fun handleOnBackPressed() {
+                    if (drawerLayout.isDrawerOpen(Gravity.START)) {
+                        drawerLayout.closeDrawer(Gravity.START)
+                    } else {
+                        drawerLayout.openDrawer(Gravity.START)
+                    }
+                }
+            },
+        )
 
         val path = intent.getStringExtra(EXTRA_GAME_PATH)
         if (path.isNullOrEmpty()) {
@@ -103,6 +186,304 @@ class EmulationActivity : ComponentActivity(), SurfaceHolder.Callback {
         }
     }
 
+    override fun onUserLeaveHint() {
+        leavingApp = true
+        super.onUserLeaveHint()
+    }
+
+    override fun onResume() {
+        super.onResume()
+        leavingApp = false
+        val surface = findViewById<SurfaceView>(R.id.emulation_surface).holder.surface
+        if (surface != null && surface.isValid) {
+            unpauseIfBackgrounded()
+        }
+        updatePauseLabel()
+        if (NativeLibrary.isPaused() && pausedFrame == null) {
+            capturePausedFrame()
+        }
+        InputHandler.updateControllerData()
+        if (::surfaceInputOverlay.isInitialized) {
+            updateInputOverlayLayout()
+            surfaceInputOverlay.refreshControls()
+        }
+    }
+
+    override fun onPause() {
+        releaseDrawerStick()
+        val leftApp = leavingApp
+        if (!NativeLibrary.isPaused()) {
+            NativeLibrary.pauseEmulation()
+            resumeAfterBackground.set(true)
+        }
+        if (leftApp) {
+            capturePausedFrame()
+        }
+        leavingApp = false
+        super.onPause()
+    }
+
+    override fun dispatchKeyEvent(event: KeyEvent): Boolean {
+        if (event.keyCode == KeyEvent.KEYCODE_BACK) {
+            return super.dispatchKeyEvent(event)
+        }
+        val source = event.source
+        val fromGamepad = source and InputDevice.SOURCE_GAMEPAD == InputDevice.SOURCE_GAMEPAD ||
+            source and InputDevice.SOURCE_JOYSTICK == InputDevice.SOURCE_JOYSTICK
+        if (!fromGamepad) {
+            return super.dispatchKeyEvent(event)
+        }
+        if (::drawerLayout.isInitialized && drawerLayout.isDrawerOpen(Gravity.START)) {
+            handleDrawerPad(event)
+            return true
+        }
+        if (InputHandler.dispatchKeyEvent(event)) {
+            return true
+        }
+        return super.dispatchKeyEvent(event)
+    }
+
+    override fun dispatchGenericMotionEvent(event: MotionEvent): Boolean {
+        val fromStick = event.source and InputDevice.SOURCE_JOYSTICK == InputDevice.SOURCE_JOYSTICK ||
+            event.source and InputDevice.SOURCE_GAMEPAD == InputDevice.SOURCE_GAMEPAD
+        if (fromStick && ::drawerLayout.isInitialized && drawerLayout.isDrawerOpen(Gravity.START)) {
+            handleDrawerStick(event)
+            return true
+        }
+        if (InputHandler.dispatchGenericMotionEvent(event)) {
+            return true
+        }
+        return super.dispatchGenericMotionEvent(event)
+    }
+
+    private fun setupInGameDrawer() {
+        drawerLayout.setDrawerLockMode(DrawerLayout.LOCK_MODE_LOCKED_CLOSED)
+        drawerLayout.addDrawerListener(object : DrawerLayout.SimpleDrawerListener() {
+            override fun onDrawerSlide(drawerView: View, slideOffset: Float) {
+                releaseOverlayTouches()
+                if (slideOffset > 0f) {
+                    surfaceInputOverlay.visibility = View.INVISIBLE
+                }
+            }
+
+            override fun onDrawerOpened(drawerView: View) {
+                drawerLayout.setDrawerLockMode(DrawerLayout.LOCK_MODE_UNLOCKED)
+                updatePauseLabel()
+                drawerMenuItems().first().requestFocus()
+            }
+
+            override fun onDrawerClosed(drawerView: View) {
+                releaseDrawerStick()
+                drawerLayout.setDrawerLockMode(savedDrawerLockMode())
+                updateInputOverlayVisibility()
+            }
+        })
+        pauseItem.setOnClickListener { togglePause() }
+        pausedIcon.contentDescription = tr("Unpause emulation")
+        findViewById<TextView>(R.id.menu_settings).text = tr("Settings")
+        findViewById<TextView>(R.id.menu_exit).text = tr("Exit emulation")
+        findViewById<View>(R.id.menu_settings).setOnClickListener {
+            drawerLayout.closeDrawers()
+            startActivity(Intent(this, SettingsActivity::class.java))
+        }
+        lockDrawerItem.setOnClickListener { toggleDrawerLock() }
+        findViewById<View>(R.id.menu_exit).setOnClickListener {
+            drawerLayout.closeDrawers()
+            exitGame()
+        }
+        updatePauseLabel()
+        updateLockDrawerLabel()
+    }
+
+    private fun exitGame() {
+        if (isFinishing) {
+            return
+        }
+        explicitExit = true
+        activeGamePath = null
+        clearPausedFrame()
+        finish()
+    }
+
+    private fun showLoading() {
+        stopPerfOverlay()
+        loadingIndicator.visibility = View.VISIBLE
+        hideLoadingIfFirstFrame()
+    }
+
+    private fun togglePause() {
+        if (NativeLibrary.isPaused()) {
+            NativeLibrary.unpauseEmulation()
+            clearPausedFrame()
+        } else {
+            resumeAfterBackground.set(false)
+            NativeLibrary.pauseEmulation()
+            capturePausedFrame()
+        }
+        updatePauseLabel()
+    }
+
+    private fun updatePauseLabel() {
+        val paused = NativeLibrary.isPaused()
+        pauseItem.text = if (paused) tr("Unpause emulation") else tr("Pause emulation")
+        if (::pausedIcon.isInitialized) {
+            pausedIcon.visibility = if (paused) View.VISIBLE else View.GONE
+        }
+        if (::pausedFrameImage.isInitialized) {
+            val frame = if (paused) pausedFrame else null
+            pausedFrameImage.setImageBitmap(frame)
+            pausedFrameImage.visibility = if (frame != null) View.VISIBLE else View.GONE
+        }
+        updateInputOverlayVisibility()
+    }
+
+    private fun updateInputOverlayVisibility() {
+        if (!::surfaceInputOverlay.isInitialized || !::drawerLayout.isInitialized || !::loadingIndicator.isInitialized) {
+            return
+        }
+        val show = loadingIndicator.visibility != View.VISIBLE &&
+            !drawerLayout.isDrawerOpen(Gravity.START) &&
+            !NativeLibrary.isPaused()
+        if (!show && surfaceInputOverlay.visibility == View.VISIBLE) {
+            releaseOverlayTouches()
+        }
+        surfaceInputOverlay.visibility = if (show) View.VISIBLE else View.INVISIBLE
+    }
+
+    private fun capturePausedFrame() {
+        if (!captureInFlight.compareAndSet(false, true)) {
+            return
+        }
+        executor.execute {
+            try {
+                val width = NativeLibrary.getAppletCaptureWidth()
+                val height = NativeLibrary.getAppletCaptureHeight()
+                val frame = NativeLibrary.getAppletCaptureBuffer()
+                val expected = width * height * 4
+                if (width <= 0 || height <= 0 || frame.size < expected) {
+                    return@execute
+                }
+                val bitmap = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
+                bitmap.copyPixelsFromBuffer(ByteBuffer.wrap(frame, 0, expected))
+                val previous = pausedFrame
+                pausedFrame = bitmap
+                Handler(Looper.getMainLooper()).post {
+                    frameListener?.invoke()
+                    if (previous != null && previous !== pausedFrame) {
+                        previous.recycle()
+                    }
+                }
+            } finally {
+                captureInFlight.set(false)
+            }
+        }
+    }
+
+    private fun clearPausedFrame() {
+        val previous = pausedFrame
+        pausedFrame = null
+        if (::pausedFrameImage.isInitialized) {
+            pausedFrameImage.setImageDrawable(null)
+            pausedFrameImage.visibility = View.GONE
+        }
+        previous?.recycle()
+    }
+
+    private fun releaseOverlayTouches() {
+        val event = MotionEvent.obtain(
+            SystemClock.uptimeMillis(),
+            SystemClock.uptimeMillis(),
+            MotionEvent.ACTION_UP,
+            0f,
+            0f,
+            0,
+        )
+        surfaceInputOverlay.dispatchTouchEvent(event)
+        event.recycle()
+    }
+
+    private fun savedDrawerLockMode(): Int {
+        return if (NativeLibrary.getSettingBool(NXUISetting.LockDrawer)) {
+            DrawerLayout.LOCK_MODE_LOCKED_CLOSED
+        } else {
+            DrawerLayout.LOCK_MODE_UNLOCKED
+        }
+    }
+
+    private fun toggleDrawerLock() {
+        NativeLibrary.setSettingBool(NXUISetting.LockDrawer, !NativeLibrary.getSettingBool(NXUISetting.LockDrawer))
+        updateLockDrawerLabel()
+        NativeConfig.saveGlobalConfig()
+    }
+
+    private fun updateLockDrawerLabel() {
+        lockDrawerItem.text = if (savedDrawerLockMode() == DrawerLayout.LOCK_MODE_LOCKED_CLOSED) tr("Unlock drawer") else tr("Lock drawer")
+    }
+
+    private fun drawerMenuItems(): List<View> {
+        return listOf(
+            findViewById(R.id.menu_pause),
+            findViewById(R.id.menu_settings),
+            findViewById(R.id.menu_lock_drawer),
+            findViewById(R.id.menu_exit),
+        )
+    }
+
+    private fun handleDrawerPad(event: KeyEvent) {
+        val down = event.action == KeyEvent.ACTION_DOWN
+        when (event.keyCode) {
+            KeyEvent.KEYCODE_BUTTON_B -> {
+                if (down && event.repeatCount == 0) {
+                    drawerLayout.closeDrawer(Gravity.START)
+                }
+            }
+            KeyEvent.KEYCODE_BUTTON_A, KeyEvent.KEYCODE_DPAD_CENTER, KeyEvent.KEYCODE_ENTER -> {
+                if (down && event.repeatCount == 0) {
+                    currentDrawerItem().performClick()
+                }
+            }
+            KeyEvent.KEYCODE_DPAD_UP -> if (down) moveDrawerFocus(-1)
+            KeyEvent.KEYCODE_DPAD_DOWN -> if (down) moveDrawerFocus(1)
+        }
+    }
+
+    private fun handleDrawerStick(event: MotionEvent) {
+        val y = when {
+            event.getAxisValue(MotionEvent.AXIS_Y) > DRAWER_STICK_DEADZONE -> 1
+            event.getAxisValue(MotionEvent.AXIS_Y) < -DRAWER_STICK_DEADZONE -> -1
+            else -> 0
+        }
+        if (y == drawerStickY) {
+            return
+        }
+        drawerStickY = y
+        perfStatsHandler.removeCallbacks(drawerStickRepeat)
+        if (y == 0) {
+            return
+        }
+        moveDrawerFocus(y)
+        perfStatsHandler.postDelayed(drawerStickRepeat, DRAWER_REPEAT_MS)
+    }
+
+    private fun releaseDrawerStick() {
+        drawerStickY = 0
+        perfStatsHandler.removeCallbacks(drawerStickRepeat)
+    }
+
+    private fun moveDrawerFocus(delta: Int) {
+        val items = drawerMenuItems()
+        if (items.isEmpty()) {
+            return
+        }
+        val current = items.indexOfFirst { it.hasFocus() }.let { if (it < 0) 0 else it }
+        items[(current + delta).coerceIn(0, items.lastIndex)].requestFocus()
+    }
+
+    private fun currentDrawerItem(): View {
+        val items = drawerMenuItems()
+        return items.firstOrNull { it.hasFocus() } ?: items.first().also { it.requestFocus() }
+    }
+
     private fun hideSystemBars() {
         WindowCompat.getInsetsController(window, window.decorView).apply {
             hide(WindowInsetsCompat.Type.systemBars())
@@ -115,7 +496,8 @@ class EmulationActivity : ComponentActivity(), SurfaceHolder.Callback {
             stopAnimatedDrawables()
             loadingIndicator.visibility = View.GONE
             startPerfOverlay()
-            surfaceInputOverlay.visibility = View.VISIBLE
+            updateInputOverlayVisibility()
+            drawerLayout.setDrawerLockMode(savedDrawerLockMode())
             updateInputOverlayLayout()
             surfaceInputOverlay.refreshControls()
         }
@@ -137,8 +519,7 @@ class EmulationActivity : ComponentActivity(), SurfaceHolder.Callback {
                 val shaders = NativeLibrary.getShadersBuilding()
                 var fpsLine = String.format(Locale.US, "FPS: %.1f", fps)
                 if (shaders > 0) {
-                    val shaderLabel = if (shaders == 1) "shader" else "shaders"
-                    fpsLine += String.format(Locale.US, " | Building: %d %s", shaders, shaderLabel)
+                    fpsLine += " | " + trCount("Building %n shader", "Building %n shaders", shaders.toLong())
                 }
                 showFpsText.text = fpsLine
                 showDeviceText.text = deviceOverlayLine()
@@ -185,7 +566,7 @@ class EmulationActivity : ComponentActivity(), SurfaceHolder.Callback {
 
     private fun loadRomInfo(path: String) {
         try {
-            val json = JSONObject(NativeLibrary.queryRomInfo(path))
+            val json = JSONObject(NativeLibrary.queryRomInfo(path, intent.getLongExtra(EXTRA_PROGRAM_ID, 0L)))
             val title = json.optString("title")
             val icon = json.optString("icon")
             val logo = json.optString("logo")
@@ -255,45 +636,45 @@ class EmulationActivity : ComponentActivity(), SurfaceHolder.Callback {
         }
     }
 
-    override fun surfaceCreated(holder: SurfaceHolder) {
-        if (!nativeSurfaceSessionOpen.compareAndSet(false, true)) {
-            Log.w(TAG, "Ignoring extra surfaceCreated")
+    override fun surfaceCreated(holder: SurfaceHolder) = Unit
+
+    override fun surfaceChanged(holder: SurfaceHolder, format: Int, width: Int, height: Int) {
+        if (width <= 0 || height <= 0) {
             return
         }
         val path = intent.getStringExtra(EXTRA_GAME_PATH)
         if (path.isNullOrEmpty()) {
             Log.e(TAG, "Missing EXTRA_GAME_PATH")
-            nativeSurfaceSessionOpen.set(false)
             finish()
             return
         }
-        val ratio = resources.displayMetrics.density
+        val programId = intent.getLongExtra(EXTRA_PROGRAM_ID, 0L)
         val surface = holder.surface
+        val ratio = resources.displayMetrics.density
         executor.execute {
             try {
-                if (!NativeLibrary.emulationSurfaceReady(surface, ratio, path)) {
-                    Log.e(TAG, "emulationSurfaceReady returned false")
-                    nativeSurfaceSessionOpen.set(false)
-                    runOnUiThread { finish() }
+                if (!nativeSurfaceSessionOpen.get()) {
+                    if (!NativeLibrary.emulationSurfaceReady(surface, ratio, path, programId)) {
+                        Log.e(TAG, "emulationSurfaceReady returned false")
+                        runOnUiThread { finish() }
+                    } else {
+                        nativeSurfaceSessionOpen.set(true)
+                        activeGamePath = path
+                        activeProgramId = programId
+                        InputHandler.updateControllerData()
+                        unpauseIfBackgrounded()
+                        runOnUiThread { updatePauseLabel() }
+                    }
+                } else {
+                    NativeLibrary.surfaceChanged(surface)
+                    unpauseIfBackgrounded()
+                    runOnUiThread { updatePauseLabel() }
                 }
             } catch (e: Throwable) {
-                Log.e(TAG, "emulationSurfaceReady failed", e)
-                nativeSurfaceSessionOpen.set(false)
-                runOnUiThread { finish() }
-            }
-        }
-    }
-
-    override fun surfaceChanged(holder: SurfaceHolder, format: Int, width: Int, height: Int) {
-        if (!nativeSurfaceSessionOpen.get() || width <= 0 || height <= 0) {
-            return
-        }
-        val surface = holder.surface
-        executor.execute {
-            try {
-                NativeLibrary.surfaceChanged(surface)
-            } catch (e: Throwable) {
                 Log.e(TAG, "surfaceChanged failed", e)
+                if (!nativeSurfaceSessionOpen.get()) {
+                    runOnUiThread { finish() }
+                }
             }
         }
     }
@@ -301,27 +682,26 @@ class EmulationActivity : ComponentActivity(), SurfaceHolder.Callback {
     override fun surfaceDestroyed(holder: SurfaceHolder) {
         try {
             executor.submit {
-                try {
-                    NativeLibrary.emulationSurfaceDestroyed()
-                } finally {
-                    nativeSurfaceSessionOpen.set(false)
-                }
+                NativeLibrary.emulationSurfaceDestroyed()
             }.get(120, TimeUnit.SECONDS)
         } catch (e: Exception) {
             Log.e(TAG, "emulationSurfaceDestroyed failed", e)
-            nativeSurfaceSessionOpen.set(false)
         }
     }
 
     override fun onDestroy() {
+        if (frameListener === pausedFrameListener) {
+            frameListener = null
+        }
         NativeLibrary.removeSettingChangedListener(settingChangedListener)
+        NativeLibrary.removeProgramEventListener(programEventListener)
         stopPerfOverlay()
         stopAnimatedDrawables()
-        if (nativeSurfaceSessionOpen.get()) {
+        if (explicitExit && nativeSurfaceSessionOpen.get()) {
             try {
                 executor.submit {
                     try {
-                        NativeLibrary.emulationSurfaceDestroyed()
+                        NativeLibrary.emulationStopped()
                     } finally {
                         nativeSurfaceSessionOpen.set(false)
                     }
@@ -342,8 +722,26 @@ class EmulationActivity : ComponentActivity(), SurfaceHolder.Callback {
         super.onDestroy()
     }
 
+    private fun unpauseIfBackgrounded() {
+        if (resumeAfterBackground.compareAndSet(true, false)) {
+            NativeLibrary.unpauseEmulation()
+            runOnUiThread {
+                clearPausedFrame()
+                updatePauseLabel()
+            }
+        }
+    }
+
     companion object {
+        private val resumeAfterBackground = AtomicBoolean(false)
+        var activeGamePath: String? = null
+        var activeProgramId = 0L
+        var pausedFrame: Bitmap? = null
+        var frameListener: (() -> Unit)? = null
         const val EXTRA_GAME_PATH = "org.nxemu.EXTRA_GAME_PATH"
+        const val EXTRA_PROGRAM_ID = "org.nxemu.EXTRA_PROGRAM_ID"
         private const val TAG = "NxEmu-Emulation"
+        private const val DRAWER_REPEAT_MS = 220L
+        private const val DRAWER_STICK_DEADZONE = 0.5f
     }
 }

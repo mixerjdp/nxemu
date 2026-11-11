@@ -15,6 +15,7 @@ public:
     ~VideoManager();
 
     void EmulationStarting();
+    void EmulationStopping(bool wait);
 
     // IVideo
     bool Initialize() override;
@@ -35,6 +36,12 @@ public:
     uint64_t Host1xRegisterProcess(IMemory* memory) override;
     void Host1xUnregisterProcess(uint64_t asid) override;
     void RequestComposite(VideoFramebufferConfig * layers, uint32_t layerCount, VideoNvFence * fences, uint32_t fenceCount) override;
+    void WaitForComposite() override;
+    void CancelPendingComposite() override;
+    bool AttachInterface(VideoInterfaceDevice * device) override;
+    bool BeginInterfaceFrame(uint32_t width, uint32_t height, VideoInterfaceFrame * frame) override;
+    void EndInterfaceFrame(const VideoInterfaceArea * gameArea) override;
+    void WaitInterfaceIdle() override;
     void UpdateFramebufferLayout(uint32_t width, uint32_t height) override;
     IChannelState * AllocateChannel() override;
     void PushGPUEntries(int32_t bindId, const uint64_t * commandList, uint32_t commandListSize, const uint32_t * prefetchCommandlist, uint32_t prefetchCommandlistSize) override;
@@ -43,13 +50,21 @@ public:
     void HandleRasterizerWrite(const uint8_t * pointer, uint64_t size, uint64_t * last_page, RasterizerDirtyCollect collect, void * user_data) override;
     void DeregisterHostAction(uint32_t syncpoint_id, uint32_t handle) override;
     uint32_t HostSyncpointValue(uint32_t id) override;
+    void HostSyncpointIncrement(uint32_t id) override;
     uint32_t HostSyncpointRegisterAction(uint32_t fence_id, uint32_t target_value, HostActionCallback operation, uint32_t slot, void * userData) override;
-    void WaitHost(uint32_t syncpoint_id, uint32_t expected_value) override;
+    bool WaitHost(uint32_t syncpoint_id, uint32_t expected_value, std::stop_token stop) override;
     uint32_t ShadersBuilding() override;
+    VideoPresentationState GetPresentationState() override;
     bool UseNvdec() override;
     void ClearCdmaInstance(uint32_t id) override;
+    void PushCommandBufferWithResources(int32_t bindId, const uint32_t* commandList,
+        uint32_t commandListSize, void* resources, void (*release)(void*)) override;
     uint32_t GetAppletCaptureBuffer(uint8_t * out, uint32_t out_size) override;
     void InvalidateMemory(const uint8_t * pointer, uint64_t size) override;
+    void NotifyWindowChanged() override;
+    uint32_t GetLinearAppletCaptureBuffer(uint8_t * out, uint32_t out_size, uint32_t * out_width, uint32_t * out_height) override;
+    bool ProcessShaderProfile(const ShaderProfileTask& task,IShaderProfileProgress& progress,
+        ShaderProfileResult& result,char* error,uint32_t error_size) override;
 
 private:
     VideoManager() = delete;

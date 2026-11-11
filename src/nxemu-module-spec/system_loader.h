@@ -94,6 +94,7 @@ enum class LoaderResultStatus : uint16_t {
     ErrorIntegrityVerificationNotImplemented,
     ErrorIntegrityVerificationFailed,
     ErrorBufferTooSmall,
+    ErrorCancelled,
 };
 
 enum class VirtualFileOpenMode : uint32_t {
@@ -153,12 +154,20 @@ struct ContentProviderEntry
     LoaderContentRecordType type;
 };
 
+enum class GamePatchType : uint8_t
+{
+    Update,
+    AddOnContent,
+    Mod,
+};
+
 struct GamePatchInfo
 {
     bool enabled;
     char name[128];
     char version[128];
     char key[128];
+    GamePatchType type;
 };
 
 struct SaveDataAttribute 
@@ -179,6 +188,15 @@ struct SaveDataSize {
 };
 static_assert(sizeof(SaveDataSize) == 0x10, "SaveDataSize has invalid size.");
 
+struct VirtualFileTimeStampRaw {
+    uint64_t created{};
+    uint64_t modified{};
+    uint64_t accessed{};
+    uint8_t is_valid{};
+    uint8_t padding[7]{};
+};
+static_assert(sizeof(VirtualFileTimeStampRaw) == 0x20);
+
 nxinterface IVirtualFile;
 nxinterface IVirtualDirectoryList;
 nxinterface IVirtualFileList;
@@ -196,6 +214,11 @@ nxinterface IVirtualDirectory
     virtual IVirtualFile * GetFileRelative(const char * relative_path) const = 0;
     virtual IVirtualFile * OpenFile(const char * path, VirtualFileOpenMode perms) = 0;
     virtual bool DeleteFile(const char * name) const = 0;
+    virtual bool DeleteSubdirectory(const char * name) const = 0;
+    virtual bool DeleteSubdirectoryRecursive(const char * name) const = 0;
+    virtual bool CleanSubdirectoryRecursive(const char * name) const = 0;
+    virtual bool RenameDirectory(const char * old_path, const char * new_path) const = 0;
+    virtual bool GetFileTimeStamp(VirtualFileTimeStampRaw * out, const char * path) const = 0;
     virtual const char * GetName() const = 0;
     virtual void Release() = 0;
 };
@@ -254,6 +277,8 @@ nxinterface IFileSysNACP
 {
     virtual uint32_t GetSupportedLanguages() const = 0;
     virtual uint32_t GetParentalControlFlag() const = 0;
+    virtual uint16_t GetCacheStorageMaxIndex() const = 0;
+    virtual uint64_t GetCacheStorageDataAndJournalMaxSize() const = 0;
     virtual bool GetUserAccountSwitchLock() const = 0;
     virtual bool GetRatingAge(uint8_t * buffer, uint32_t bufferSize) const = 0;
     virtual const char * GetVersionString() const = 0;
@@ -277,6 +302,8 @@ nxinterface IFileSysRegisteredCache
 nxinterface ISaveDataController
 {
     virtual bool CreateSaveData(IVirtualDirectory** out_save_data, SaveDataSpaceId space, const SaveDataAttribute & attribute) = 0;
+    virtual SaveDataSize ReadSaveDataSize(SaveDataType type, uint64_t title_id, uint64_t user_id_high, uint64_t user_id_low) = 0;
+    virtual void WriteSaveDataSize(SaveDataType type, uint64_t title_id, uint64_t user_id_high, uint64_t user_id_low, SaveDataSize new_value) = 0;
     virtual void Release() = 0;
 };
 
@@ -314,6 +341,7 @@ nxinterface IRomInfo
     virtual LoaderFileType GetFileType() const = 0;
     virtual LoaderResultStatus ReadProgramId(uint64_t & out_program_id) = 0;
     virtual LoaderResultStatus ReadTitle(char * buffer, uint32_t * bufferSize) = 0;
+    virtual LoaderResultStatus ReadDisplayVersion(char * buffer, uint32_t * bufferSize) = 0;
     virtual LoaderResultStatus ReadIcon(uint8_t * buffer, uint32_t * bufferSize) = 0;
     virtual LoaderResultStatus ReadBanner(uint8_t * buffer, uint32_t * bufferSize) = 0;
     virtual LoaderResultStatus ReadLogo(uint8_t * buffer, uint32_t * bufferSize) = 0;
@@ -327,14 +355,68 @@ nxinterface IRomInfo
     virtual void Release() = 0;
 };
 
+enum class FirmwareInstallStage : uint32_t
+{
+    Copying,
+    Checking,
+    Replacing,
+};
+
+enum class FirmwareInstallStatus : uint32_t
+{
+    Installed,
+    Cancelled,
+    SourceUnreadable,
+    NotFirmware,
+    StorageUnavailable,
+    CopyFailed,
+    ReplaceFailed,
+};
+
+nxinterface IFirmwareInstallObserver
+{
+    virtual bool FirmwareInstallProgress(FirmwareInstallStage stage, uint64_t done, uint64_t total) = 0;
+    virtual bool ConfirmFirmwareReplacement(const char * packageVersion, const char * installedVersion) = 0;
+};
+
+struct GameFileEntry
+{
+    const char * path;
+    uint64_t size;
+    int64_t modifiedTime;
+};
+
+nxinterface IGameListScanCallback
+{
+    virtual bool ScanStopRequested() = 0;
+    virtual void GameFound(const char * path, IRomInfo * romInfo, bool changed) = 0;
+    virtual void ScanProgress(uint32_t filesStarted, uint32_t filesTotal) = 0;
+};
+
+// Startup snapshot. Returned NCA interfaces belong to the caller (Release).
+struct ActiveProgramContent
+{
+    IFileSysNCA * base_program{};
+    IFileSysNCA * update_program{};
+    bool update_available{}, update_enabled{};
+    char base_version[128]{};
+    char update_version[128]{};
+    char code_mods[65]{}; // hash of the enabled ExeFS patches and cheats, empty without any
+};
+
 nxinterface ISystemloader
 {
     virtual bool Initialize() = 0;
     virtual uint32_t GetSupportedGameExtensions(const char ** extensions, uint32_t maxCount) const = 0;
-    virtual bool LoadRom(const char * fileName, int32_t program_index, int32_t previous_program_index, ApplicationLaunchType launch_type) = 0;
+    virtual bool LoadRom(const char * fileName, uint64_t program_id, int32_t program_index, int32_t previous_program_index, ApplicationLaunchType launch_type) = 0;
+    virtual bool PrepareRom(const char * fileName, uint64_t program_id, int32_t program_index, int32_t previous_program_index, ApplicationLaunchType launch_type) = 0;
+    virtual bool StartPreparedRom() = 0;
+    virtual void CancelPrepareRom() = 0;
     virtual IRomInfo * RomInfo(const char * fileName, uint64_t programId, uint64_t programIndex) = 0;
     virtual IRomInfo * FileRomInfo(IVirtualFile * file, uint64_t programId, uint64_t programIndex) = 0;
     virtual IRomInfo * LoadedRomInfo() = 0;
+    virtual bool ScanGameList(const char * const * gameDirs, const bool * scanSubfolders, uint32_t gameDirCount, IGameListScanCallback & callback) = 0;
+    virtual bool ScanGameFiles(const GameFileEntry * files, uint32_t fileCount, IGameListScanCallback & callback) = 0;
 
     virtual IContentProvider & ContentProvider() = 0;
     virtual IFilesystem & Filesystem() = 0;
@@ -348,9 +430,14 @@ nxinterface ISystemloader
     virtual IFileSysNACP * GetPMControlMetadata(uint64_t programID) = 0;
     virtual IManualContentProvider & ManualContentProvider() = 0;
     virtual uint32_t GetInstalledFirmwareDisplayVersion(char * buffer, uint32_t buffer_size) const = 0;
-    virtual bool InstallFirmwarePackage(const char * utf8_path) = 0;
+    virtual uint32_t GetGameCardFirmwareUpdate(const char * utf8_path, char * versionBuffer, uint32_t versionBufferSize) const = 0;
+    virtual FirmwareInstallStatus InstallFirmwarePackage(const char * utf8_path, IFirmwareInstallObserver * observer, char * versionBuffer, uint32_t versionBufferSize) = 0;
     virtual void SetDisabledAddons(uint64_t program_id, const char * const * names, uint32_t count) = 0;
     virtual bool IsAddonDisabled(uint64_t program_id, const char * name) const = 0;
+    virtual LoaderResultStatus GetPMControlData(uint64_t program_id, uint8_t * buffer, uint32_t buffer_size, uint32_t & actual_size) = 0;
+    // Backing-file traffic on this thread; internal cache hits perform no backing I/O.
+    virtual void GetBackingReadTraffic(StorageReadTraffic* out) const = 0;
+    virtual bool GetActiveProgramContent(uint64_t program_id, ActiveProgramContent & out) = 0;
 };
 
 EXPORT ISystemloader * CALL CreateSystemLoader(ISystemModules & modules);

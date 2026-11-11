@@ -94,3 +94,34 @@ void ModuleSettings::UnregisterCallback(const char * setting, SettingChangeCallb
 {
     SettingsStore::GetInstance().UnregisterCallback(setting, callback, userData);
 }
+
+void ModuleSettings::SetDebugSetting(const char * setting, bool debug)
+{
+    SettingsStore::GetInstance().SetDebugSetting(setting, debug);
+}
+
+bool ModuleSettings::DebugSettingsEnabled(void) const
+{
+    return SettingsStore::GetInstance().DebugSettingsEnabled();
+}
+
+const char * ModuleSettings::GetGameSectionSettings(const char * section) const
+{
+    JsonValue json = SettingsStore::GetInstance().GetGameSettings(section);
+    m_gameSectionSetting = json.isNull() ? "" : JsonStyledWriter().write(json);
+    return m_gameSectionSetting.c_str();
+}
+
+void ModuleSettings::SetGameSectionSettings(const char * section, const char * json)
+{
+    JsonValue root;
+    if (json != nullptr && json[0] != '\0')
+    {
+        JsonReader reader;
+        if (!reader.Parse(json, json + strlen(json), root))
+        {
+            return;
+        }
+    }
+    SettingsStore::GetInstance().SetGameSettings(section, root);
+}

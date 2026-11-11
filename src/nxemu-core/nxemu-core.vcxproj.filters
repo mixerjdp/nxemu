@@ -25,6 +25,12 @@
     <Filter Include="Source Files\modules">
       <UniqueIdentifier>{c6e43ffa-3021-4a67-9048-ef1f2bd97331}</UniqueIdentifier>
     </Filter>
+    <Filter Include="Header Files\i18n">
+      <UniqueIdentifier>{28cc38a2-8104-458a-b4af-e4cbfecd91b3}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="Source Files\i18n">
+      <UniqueIdentifier>{09e521f8-bcc1-46f2-a793-469999e3f03d}</UniqueIdentifier>
+    </Filter>
     <Filter Include="Module Spec">
       <UniqueIdentifier>{6d196b5d-acca-4a87-8558-e71395ac5fb1}</UniqueIdentifier>
     </Filter>
@@ -34,6 +40,15 @@
       <Filter>Header Files\settings</Filter>
     </ClInclude>
     <ClInclude Include="app_init.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="i18n\plural_rule.h">
+      <Filter>Header Files\i18n</Filter>
+    </ClInclude>
+    <ClInclude Include="i18n\translation.h">
+      <Filter>Header Files\i18n</Filter>
+    </ClInclude>
+    <ClInclude Include="play_time.h">
       <Filter>Header Files</Filter>
     </ClInclude>
     <ClInclude Include="notification.h">
@@ -78,6 +93,9 @@
     <ClInclude Include="settings\identifiers.h">
       <Filter>Header Files\settings</Filter>
     </ClInclude>
+    <ClInclude Include="settings\module_setting_table.h">
+      <Filter>Header Files\settings</Filter>
+    </ClInclude>
     <ClInclude Include="modules\loader_module.h">
       <Filter>Header Files\modules</Filter>
     </ClInclude>
@@ -98,7 +116,16 @@
     <ClCompile Include="settings\settings.cpp">
       <Filter>Source Files\settings</Filter>
     </ClCompile>
+    <ClCompile Include="i18n\plural_rule.cpp">
+      <Filter>Source Files\i18n</Filter>
+    </ClCompile>
+    <ClCompile Include="i18n\translation.cpp">
+      <Filter>Source Files\i18n</Filter>
+    </ClCompile>
     <ClCompile Include="app_init.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="play_time.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
     <ClCompile Include="modules\module_list.cpp">

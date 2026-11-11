@@ -3,6 +3,7 @@
 
 #include <array>
 #include <atomic>
+#include <cstring>
 #include <memory>
 #include <span>
 #include <vector>
@@ -219,7 +220,17 @@ void SinkStream::ProcessAudioIn(std::span<const s16> input_buffer, std::size_t n
         }
     }
 
-    std::memcpy(&last_frame[0], &input_buffer[(frames_written - 1) * frame_size], frame_size_bytes);
+    if (frames_written > 0) {
+        std::memcpy(&last_frame[0], &input_buffer[(frames_written - 1) * frame_size], frame_size_bytes);
+    }
+
+    // update sample counts fuer audio-ins
+    {
+        std::scoped_lock lk{sample_count_lock};
+        last_sample_count_update_time = system.CoreTiming().GetGlobalTimeNs();
+        min_played_sample_count = max_played_sample_count;
+        max_played_sample_count += frames_written;
+    }
 }
 
 void SinkStream::ProcessAudioOutAndRender(std::span<s16> output_buffer, std::size_t num_frames)
@@ -243,10 +254,10 @@ void SinkStream::ProcessAudioOutAndRender(std::span<s16> output_buffer, std::siz
             release_cv.notify_one();
         }
 
-        static constexpr std::array<s16, 6> silence{};
+        // Silence must cover the negotiated channel count, not a fixed six-sample array.
         for (size_t i = frames_written; i < num_frames; i++)
         {
-            std::memcpy(&output_buffer[i * frame_size], &silence[0], frame_size_bytes);
+            std::memset(&output_buffer[i * frame_size], 0, frame_size_bytes);
         }
         return;
     }

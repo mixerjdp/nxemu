@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include <mutex>
 #include <set>
 #include <yuzu_common/threadsafe_queue.h>
 #include "yuzu_input_common/input_engine.h"
@@ -85,6 +86,7 @@ public:
 private:
 #ifdef ANDROID
     std::unordered_map<PadIdentifier, jobject> input_devices;
+    mutable std::mutex input_mutex;
 #endif
 
     /// Returns the correct identifier corresponding to the player index
@@ -139,7 +141,7 @@ private:
     const std::vector<std::string> flipped_xy_vids{sony_vid, razer_vid, redmagic_vid, backbone_labs_vid, xbox_vid};
 
     /// Queue of vibration request to controllers
-    Common::SPSCQueue<VibrationRequest> vibration_queue;
+    Common::SPSCQueue<VibrationRequest, true> vibration_queue;
     std::jthread vibration_thread;
 };
 

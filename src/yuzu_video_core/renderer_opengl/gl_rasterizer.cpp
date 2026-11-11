@@ -17,6 +17,7 @@
 #include "yuzu_common/settings.h"
 #include "video_settings.h"
 #include "yuzu_video_core/control/channel_state.h"
+#include "yuzu_video_core/engines/fast_copy.h"
 #include "yuzu_video_core/engines/kepler_compute.h"
 #include "yuzu_video_core/engines/maxwell_3d.h"
 #include "yuzu_video_core/memory_manager.h"
@@ -146,7 +147,7 @@ void RasterizerOpenGL::SyncVertexInstances() {
 }
 
 void RasterizerOpenGL::LoadDiskResources(u64 title_id, std::stop_token stop_loading,
-                                         const VideoCore::DiskResourceLoadCallback& callback) {
+                                         const VideoCore::DiskResourceLoadCallback& callback, [[maybe_unused]] std::string_view content_identity, [[maybe_unused]] std::string_view game_path, [[maybe_unused]] std::string_view game_context) {
     shader_cache.LoadDiskResources(title_id, stop_loading, callback);
 }
 
@@ -251,6 +252,7 @@ void RasterizerOpenGL::PrepareDraw(bool is_indexed, Func&& draw_func)
     draw_func(primitive_mode);
 
     EndTransformFeedback();
+    buffer_cache.CopySparseWrites();
 
     ++num_queued_commands;
     has_written_global_memory |= pipeline->WritesGlobalMemory();
@@ -299,7 +301,7 @@ void RasterizerOpenGL::Draw(bool is_indexed, u32 instance_count) {
     });
 }
 
-void RasterizerOpenGL::DrawIndirect() {
+bool RasterizerOpenGL::DrawIndirect() {
     const auto& params = maxwell3d->draw_manager->GetIndirectParams();
     buffer_cache.SetDrawIndirect(&params);
     PrepareDraw(params.is_indexed, [this, &params](GLenum primitive_mode) {
@@ -344,6 +346,7 @@ void RasterizerOpenGL::DrawIndirect() {
         }
     });
     buffer_cache.SetDrawIndirect(nullptr);
+    return true;
 }
 
 void RasterizerOpenGL::DrawTexture() {
@@ -404,12 +407,16 @@ void RasterizerOpenGL::DispatchCompute() {
     }
     pipeline->SetEngine(kepler_compute, gpu_memory);
     pipeline->Configure();
+    SCOPE_EXIT {
+        buffer_cache.CopySparseWrites();
+    };
     const auto& qmd{kepler_compute->launch_description};
     auto indirect_address = kepler_compute->GetIndirectComputeAddress();
     if (indirect_address) {
         // DispatchIndirect
         static constexpr auto sync_info = VideoCommon::ObtainBufferSynchronize::FullSynchronize;
-        const auto post_op = VideoCommon::ObtainBufferOperation::DiscardWrite;
+        // The parameters are only read, what the GPU wrote there still has to reach the guest
+        const auto post_op = VideoCommon::ObtainBufferOperation::DoNothing;
         const auto [buffer, offset] =
             buffer_cache.ObtainBuffer(*indirect_address, 12, sync_info, post_op);
         glBindBuffer(GL_DISPATCH_INDIRECT_BUFFER, buffer->Handle());
@@ -604,15 +611,23 @@ void RasterizerOpenGL::UnmapMemory(DAddr addr, u64 size) {
     shader_cache.OnCacheInvalidation(addr, size);
 }
 
-void RasterizerOpenGL::ModifyGPUMemory(size_t as_id, GPUVAddr addr, u64 size) {
+void RasterizerOpenGL::ModifyGPUMemory(size_t as_id, GPUVAddr addr, u64 size, bool preserve_contents) {
     {
         std::scoped_lock lock{texture_cache.mutex};
-        texture_cache.UnmapGPUMemory(as_id, addr, size);
+        texture_cache.UnmapGPUMemory(as_id, addr, size, preserve_contents);
     }
 }
 
 void RasterizerOpenGL::SignalFence(std::function<void()>&& func) {
-    fence_manager.SignalFence(std::move(func));
+    fence_manager.SignalQueryFence(std::move(func));
+}
+
+void RasterizerOpenGL::SignalMemoryOperationFence(std::function<void()>&& func) {
+    fence_manager.SignalMemoryOperationFence(std::move(func));
+}
+
+void RasterizerOpenGL::WaitForFence() {
+    fence_manager.WaitForFence();
 }
 
 void RasterizerOpenGL::SyncOperation(std::function<void()>&& func) {
@@ -855,10 +870,10 @@ void RasterizerOpenGL::SyncViewport() {
             flags[Dirty::Viewport0 + index] = false;
 
             if (!regs.viewport_scale_offset_enabled) {
-                const auto x = static_cast<GLfloat>(regs.surface_clip.x);
-                const auto y = static_cast<GLfloat>(regs.surface_clip.y);
-                const auto width = static_cast<GLfloat>(regs.surface_clip.width);
-                const auto height = static_cast<GLfloat>(regs.surface_clip.height);
+                const auto x = conv(static_cast<float>(regs.surface_clip.x));
+                const auto y = conv(static_cast<float>(regs.surface_clip.y));
+                const auto width = conv(static_cast<float>(regs.surface_clip.width));
+                const auto height = conv(static_cast<float>(regs.surface_clip.height));
                 glViewportIndexedf(static_cast<GLuint>(index), x, y, width != 0.0f ? width : 1.0f,
                                    height != 0.0f ? height : 1.0f);
                 continue;
@@ -1434,6 +1449,26 @@ bool AccelerateDMA::BufferToImage(const Tegra::DMA::ImageCopy& copy_info,
                                   const Tegra::DMA::BufferOperand& buffer_operand,
                                   const Tegra::DMA::ImageOperand& image_operand) {
     return DmaBufferImageCopy<true>(copy_info, buffer_operand, image_operand);
+}
+
+bool AccelerateDMA::ImageToImage(Tegra::MemoryManager& gpu_memory,
+                                 const Tegra::DMA::ImageCopy& copy_info,
+                                 const Tegra::DMA::ImageOperand& src,
+                                 const Tegra::DMA::ImageOperand& dst) {
+    const size_t size = Tegra::Engines::DmaImageCopySize(copy_info, src, dst);
+    if (size == 0) {
+        return false;
+    }
+    std::scoped_lock lock{buffer_cache.mutex, texture_cache.mutex};
+    const auto cpu_src = gpu_memory.GpuToCpuAddress(src.address);
+    const auto cpu_dst = gpu_memory.GpuToCpuAddress(dst.address);
+    if (!cpu_src || !cpu_dst || gpu_memory.MaxContinuousRange(src.address, size) != size ||
+        gpu_memory.MaxContinuousRange(dst.address, size) != size ||
+        buffer_cache.IsRegionRegistered(*cpu_src, size) ||
+        buffer_cache.IsRegionRegistered(*cpu_dst, size)) {
+        return false;
+    }
+    return texture_cache.DmaImageToImage(copy_info, src, dst);
 }
 
 } // namespace OpenGL

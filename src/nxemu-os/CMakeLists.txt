@@ -1,19 +1,5 @@
 cmake_minimum_required(VERSION 3.18)
 
-# nxemu-os depends on yuzu "core", yuzu_audio_core, src/network, hid_core (which itself
-# links "core"), cubeb, SDL, etc. Host desktop builds may still be incomplete — default OFF.
-# Android needs the OS plugin .so alongside loader/cpu/video, so default ON there.
-if(ANDROID)
-    set(_NXEMU_OS_BUILD_DEFAULT ON)
-else()
-    set(_NXEMU_OS_BUILD_DEFAULT OFF)
-endif()
-option(NXEMU_BUILD_NXEMU_OS "Build nxemu-os shared library" ${_NXEMU_OS_BUILD_DEFAULT})
-
-if(NOT NXEMU_BUILD_NXEMU_OS)
-    message(STATUS "nxemu-os: skipped (NXEMU_BUILD_NXEMU_OS=OFF)")
-else()
-
 project(nxemu-os LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 20)
@@ -77,6 +63,22 @@ target_link_libraries(nxemu-os PRIVATE
 
 if(ANDROID)
     target_link_libraries(nxemu-os PRIVATE log)
+elseif(APPLE)
+    find_library(NXEMU_SECURITY_FRAMEWORK Security REQUIRED)
+    find_library(NXEMU_COREFOUNDATION_FRAMEWORK CoreFoundation REQUIRED)
+    target_link_libraries(nxemu-os PRIVATE
+        "${NXEMU_SECURITY_FRAMEWORK}"
+        "${NXEMU_COREFOUNDATION_FRAMEWORK}"
+    )
+    # The module is copied two levels below Contents/Frameworks in the app.
+    set_property(TARGET nxemu-os APPEND PROPERTY BUILD_RPATH "@loader_path/../..")
+elseif(WIN32)
+    target_link_libraries(nxemu-os PRIVATE
+        ntdll iphlpapi winmm ksuser crypt32 secur32 ws2_32)
+elseif(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    # The module is copied to modules/operating_system beside the executable,
+    # two levels below the bundled SDL.
+    set_property(TARGET nxemu-os APPEND PROPERTY BUILD_RPATH "$ORIGIN/../..")
 endif()
 
 # Use BSD socket headers and TranslateIPv4(in_addr) path (Linux/macOS/Android).
@@ -85,13 +87,13 @@ if(UNIX)
 endif()
 
 # 128-bit atomics used by OS networking / room code — need cmpxchg16b on x86_64.
-if(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64|amd64")
+if(ARCHITECTURE_x86_64 AND NOT MSVC)
     target_compile_options(nxemu-os PRIVATE -mcx16)
-    target_link_libraries(nxemu-os PRIVATE atomic)
+    if(NOT APPLE)
+        target_link_libraries(nxemu-os PRIVATE atomic)
+    endif()
 endif()
 
 set_property(TARGET nxemu-os PROPERTY POSITION_INDEPENDENT_CODE ON)
 
 nxemu_set_module_output(nxemu-os operating_system)
-
-endif()

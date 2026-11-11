@@ -33,14 +33,53 @@
   </ItemDefinitionGroup>
   <ItemGroup>
     <ClInclude Include="buffer_cache\buffer_base.h" />
+    <ClInclude Include="shader_profile_export.h" />
+    <ClInclude Include="shader_profile_discovery.h" />
+    <ClInclude Include="shader_profile_compact.h" />
+    <ClInclude Include="shader_profile_journal.h" />
+    <ClInclude Include="renderer_vulkan\guest_pipeline_recorder.h" />
+    <ClInclude Include="renderer_vulkan\guest_recipe_input_cache.h" />
+    <ClInclude Include="pipeline_cache_store.h" />
+    <ClInclude Include="shader_profile_audit.h" />
+    <ClInclude Include="shader_profile_location.h" />
+    <ClInclude Include="shader_profile_runtime.h" />
+    <ClInclude Include="shader_profile_sph.h" />
+    <ClInclude Include="shader_profile_import_status.h" />
+    <ClInclude Include="shader_profile_identity.h" />
+    <ClInclude Include="shader_profile_file_stamp.h" />
+    <ClInclude Include="shader_profile_context.h" />
+    <ClInclude Include="shader_profile_provenance.h" />
+    <ClInclude Include="shader_profile_publication.h" />
+    <ClInclude Include="shader_profile_candidate_budget.h" />
+    <ClInclude Include="shader_profile_reuse.h" />
+    <ClInclude Include="shared_shader_bytes.h" />
+    <ClInclude Include="shader_profile_text.h" />
+    <ClInclude Include="shader_profile_validation.h" />
+    <ClInclude Include="renderer_vulkan\startup_pipeline_variants.h" />
+    <ClInclude Include="shader_profile.h" />
+    <ClInclude Include="area_sampling.h" />
+    <ClInclude Include="command_header.h" />
+    <ClInclude Include="present_sharpening.h" />
+    <ClInclude Include="shader_profile_hash.h" />
+    <ClInclude Include="shader_profile_layout.h" />
+    <ClInclude Include="shader_profile_limits.h" />
+    <ClInclude Include="shader_profile_metrics.h" />
+    <ClInclude Include="shader_profile_resources.h" />
+    <ClInclude Include="shader_profile_search.h" />
+    <ClInclude Include="shader_profile_versions.h" />
+    <ClInclude Include="snapshot_memory_budget.h" />
+    <ClInclude Include="shader_profile_codec.h" />
+    <ClInclude Include="renderer_vulkan\guest_pipeline_recipe_probe.h" />
     <ClInclude Include="buffer_cache\buffer_cache.h" />
     <ClInclude Include="buffer_cache\buffer_cache_base.h" />
     <ClInclude Include="buffer_cache\memory_tracker_base.h" />
     <ClInclude Include="buffer_cache\usage_tracker.h" />
     <ClInclude Include="buffer_cache\word_manager.h" />
     <ClInclude Include="cache_types.h" />
+    <ClInclude Include="flush_region_cache_filter.h" />
     <ClInclude Include="capture.h" />
     <ClInclude Include="cdma_pusher.h" />
+    <ClInclude Include="composite_request.h" />
     <ClInclude Include="compatible_formats.h" />
     <ClInclude Include="control\channel_state.h" />
     <ClInclude Include="control\channel_state_cache.h" />
@@ -51,6 +90,7 @@
     <ClInclude Include="engines\const_buffer_info.h" />
     <ClInclude Include="engines\draw_manager.h" />
     <ClInclude Include="engines\engine_interface.h" />
+    <ClInclude Include="engines\fast_copy.h" />
     <ClInclude Include="engines\engine_upload.h" />
     <ClInclude Include="engines\fermi_2d.h" />
     <ClInclude Include="engines\kepler_compute.h" />
@@ -94,6 +134,7 @@
     <ClInclude Include="pte_kind.h" />
     <ClInclude Include="query_cache.h" />
     <ClInclude Include="query_cache\bank_base.h" />
+    <ClInclude Include="query_cache\query_bank_operations.h" />
     <ClInclude Include="query_cache\query_base.h" />
     <ClInclude Include="query_cache\query_cache.h" />
     <ClInclude Include="query_cache\query_cache_base.h" />
@@ -141,18 +182,27 @@
     <ClInclude Include="renderer_vulkan\present\filters.h" />
     <ClInclude Include="renderer_vulkan\present\fsr.h" />
     <ClInclude Include="renderer_vulkan\present\fxaa.h" />
+    <ClInclude Include="renderer_vulkan\present\catmull_pass.h" />
+    <ClInclude Include="renderer_vulkan\present\scale_capture.h" />
+    <ClInclude Include="renderer_vulkan\present\scale_trace.h" />
     <ClInclude Include="renderer_vulkan\present\layer.h" />
     <ClInclude Include="renderer_vulkan\present\present_push_constants.h" />
     <ClInclude Include="renderer_vulkan\present\smaa.h" />
     <ClInclude Include="renderer_vulkan\present\util.h" />
     <ClInclude Include="renderer_vulkan\present\window_adapt_pass.h" />
     <ClInclude Include="renderer_vulkan\renderer_vulkan.h" />
+    <ClInclude Include="renderer_vulkan\descriptor_copy_cache.h" />
     <ClInclude Include="renderer_vulkan\vk_blit_screen.h" />
     <ClInclude Include="renderer_vulkan\vk_buffer_cache.h" />
     <ClInclude Include="renderer_vulkan\vk_command_pool.h" />
     <ClInclude Include="renderer_vulkan\vk_compute_pass.h" />
+    <ClInclude Include="renderer_vulkan\descriptor_lookup.h" />
+    <ClInclude Include="renderer_vulkan\descriptor_limits.h" />
+    <ClInclude Include="renderer_vulkan\descriptor_payload.h" />
+    <ClInclude Include="renderer_vulkan\cbuf_size_dependencies.h" />
     <ClInclude Include="renderer_vulkan\vk_compute_pipeline.h" />
     <ClInclude Include="renderer_vulkan\vk_descriptor_pool.h" />
+    <ClInclude Include="renderer_vulkan\vk_display.h" />
     <ClInclude Include="renderer_vulkan\vk_fence_manager.h" />
     <ClInclude Include="renderer_vulkan\vk_graphics_pipeline.h" />
     <ClInclude Include="renderer_vulkan\vk_master_semaphore.h" />
@@ -190,6 +240,7 @@
     <ClInclude Include="texture_cache\format_lookup_table.h" />
     <ClInclude Include="texture_cache\image_base.h" />
     <ClInclude Include="texture_cache\image_info.h" />
+    <ClInclude Include="texture_cache\mip_levels.h" />
     <ClInclude Include="texture_cache\image_view_base.h" />
     <ClInclude Include="texture_cache\image_view_info.h" />
     <ClInclude Include="texture_cache\render_targets.h" />
@@ -206,6 +257,7 @@
     <ClInclude Include="vulkan_common\vulkan.h" />
     <ClInclude Include="vulkan_common\vulkan_debug_callback.h" />
     <ClInclude Include="vulkan_common\vulkan_device.h" />
+    <ClInclude Include="vulkan_common\moltenvk_workarounds.h" />
     <ClInclude Include="vulkan_common\vulkan_instance.h" />
     <ClInclude Include="vulkan_common\vulkan_library.h" />
     <ClInclude Include="vulkan_common\vulkan_memory_allocator.h" />
@@ -309,6 +361,9 @@
     <ClCompile Include="renderer_vulkan\present\fxaa.cpp">
       <ObjectFileName>$(IntDir)/renderer_vulkan/present/fxaa.cpp.obj</ObjectFileName>
     </ClCompile>
+    <ClCompile Include="renderer_vulkan\present\catmull_pass.cpp">
+      <ObjectFileName>$(IntDir)/renderer_vulkan/present/catmull_pass.cpp.obj</ObjectFileName>
+    </ClCompile>
     <ClCompile Include="renderer_vulkan\present\layer.cpp">
       <ObjectFileName>$(IntDir)/renderer_vulkan/present/layer.cpp.obj</ObjectFileName>
     </ClCompile>
@@ -329,6 +384,7 @@
     <ClCompile Include="renderer_vulkan\vk_compute_pass.cpp" />
     <ClCompile Include="renderer_vulkan\vk_compute_pipeline.cpp" />
     <ClCompile Include="renderer_vulkan\vk_descriptor_pool.cpp" />
+    <ClCompile Include="renderer_vulkan\vk_display.cpp" />
     <ClCompile Include="renderer_vulkan\vk_fence_manager.cpp" />
     <ClCompile Include="renderer_vulkan\vk_graphics_pipeline.cpp" />
     <ClCompile Include="renderer_vulkan\vk_master_semaphore.cpp" />
@@ -349,6 +405,14 @@
     <ClCompile Include="renderer_vulkan\vk_update_descriptor.cpp" />
     <ClCompile Include="shader_cache.cpp" />
     <ClCompile Include="shader_environment.cpp" />
+    <ClCompile Include="pipeline_cache_store.cpp" />
+    <ClCompile Include="shader_profile.cpp" />
+    <ClCompile Include="shader_profile_export.cpp" />
+    <ClCompile Include="shader_profile_discovery.cpp" />
+    <ClCompile Include="shader_profile_compact.cpp" />
+    <ClCompile Include="shader_profile_codec.cpp">
+      <AdditionalIncludeDirectories>$(SolutionDir)external\zstd\lib;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+    </ClCompile>
     <ClCompile Include="shader_notify.cpp" />
     <ClCompile Include="surface.cpp" />
     <ClCompile Include="textures\astc.cpp" />
@@ -388,6 +452,9 @@
     </ProjectReference>
     <ProjectReference Include="..\3rd_party\stb\stb.vcxproj">
       <Project>{3a62c094-dbdf-414a-a65e-ebdb939a81e5}</Project>
+    </ProjectReference>
+    <ProjectReference Include="..\..\external\zstd.vcxproj">
+      <Project>{808d773c-086c-4e17-a195-b4af30eee86e}</Project>
     </ProjectReference>
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />

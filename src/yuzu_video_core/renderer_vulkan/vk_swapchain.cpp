@@ -7,17 +7,16 @@
 #include <vector>
 
 #include "yuzu_common/logging/log.h"
-#include "nxemu-os/os_settings_identifiers.h"
 #include "yuzu_common/polyfill_ranges.h"
-#include "yuzu_common/settings.h"
-#include <nxemu-module-spec/base.h>
-#include "yuzu_video_core/renderer_vulkan/vk_scheduler.h"
 #include "yuzu_video_core/renderer_vulkan/vk_swapchain.h"
 #include "yuzu_video_core/vulkan_common/vk_enum_string_helper.h"
 #include "yuzu_video_core/vulkan_common/vulkan_device.h"
 #include "yuzu_video_core/vulkan_common/vulkan_wrapper.h"
 #include "vulkan/vulkan_core.h"
 #include "video_settings.h"
+#include "yuzu_video_core/renderer_vulkan/swapchain_present_mode.h"
+#include "nxemu-os/os_settings_identifiers.h"
+#include <nxemu-module-spec/base.h>
 
 extern IModuleSettings * g_settings;
 
@@ -41,45 +40,10 @@ VkSurfaceFormatKHR ChooseSwapSurfaceFormat(vk::Span<VkSurfaceFormatKHR> formats)
 
 static VkPresentModeKHR ChooseSwapPresentMode(bool has_imm, bool has_mailbox,
                                               bool has_fifo_relaxed) {
-    // Mailbox doesn't lock the application like FIFO (vsync)
-    // FIFO present mode locks the framerate to the monitor's refresh rate
-    VSyncMode setting = [has_imm, has_mailbox]() {
-        // Choose Mailbox or Immediate if unlocked and those modes are supported
-        const auto mode = videoSettings.vsync_mode;
-        if (g_settings->GetBool(NXOsSetting::UseSpeedLimit)) {
-            return mode;
-        }
-        switch (mode) {
-        case VSyncMode::Fifo:
-        case VSyncMode::FifoRelaxed:
-            if (has_mailbox) {
-                return VSyncMode::Mailbox;
-            } else if (has_imm) {
-                return VSyncMode::Immediate;
-            }
-            [[fallthrough]];
-        default:
-            return mode;
-        }
-    }();
-    if ((setting == VSyncMode::Mailbox && !has_mailbox) ||
-        (setting == VSyncMode::Immediate && !has_imm) ||
-        (setting == VSyncMode::FifoRelaxed && !has_fifo_relaxed)) {
-        setting = VSyncMode::Fifo;
-    }
-
-    switch (setting) {
-    case VSyncMode::Immediate:
-        return VK_PRESENT_MODE_IMMEDIATE_KHR;
-    case VSyncMode::Mailbox:
-        return VK_PRESENT_MODE_MAILBOX_KHR;
-    case VSyncMode::Fifo:
-        return VK_PRESENT_MODE_FIFO_KHR;
-    case VSyncMode::FifoRelaxed:
-        return VK_PRESENT_MODE_FIFO_RELAXED_KHR;
-    default:
-        return VK_PRESENT_MODE_FIFO_KHR;
-    }
+    const bool uncapped = !g_settings->GetBool(NXOsSetting::UseSpeedLimit) &&
+                          g_settings->GetBool(NXOsSetting::UncappedPresent);
+    return SelectPresentMode(videoSettings.vsync_mode, uncapped, has_imm, has_mailbox,
+                             has_fifo_relaxed);
 }
 
 VkExtent2D ChooseSwapExtent(const VkSurfaceCapabilitiesKHR& capabilities, u32 width, u32 height) {
@@ -109,9 +73,8 @@ VkCompositeAlphaFlagBitsKHR ChooseAlphaFlags(const VkSurfaceCapabilitiesKHR& cap
 
 } // Anonymous namespace
 
-Swapchain::Swapchain(VkSurfaceKHR surface_, const Device& device_, Scheduler& scheduler_,
-                     u32 width_, u32 height_)
-    : surface{surface_}, device{device_}, scheduler{scheduler_} {
+Swapchain::Swapchain(VkSurfaceKHR surface_, const Device& device_, u32 width_, u32 height_)
+    : surface{surface_}, device{device_} {
     Create(surface_, width_, height_);
 }
 
@@ -127,6 +90,10 @@ void Swapchain::Create(VkSurfaceKHR surface_, u32 width_, u32 height_) {
     const auto physical_device = device.GetPhysical();
     const auto capabilities{physical_device.GetSurfaceCapabilitiesKHR(surface)};
     if (capabilities.maxImageExtent.width == 0 || capabilities.maxImageExtent.height == 0) {
+        // The surface is temporarily unusable (for example minimized). Retire
+        // the old swapchain now: it may refer to an about-to-be-released surface.
+        Destroy();
+        is_outdated = true;
         return;
     }
 
@@ -134,14 +101,11 @@ void Swapchain::Create(VkSurfaceKHR surface_, u32 width_, u32 height_) {
 
     CreateSwapchain(capabilities);
     CreateSemaphores();
-
-    resource_ticks.clear();
-    resource_ticks.resize(image_count);
 }
 
-bool Swapchain::AcquireNextImage() {
+Swapchain::AcquireResult Swapchain::AcquireNextImage(u64 timeout_ns) {
     const VkResult result = device.GetLogical().AcquireNextImageKHR(
-        *swapchain, std::numeric_limits<u64>::max(), *present_semaphores[frame_index],
+        *swapchain, timeout_ns, *present_semaphores[frame_index],
         VK_NULL_HANDLE, &image_index);
     switch (result) {
     case VK_SUCCESS:
@@ -150,23 +114,29 @@ bool Swapchain::AcquireNextImage() {
         is_suboptimal = true;
         break;
     case VK_ERROR_OUT_OF_DATE_KHR:
+        // No image was acquired, so image_index is not valid for this call.
         is_outdated = true;
-        break;
+        return AcquireResult::Outdated;
+    case VK_TIMEOUT:
+    case VK_NOT_READY:
+        // The acquire semaphore was not signaled. Retrying on the next frame
+        // is cheaper and safer than rebuilding an otherwise valid swapchain.
+        return AcquireResult::RetryLater;
     case VK_ERROR_SURFACE_LOST_KHR:
         vk::Check(result);
         break;
     default:
         LOG_ERROR(Render_Vulkan, "vkAcquireNextImageKHR returned {}", string_VkResult(result));
+        vk::Check(result);
         break;
     }
 
-    scheduler.Wait(resource_ticks[image_index]);
-    resource_ticks[image_index] = scheduler.CurrentTick();
-
-    return is_suboptimal || is_outdated;
+    // VK_SUBOPTIMAL_KHR is still a successful acquire. Consume the acquire
+    // semaphore and present this image before recreating on the next frame.
+    return AcquireResult::Acquired;
 }
 
-void Swapchain::Present(VkSemaphore render_semaphore) {
+bool Swapchain::Present(VkSemaphore render_semaphore) {
     const auto present_queue{device.GetPresentQueue()};
     const VkPresentInfoKHR present_info{
         .sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR,
@@ -178,12 +148,16 @@ void Swapchain::Present(VkSemaphore render_semaphore) {
         .pImageIndices = &image_index,
         .pResults = nullptr,
     };
-    std::scoped_lock lock{scheduler.submit_mutex};
-    switch (const VkResult result = present_queue.Present(present_info)) {
+    std::scoped_lock lock{device.QueueMutex()};
+    const VkResult result = present_queue.Present(present_info);
+    switch (result) {
     case VK_SUCCESS:
         break;
     case VK_SUBOPTIMAL_KHR:
         LOG_DEBUG(Render_Vulkan, "Suboptimal swapchain");
+#ifndef ANDROID
+        is_suboptimal = true;
+#endif
         break;
     case VK_ERROR_OUT_OF_DATE_KHR:
         is_outdated = true;
@@ -193,12 +167,14 @@ void Swapchain::Present(VkSemaphore render_semaphore) {
         break;
     default:
         LOG_CRITICAL(Render_Vulkan, "Failed to present with error {}", string_VkResult(result));
+        vk::Check(result);
         break;
     }
     ++frame_index;
     if (frame_index >= image_count) {
         frame_index = 0;
     }
+    return result == VK_SUCCESS || result == VK_SUBOPTIMAL_KHR;
 }
 
 void Swapchain::CreateSwapchain(const VkSurfaceCapabilitiesKHR& capabilities) {
@@ -282,6 +258,9 @@ void Swapchain::CreateSwapchain(const VkSurfaceCapabilitiesKHR& capabilities) {
 
     images = swapchain.GetImages();
     image_count = static_cast<u32>(images.size());
+    LOG_INFO(Render_Vulkan, "Swapchain {}x{}, {} images (requested {}), {}, mailbox={}, immediate={}",
+             extent.width, extent.height, image_count, requested_image_count,
+             string_VkPresentModeKHR(present_mode), has_mailbox, has_imm);
 #ifdef ANDROID
     // Android is already ordered the same as Switch.
     image_view_format = VK_FORMAT_R8G8B8A8_UNORM;
@@ -302,6 +281,12 @@ void Swapchain::CreateSemaphores() {
 void Swapchain::Destroy() {
     frame_index = 0;
     present_semaphores.clear();
+    // Present may have skipped consuming a semaphore on OUT_OF_DATE. Never
+    // carry binary render semaphore state into a different swapchain.
+    render_semaphores.clear();
+    images.clear();
+    // image_count keeps the last value: the presentation resources sized by it
+    // must not be rebuilt for a swapchain that is only gone while minimized.
     swapchain.reset();
 }
 

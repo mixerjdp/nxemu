@@ -13,6 +13,7 @@
 #include "yuzu_common/settings.h"
 #include <nxemu-module-spec/base.h>
 #include "nxemu-os/os_settings_identifiers.h"
+#include <nxemu-core/settings/identifiers.h>
 #ifndef _WIN32
 #include "yuzu_common/string_util.h"
 #endif
@@ -22,7 +23,9 @@
 #include "core/file_sys/control_metadata.h"
 #include "core/file_sys/filesystem.h"
 #include "core/file_sys/ips_layer.h"
+#include "core/file_sys/code_mods.h"
 #include "core/file_sys/patch_manager.h"
+#include "core/file_sys/patch_sets.h"
 #include "core/file_sys/registered_cache.h"
 #include "core/file_sys/romfs.h"
 #include "core/file_sys/vfs/vfs_cached.h"
@@ -33,6 +36,8 @@
 #include "core/loader/loader.h"
 #include "core/loader/nso.h"
 #include "loader_settings.h"
+#include <common/json.h>
+#include <nxemu-cpu/cpu_settings_identifiers.h>
 
 extern IModuleSettings * g_settings;
 
@@ -215,26 +220,35 @@ void AddLoadRootChildren(std::vector<VirtualDir> & patch_dirs, std::unordered_se
     }
 }
 
+// The user's own mods: the load folder, then the game directories
+void AddUserModPatchDirs(uint64_t title_id, const FileSystemController & fs_controller, std::vector<VirtualDir> & patch_dirs, std::unordered_set<std::string> & seen_names)
+{
+    AddLoadRootChildren(patch_dirs, seen_names, fs_controller.GetModificationLoadRoot(title_id));
+
+    const std::vector<VirtualDir> mod_roots = fs_controller.GetGameDirectoryModificationLoadRoots(title_id);
+    for (const VirtualDir & mod_root : mod_roots)
+    {
+        if (mod_root != nullptr &&
+            (IsDirValidAndNonEmpty(FindSubdirectoryCaseless(mod_root, "romfs")) ||
+             IsDirValidAndNonEmpty(FindSubdirectoryCaseless(mod_root, "exefs")) ||
+             IsDirValidAndNonEmpty(FindSubdirectoryCaseless(mod_root, "cheats")) ||
+             IsDirValidAndNonEmpty(FindSubdirectoryCaseless(mod_root, "romfs_ext"))))
+        {
+            AddUniqueModPatchDir(patch_dirs, seen_names, mod_root);
+        }
+        AddLoadRootChildren(patch_dirs, seen_names, mod_root);
+    }
+}
+
 std::vector<VirtualDir> CollectModPatchDirs(uint64_t title_id, const FileSystemController & fs_controller, bool include_sdmc)
 {
     std::vector<VirtualDir> patch_dirs;
     std::unordered_set<std::string> seen_names;
 
-    AddLoadRootChildren(patch_dirs, seen_names, fs_controller.GetModificationLoadRoot(title_id));
+    AddUserModPatchDirs(title_id, fs_controller, patch_dirs, seen_names);
 
-    const std::vector<VirtualDir> addon_roots = fs_controller.GetAddOnModificationLoadRoots(title_id);
-    for (const VirtualDir & addon_root : addon_roots)
-    {
-        if (addon_root != nullptr &&
-            (IsDirValidAndNonEmpty(FindSubdirectoryCaseless(addon_root, "romfs")) ||
-             IsDirValidAndNonEmpty(FindSubdirectoryCaseless(addon_root, "exefs")) ||
-             IsDirValidAndNonEmpty(FindSubdirectoryCaseless(addon_root, "cheats")) ||
-             IsDirValidAndNonEmpty(FindSubdirectoryCaseless(addon_root, "romfs_ext"))))
-        {
-            AddUniqueModPatchDir(patch_dirs, seen_names, addon_root);
-        }
-        AddLoadRootChildren(patch_dirs, seen_names, addon_root);
-    }
+    // The mods that ship with NXEmu come last, so the user's own mod of the same name replaces one
+    AddLoadRootChildren(patch_dirs, seen_names, fs_controller.GetBundledModificationLoadRoot(title_id));
 
     if (include_sdmc)
     {
@@ -244,7 +258,124 @@ std::vector<VirtualDir> CollectModPatchDirs(uint64_t title_id, const FileSystemC
     return patch_dirs;
 }
 
+bool IsOffByDefault(const VirtualDir & mod)
+{
+    const VirtualFile file = mod->GetFile("mod.json");
+    if (file == nullptr)
+    {
+        return false;
+    }
+    const std::vector<u8> json = file->ReadAllBytes();
+    JsonValue root;
+    JsonReader reader;
+    if (!reader.Parse(reinterpret_cast<const char *>(json.data()), reinterpret_cast<const char *>(json.data() + json.size()), root) || !root.isObject())
+    {
+        LOG_WARNING(Loader, "{}/mod.json could not be read", mod->GetName());
+        return false;
+    }
+    const JsonValue enabled = root["enabled_by_default"];
+    return enabled.isBool() && !enabled.asBool();
+}
+
+// The bundled mods of the title that are off until the user turns them on (mod.json "enabled_by_default": false),
+// leaving out those the user's own mod of the same name replaces
+std::vector<std::string> BundledModsOffByDefault(uint64_t title_id, const FileSystemController & fs_controller)
+{
+    std::vector<std::string> names;
+    const VirtualDir root = fs_controller.GetBundledModificationLoadRoot(title_id);
+    if (root == nullptr)
+    {
+        return names;
+    }
+    for (const VirtualDir & mod : root->GetSubdirectories())
+    {
+        if (mod != nullptr && IsOffByDefault(mod))
+        {
+            names.push_back(mod->GetName());
+        }
+    }
+    if (names.empty())
+    {
+        return names;
+    }
+    // Only then walk the user's mod folders, which can be many
+    std::vector<VirtualDir> user_dirs;
+    std::unordered_set<std::string> user_names;
+    AddUserModPatchDirs(title_id, fs_controller, user_dirs, user_names);
+    names.erase(std::remove_if(names.begin(), names.end(), [&](const std::string & name) { return user_names.count(name) != 0; }), names.end());
+    return names;
+}
+
+const std::vector<std::string> & AddOnNames(const TitleIdStringListMap & addons, uint64_t title_id)
+{
+    static const std::vector<std::string> none;
+    const TitleIdStringListMap::const_iterator itr = addons.find(title_id);
+    return itr != addons.end() ? itr->second : none;
+}
+
+bool Contains(const std::vector<std::string> & names, const std::string & name)
+{
+    return std::find(names.begin(), names.end(), name) != names.end();
+}
+
 } // Anonymous namespace
+
+std::vector<std::string> GetDisabledAddOns(uint64_t title_id, const FileSystemController & fs_controller)
+{
+    std::vector<std::string> disabled = AddOnNames(loaderSettings.disabled_addons, title_id);
+    const std::vector<std::string> & enabled = AddOnNames(loaderSettings.enabled_addons, title_id);
+    for (std::string & name : BundledModsOffByDefault(title_id, fs_controller))
+    {
+        if (!Contains(enabled, name) && !Contains(disabled, name))
+        {
+            disabled.push_back(std::move(name));
+        }
+    }
+    return disabled;
+}
+
+bool IsAddOnDisabled(uint64_t title_id, const FileSystemController & fs_controller, const std::string & name)
+{
+    // Answered from the settings unless the name is a bundled mod's, which may be off by default: "DLC", called by the
+    // game while it runs, never looks at the mod folders
+    if (Contains(AddOnNames(loaderSettings.disabled_addons, title_id), name))
+    {
+        return true;
+    }
+    if (Contains(AddOnNames(loaderSettings.enabled_addons, title_id), name))
+    {
+        return false;
+    }
+    const VirtualDir root = fs_controller.GetBundledModificationLoadRoot(title_id);
+    if (root == nullptr || root->GetSubdirectory(name) == nullptr)
+    {
+        return false;
+    }
+    return Contains(BundledModsOffByDefault(title_id, fs_controller), name);
+}
+
+void SetDisabledAddOns(uint64_t title_id, const FileSystemController & fs_controller, std::vector<std::string> names)
+{
+    // Only what differs from the default is kept: a bundled mod that is off by default is stored when turned on
+    std::vector<std::string> disabled;
+    std::vector<std::string> enabled;
+    const std::vector<std::string> off_by_default = BundledModsOffByDefault(title_id, fs_controller);
+    for (std::string & name : names)
+    {
+        if (!Contains(off_by_default, name))
+        {
+            disabled.push_back(std::move(name));
+        }
+    }
+    for (const std::string & name : off_by_default)
+    {
+        if (!Contains(names, name))
+        {
+            enabled.push_back(name);
+        }
+    }
+    SetLoaderAddOns(title_id, std::move(disabled), std::move(enabled));
+}
 
 PatchManager::PatchManager(uint64_t title_id_, const FileSystemController & fs_controller_, const ContentProvider & content_provider_) :
     title_id{title_id_},
@@ -269,7 +400,7 @@ VirtualDir PatchManager::PatchExeFS(VirtualDir exefs) const
         return exefs;    
     }
 
-    const std::vector<std::string> & disabled = loaderSettings.disabled_addons[title_id];
+    const std::vector<std::string> disabled = GetDisabledAddOns(title_id, fs_controller);
     const uint64_t update_tid = GetUpdateTitleID(title_id);
     const ManualContentProvider * manual_provider = content_provider.GetManualContentProvider();
 
@@ -365,7 +496,7 @@ VirtualDir PatchManager::PatchExeFS(VirtualDir exefs) const
 
 std::vector<VirtualFile> PatchManager::CollectPatches(const std::vector<VirtualDir> & patch_dirs, const std::string & build_id) const
 {
-    const auto & disabled = loaderSettings.disabled_addons[title_id];
+    const std::vector<std::string> disabled = GetDisabledAddOns(title_id, fs_controller);
     const auto nso_build_id = fmt::format("{:0<64}", build_id);
 
     std::vector<VirtualFile> out;
@@ -493,6 +624,63 @@ bool PatchManager::HasNSOPatch(const BuildID & build_id_, std::string_view name)
     return !CollectPatches(patch_dirs, build_id).empty();
 }
 
+std::vector<VirtualFile> PatchManager::CollectPatchSetFiles() const
+{
+    const std::vector<std::string> disabled = GetDisabledAddOns(title_id, fs_controller);
+    std::vector<VirtualFile> out;
+    for (const VirtualDir & subdir : CollectModPatchDirs(title_id, fs_controller, false))
+    {
+        if (std::find(disabled.cbegin(), disabled.cend(), subdir->GetName()) != disabled.cend())
+        {
+            continue;
+        }
+        const VirtualDir exefs_dir = FindSubdirectoryCaseless(subdir, "exefs");
+        if (exefs_dir == nullptr)
+        {
+            continue;
+        }
+        std::vector<VirtualFile> files = exefs_dir->GetFiles();
+        std::sort(files.begin(), files.end(), [](const VirtualFile & l, const VirtualFile & r) { return l->GetName() < r->GetName(); });
+        for (const VirtualFile & file : files)
+        {
+            if (file->GetExtension() == "nxpatch")
+            {
+                out.push_back(file);
+            }
+        }
+    }
+    return out;
+}
+
+std::string PatchManager::HashEnabledCodeMods() const
+{
+    const std::vector<std::string> disabled = GetDisabledAddOns(title_id, fs_controller);
+    std::vector<VirtualDir> code_dirs;
+    const auto add_mod = [&](const VirtualDir & mod) {
+        for (const char * name : {"exefs", "cheats"})
+        {
+            const VirtualDir dir = FindSubdirectoryCaseless(mod, name);
+            if (IsDirValidAndNonEmpty(dir))
+            {
+                code_dirs.push_back(dir);
+            }
+        }
+    };
+    for (const VirtualDir & mod : CollectModPatchDirs(title_id, fs_controller, false))
+    {
+        if (std::find(disabled.cbegin(), disabled.cend(), mod->GetName()) == disabled.cend())
+        {
+            add_mod(mod);
+        }
+    }
+    const VirtualDir sdmc_mod_dir = fs_controller.GetSDMCModificationLoadRoot(title_id);
+    if (sdmc_mod_dir != nullptr && std::find(disabled.cbegin(), disabled.cend(), "SDMC") == disabled.cend())
+    {
+        add_mod(sdmc_mod_dir);
+    }
+    return HashCodeMods(code_dirs, g_settings->GetBool(NXCpuSetting::NceEnabled));
+}
+
 static void ApplyLayeredFS(VirtualFile & romfs, uint64_t title_id, LoaderContentRecordType type, const FileSystemController & fs_controller)
 {
     if (type != LoaderContentRecordType::Program && type != LoaderContentRecordType::Data &&
@@ -501,7 +689,7 @@ static void ApplyLayeredFS(VirtualFile & romfs, uint64_t title_id, LoaderContent
         return;
     }
 
-    const auto & disabled = loaderSettings.disabled_addons[title_id];
+    const std::vector<std::string> disabled = GetDisabledAddOns(title_id, fs_controller);
     std::vector<VirtualDir> patch_dirs = CollectModPatchDirs(title_id, fs_controller, false);
     const VirtualDir sdmc_load_dir = fs_controller.GetSDMCModificationLoadRoot(title_id);
     if (sdmc_load_dir != nullptr &&
@@ -597,7 +785,7 @@ VirtualFile PatchManager::PatchRomFS(const NCA * base_nca, VirtualFile base_romf
 
     // Game Updates
     const uint64_t update_tid = GetUpdateTitleID(title_id);
-    const auto & disabled = loaderSettings.disabled_addons[title_id];
+    const std::vector<std::string> disabled = GetDisabledAddOns(title_id, fs_controller);
     const ManualContentProvider * manual_provider = content_provider.GetManualContentProvider();
 
     bool update_disabled = true;
@@ -676,7 +864,7 @@ std::vector<Patch> PatchManager::GetPatches(VirtualFile update_raw) const
 
     // Game Updates
     const auto update_tid = GetUpdateTitleID(title_id);
-    const auto & disabled = loaderSettings.disabled_addons[title_id];
+    const std::vector<std::string> disabled = GetDisabledAddOns(title_id, fs_controller);
     const ManualContentProvider * manual_provider = content_provider.GetManualContentProvider();
 
     std::vector<Patch> update_patches;
@@ -765,12 +953,15 @@ std::vector<Patch> PatchManager::GetPatches(VirtualFile update_raw) const
     for (const VirtualDir & mod : CollectModPatchDirs(title_id, fs_controller, false))
     {
         std::string types;
+        bool replaces_romfs = false;
 
         const auto exefs_dir = FindSubdirectoryCaseless(mod, "exefs");
         if (IsDirValidAndNonEmpty(exefs_dir))
         {
             bool ips = false;
             bool ipswitch = false;
+            bool patch_sets = false;
+            std::string patch_set_versions;
             bool layeredfs = false;
 
             for (const auto & file : exefs_dir->GetFiles())
@@ -778,6 +969,14 @@ std::vector<Patch> PatchManager::GetPatches(VirtualFile update_raw) const
                 if (file->GetExtension() == "ips")
                 {
                     ips = true;
+                }
+                else if (file->GetExtension() == "nxpatch")
+                {
+                    patch_sets = true;
+                    if (const std::string version = PatchSets::FileVersion(file); !version.empty())
+                    {
+                        AppendCommaIfNotEmpty(patch_set_versions, version);
+                    }
                 }
                 else if (file->GetExtension() == "pchtxt")
                 {
@@ -798,14 +997,21 @@ std::vector<Patch> PatchManager::GetPatches(VirtualFile update_raw) const
             {
                 AppendCommaIfNotEmpty(types, "IPSwitch");
             }
+            if (patch_sets)
+            {
+                // The game versions its files name, e.g. "Patch sets 1.0.0, 1.4.3"
+                AppendCommaIfNotEmpty(types, patch_set_versions.empty() ? "Patch sets" : "Patch sets " + patch_set_versions);
+            }
             if (layeredfs)
             {
                 AppendCommaIfNotEmpty(types, "LayeredExeFS");
             }
         }
-        if (IsDirValidAndNonEmpty(FindSubdirectoryCaseless(mod, "romfs")))
+        if (IsDirValidAndNonEmpty(FindSubdirectoryCaseless(mod, "romfs")) ||
+            IsDirValidAndNonEmpty(FindSubdirectoryCaseless(mod, "romfs_ext")))
         {
             AppendCommaIfNotEmpty(types, "LayeredFS");
+            replaces_romfs = true;
         }
         if (IsDirValidAndNonEmpty(FindSubdirectoryCaseless(mod, "cheats")))
         {
@@ -824,7 +1030,8 @@ std::vector<Patch> PatchManager::GetPatches(VirtualFile update_raw) const
                        .version = std::move(types),
                        .type = PatchType::Mod,
                        .program_id = title_id,
-                       .title_id = title_id});
+                       .title_id = title_id,
+                       .replaces_romfs = replaces_romfs});
     }
 
     // SDMC mod directory (RomFS LayeredFS)
@@ -832,13 +1039,16 @@ std::vector<Patch> PatchManager::GetPatches(VirtualFile update_raw) const
     if (sdmc_mod_dir != nullptr)
     {
         std::string types;
+        bool replaces_romfs = false;
         if (IsDirValidAndNonEmpty(FindSubdirectoryCaseless(sdmc_mod_dir, "exefs")))
         {
             AppendCommaIfNotEmpty(types, "LayeredExeFS");
         }
-        if (IsDirValidAndNonEmpty(FindSubdirectoryCaseless(sdmc_mod_dir, "romfs")))
+        if (IsDirValidAndNonEmpty(FindSubdirectoryCaseless(sdmc_mod_dir, "romfs")) ||
+            IsDirValidAndNonEmpty(FindSubdirectoryCaseless(sdmc_mod_dir, "romfs_ext")))
         {
             AppendCommaIfNotEmpty(types, "LayeredFS");
+            replaces_romfs = true;
         }
 
         if (!types.empty())
@@ -850,7 +1060,8 @@ std::vector<Patch> PatchManager::GetPatches(VirtualFile update_raw) const
                            .version = std::move(types),
                            .type = PatchType::Mod,
                            .program_id = title_id,
-                           .title_id = title_id});
+                           .title_id = title_id,
+                           .replaces_romfs = replaces_romfs});
         }
     }
 
@@ -926,7 +1137,18 @@ PatchManager::Metadata PatchManager::ParseControlNCA(const NCA & nca) const
         return {};
     }
 
-    const auto romfs = PatchRomFS(&nca, base_romfs, LoaderContentRecordType::Control);
+    const auto patched = PatchRomFS(&nca, base_romfs, LoaderContentRecordType::Control);
+    auto metadata = ParseControlRomFS(patched);
+    if (!metadata.first && patched != base_romfs)
+    {
+        LOG_WARNING(Loader, "Invalid updated control metadata for {:016X}; using base metadata", title_id);
+        return ParseControlRomFS(base_romfs);
+    }
+    return metadata;
+}
+
+PatchManager::Metadata ParseControlRomFS(VirtualFile romfs)
+{
     if (romfs == nullptr)
     {
         return {};
@@ -945,9 +1167,14 @@ PatchManager::Metadata PatchManager::ParseControlNCA(const NCA & nca) const
     }
 
     auto nacp = nacp_file == nullptr ? nullptr : std::make_unique<NACP>(nacp_file);
+    if (nacp && !nacp->IsValid())
+    {
+        LOG_ERROR(Loader, "Invalid control.nacp: truncated file, unterminated string or invalid UTF-8");
+        return {};
+    }
 
     // Get language code from settings
-    const auto language_code = Service::Set::GetLanguageCodeFromIndex((uint32_t)g_settings->GetInt(NXOsSetting::LanguageIndex));
+    const auto language_code = Service::Set::GetLanguageCodeFromIndex((uint32_t)loaderSettings.languageIndex);
 
     // Convert to application language and get priority list
     const auto application_language = Service::NS::ConvertToApplicationLanguage(language_code).value_or(Service::NS::ApplicationLanguage::AmericanEnglish);

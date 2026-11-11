@@ -4,10 +4,16 @@
 #pragma once
 
 #include <memory>
+#include <unordered_map>
+#include <vector>
 
 #include "yuzu_common/scratch_buffer.h"
 #include "core/hle/service/nvdrv/nvdrv.h"
 #include "core/hle/service/service.h"
+
+namespace Service::Nvidia::NvCore {
+class SyncpointWait;
+}
 
 namespace Service::Nvidia {
 
@@ -34,14 +40,22 @@ private:
     void DumpGraphicsMemoryInfo(HLERequestContext& ctx);
 
     void ServiceError(HLERequestContext& ctx, NvResult result);
+    void PrepareOutputBuffer(HLERequestContext& ctx, Common::ScratchBuffer<u8>& buffer, size_t index);
 
     std::shared_ptr<Module> nvdrv;
+
+    struct DeferredIoctl {
+        std::vector<u8> input;
+        std::unique_ptr<NvCore::SyncpointWait> wait;
+    };
+    std::unordered_map<const HLERequestContext*, DeferredIoctl> deferred_ioctls;
 
     u64 pid{};
     bool is_initialized{};
     NvCore::SessionId session_id{};
     Common::ScratchBuffer<u8> output_buffer;
     Common::ScratchBuffer<u8> inline_output_buffer;
+    std::shared_ptr<IpcResponseBufferPool> output_pool;
 };
 
 } // namespace Service::Nvidia

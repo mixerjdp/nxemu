@@ -38,6 +38,7 @@
 #include "core/hle/kernel/k_thread.h"
 #include "core/hle/kernel/k_worker_task_manager.h"
 #include "core/hle/kernel/kernel.h"
+#include "core/hle/kernel/host_thread_state.h"
 #include "core/hle/kernel/physical_core.h"
 #include "core/hle/result.h"
 #include "core/hle/service/server_manager.h"
@@ -59,6 +60,7 @@ struct KernelCore::Impl {
     }
 
     void Initialize(KernelCore& kernel) {
+        session_generation = next_session_generation.fetch_add(1, std::memory_order_relaxed);
         hardware_timer = std::make_unique<Kernel::KHardwareTimer>(kernel);
         hardware_timer->Initialize();
 
@@ -107,6 +109,8 @@ struct KernelCore::Impl {
         is_shutting_down.store(true, std::memory_order_relaxed);
         SCOPE_EXIT {
             is_shutting_down.store(false, std::memory_order_relaxed);
+            std::scoped_lock lk{server_lock};
+            services_closed = false;
         };
 
         CloseServices();
@@ -183,9 +187,17 @@ struct KernelCore::Impl {
     }
 
     void CloseServices() {
-        // Ensures all servers gracefully shutdown.
-        std::scoped_lock lk{server_lock};
-        server_managers.clear();
+        // Ensures all servers gracefully shutdown. A server still starting must not register
+        // once they are closed: the cores it needs to stop are shut down next.
+        decltype(server_managers) closing;
+        {
+            std::scoped_lock lk{server_lock};
+            services_closed = true;
+            closing.swap(server_managers);
+        }
+        // Stop them without the lock: a server stops on a core that may be registering
+        // another one.
+        closing.clear();
     }
 
     void InitializePhysicalCores() {
@@ -373,16 +385,19 @@ struct KernelCore::Impl {
         return host_thread_id;
     }
 
-    // Gets the dummy KThread for the caller, allocating a new one if this is the first time
-    LTO_NOINLINE KThread* GetHostDummyThread(KThread* existing_thread) {
-        const auto initialize{[](KThread* thread) LTO_NOINLINE {
-            ASSERT(KThread::InitializeDummyThread(thread, nullptr).IsSuccess());
-            return thread;
-        }};
+    static inline std::atomic<std::uint64_t> next_session_generation{1};
+    std::uint64_t session_generation{};
+    static inline thread_local HostThreadState<KThread> host_thread_state;
 
-        thread_local KThread raw_thread{system.Kernel()};
-        thread_local KThread* thread = existing_thread ? existing_thread : initialize(&raw_thread);
-        return thread;
+    LTO_NOINLINE KThread* GetHostDummyThread(KThread* existing_thread) {
+        if (existing_thread) {
+            host_thread_state.Set(session_generation, existing_thread);
+        }
+        return host_thread_state.Get(session_generation, [&] {
+            auto thread = std::make_unique<KThread>(system.Kernel());
+            ASSERT(KThread::InitializeDummyThread(thread.get(), nullptr).IsSuccess());
+            return thread;
+        });
     }
 
     /// Registers a CPU core thread by allocating a host thread ID for it
@@ -422,17 +437,12 @@ struct KernelCore::Impl {
         return is_shutting_down.load(std::memory_order_relaxed);
     }
 
-    static inline thread_local KThread* current_thread{nullptr};
-
     LTO_NOINLINE KThread* GetCurrentEmuThread() {
-        if (!current_thread) {
-            current_thread = GetHostDummyThread(nullptr);
-        }
-        return current_thread;
+        return GetHostDummyThread(nullptr);
     }
 
     LTO_NOINLINE void SetCurrentEmuThread(KThread* thread) {
-        current_thread = thread;
+        host_thread_state.Set(session_generation, thread);
     }
 
     void DeriveInitialMemoryLayout() {
@@ -837,6 +847,7 @@ struct KernelCore::Impl {
 
     bool is_multicore{};
     std::atomic_bool is_shutting_down{};
+    bool services_closed{};
     u32 single_core_thread_id{};
 
     KWorkerTaskManager worker_task_manager;
@@ -995,19 +1006,20 @@ void KernelCore::UnregisterInUseObject(KAutoObject* object) {
     impl->registered_in_use_objects.erase(object);
 }
 
-void KernelCore::RunServer(std::unique_ptr<Service::ServerManager>&& server_manager) {
+bool KernelCore::RunServer(std::unique_ptr<Service::ServerManager>&& server_manager) {
     auto* manager = server_manager.get();
 
     {
         std::scoped_lock lk{impl->server_lock};
-        if (impl->is_shutting_down) {
-            return;
+        if (impl->is_shutting_down || impl->services_closed) {
+            return false;
         }
 
         impl->server_managers.emplace_back(std::move(server_manager));
     }
 
     manager->LoopProcess();
+    return true;
 }
 
 u32 KernelCore::CreateNewObjectID() {

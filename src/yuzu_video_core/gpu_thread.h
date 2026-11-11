@@ -5,6 +5,7 @@
 
 #include <atomic>
 #include <condition_variable>
+#include <memory>
 #include <mutex>
 #include <optional>
 #include <thread>
@@ -90,11 +91,21 @@ struct CommandDataContainer {
 /// Struct used to synchronize the GPU thread
 struct SynchState final {
     using CommandQueue = Common::MPSCQueue<CommandDataContainer>;
+    // Mapping notifications may download images and record renderer commands.
+    // They must not race the GPU command/composite producer.
+    std::recursive_mutex execution_mutex;
     std::mutex write_lock;
     CommandQueue queue;
     u64 last_fence{};
     std::atomic<u64> signaled_fence{};
     std::condition_variable_any cv;
+    std::atomic<bool> composite_ready{};
+
+    void NotifyComposite() {
+        if (!composite_ready.exchange(true, std::memory_order_release)) {
+            queue.NotifyConsumer();
+        }
+    }
 };
 
 /// Class used to manage the GPU thread
@@ -106,6 +117,9 @@ public:
     /// Creates and starts the GPU thread.
     void StartThread(VideoCore::RendererBase& renderer, Core::Frontend::GraphicsContext& context,
                      Tegra::Control::Scheduler& scheduler);
+
+    /// Stops and joins the GPU thread, if it was started.
+    void StopThread();
 
     /// Push GPU command entries to be processed
     void SubmitList(s32 channel, Tegra::CommandList&& entries);
@@ -121,6 +135,19 @@ public:
 
     void TickGPU();
 
+    /// Returns true when the GPU thread has executed every command pushed so far
+    bool IsIdle() const;
+
+    std::unique_lock<std::recursive_mutex> LockExecution() {
+        return std::unique_lock{state->execution_mutex};
+    }
+
+    std::weak_ptr<SynchState> Wakeup() const { return state; }
+
+    bool TakeCompositeReady() {
+        return state->composite_ready.exchange(false, std::memory_order_acquire);
+    }
+
 private:
     /// Pushes a command to be executed by the GPU thread
     u64 PushCommand(CommandData&& command_data, bool block = false);
@@ -129,7 +156,7 @@ private:
     const bool is_async;
     VideoCore::RasterizerInterface* rasterizer = nullptr;
 
-    SynchState state;
+    std::shared_ptr<SynchState> state{std::make_shared<SynchState>()};
     std::jthread thread;
 };
 

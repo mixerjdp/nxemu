@@ -1,9 +1,11 @@
 #pragma once
 #include "common/path.h"
+#include <cstdint>
 #include <string>
 
 struct CoreSettings
 {
+    bool debugSettingsEnabled;
     bool ShowLogConsole;
     std::string LogFilter;
     Path baseDir;
@@ -19,6 +21,7 @@ struct CoreSettings
     std::string gpuCustomDriverDir;
     std::string gpuCustomDriverName;
     std::string gpuFileRedirectDir;
+    int32_t languageIndex;
 };
 
 extern CoreSettings coreSettings;

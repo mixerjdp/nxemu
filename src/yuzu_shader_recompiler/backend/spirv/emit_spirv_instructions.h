@@ -34,6 +34,7 @@ void EmitWorkgroupMemoryBarrier(EmitContext& ctx);
 void EmitDeviceMemoryBarrier(EmitContext& ctx);
 void EmitPrologue(EmitContext& ctx);
 void EmitEpilogue(EmitContext& ctx);
+void EmitForwardLayer(EmitContext& ctx, IR::Attribute source);
 void EmitEmitVertex(EmitContext& ctx, const IR::Value& stream);
 void EmitEndPrimitive(EmitContext& ctx, const IR::Value& stream);
 void EmitGetRegister(EmitContext& ctx);
@@ -359,8 +360,8 @@ Id EmitStorageAtomicXor32(EmitContext& ctx, const IR::Value& binding, const IR::
                           Id value);
 Id EmitStorageAtomicExchange32(EmitContext& ctx, const IR::Value& binding, const IR::Value& offset,
                                Id value);
-Id EmitStorageAtomicIAdd64(EmitContext& ctx, const IR::Value& binding, const IR::Value& offset,
-                           Id value);
+Id EmitStorageAtomicIAdd64(EmitContext& ctx, IR::Inst* inst, const IR::Value& binding,
+                           const IR::Value& offset, Id value);
 Id EmitStorageAtomicSMin64(EmitContext& ctx, const IR::Value& binding, const IR::Value& offset,
                            Id value);
 Id EmitStorageAtomicUMin64(EmitContext& ctx, const IR::Value& binding, const IR::Value& offset,
@@ -377,8 +378,8 @@ Id EmitStorageAtomicXor64(EmitContext& ctx, const IR::Value& binding, const IR::
                           Id value);
 Id EmitStorageAtomicExchange64(EmitContext& ctx, const IR::Value& binding, const IR::Value& offset,
                                Id value);
-Id EmitStorageAtomicIAdd32x2(EmitContext& ctx, const IR::Value& binding, const IR::Value& offset,
-                             Id value);
+Id EmitStorageAtomicIAdd32x2(EmitContext& ctx, IR::Inst* inst, const IR::Value& binding,
+                             const IR::Value& offset, Id value);
 Id EmitStorageAtomicSMin32x2(EmitContext& ctx, const IR::Value& binding, const IR::Value& offset,
                              Id value);
 Id EmitStorageAtomicUMin32x2(EmitContext& ctx, const IR::Value& binding, const IR::Value& offset,
@@ -409,17 +410,17 @@ Id EmitStorageAtomicMaxF16x2(EmitContext& ctx, const IR::Value& binding, const I
                              Id value);
 Id EmitStorageAtomicMaxF32x2(EmitContext& ctx, const IR::Value& binding, const IR::Value& offset,
                              Id value);
-Id EmitGlobalAtomicIAdd32(EmitContext& ctx);
-Id EmitGlobalAtomicSMin32(EmitContext& ctx);
-Id EmitGlobalAtomicUMin32(EmitContext& ctx);
-Id EmitGlobalAtomicSMax32(EmitContext& ctx);
-Id EmitGlobalAtomicUMax32(EmitContext& ctx);
+Id EmitGlobalAtomicIAdd32(EmitContext& ctx, Id address, Id value);
+Id EmitGlobalAtomicSMin32(EmitContext& ctx, Id address, Id value);
+Id EmitGlobalAtomicUMin32(EmitContext& ctx, Id address, Id value);
+Id EmitGlobalAtomicSMax32(EmitContext& ctx, Id address, Id value);
+Id EmitGlobalAtomicUMax32(EmitContext& ctx, Id address, Id value);
 Id EmitGlobalAtomicInc32(EmitContext& ctx);
 Id EmitGlobalAtomicDec32(EmitContext& ctx);
-Id EmitGlobalAtomicAnd32(EmitContext& ctx);
-Id EmitGlobalAtomicOr32(EmitContext& ctx);
-Id EmitGlobalAtomicXor32(EmitContext& ctx);
-Id EmitGlobalAtomicExchange32(EmitContext& ctx);
+Id EmitGlobalAtomicAnd32(EmitContext& ctx, Id address, Id value);
+Id EmitGlobalAtomicOr32(EmitContext& ctx, Id address, Id value);
+Id EmitGlobalAtomicXor32(EmitContext& ctx, Id address, Id value);
+Id EmitGlobalAtomicExchange32(EmitContext& ctx, Id address, Id value);
 Id EmitGlobalAtomicIAdd64(EmitContext& ctx);
 Id EmitGlobalAtomicSMin64(EmitContext& ctx);
 Id EmitGlobalAtomicUMin64(EmitContext& ctx);
@@ -473,8 +474,8 @@ Id EmitConvertU64F32(EmitContext& ctx, Id value);
 Id EmitConvertU64F64(EmitContext& ctx, Id value);
 Id EmitConvertU64U32(EmitContext& ctx, Id value);
 Id EmitConvertU32U64(EmitContext& ctx, Id value);
-Id EmitConvertF16F32(EmitContext& ctx, Id value);
-Id EmitConvertF32F16(EmitContext& ctx, Id value);
+Id EmitConvertF16F32(EmitContext& ctx, IR::Inst* inst, Id value);
+Id EmitConvertF32F16(EmitContext& ctx, IR::Inst* inst, Id value);
 Id EmitConvertF32F64(EmitContext& ctx, Id value);
 Id EmitConvertF64F32(EmitContext& ctx, Id value);
 Id EmitConvertF16S8(EmitContext& ctx, Id value);

@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <cstring>
 #include <fstream>
 #include <sstream>
 #include <vector>
@@ -192,6 +193,11 @@ std::optional<NetworkInterface> GetSelectedNetworkInterface() {
     if (network_interfaces.empty()) {
         LOG_ERROR(Network, "GetAvailableNetworkInterfaces returned no interfaces");
         return std::nullopt;
+    }
+    
+    // An empty setting means automatic selection. Use the first available interface.
+    if (selected_network_interface.empty()) {
+        return network_interfaces.front();
     }
 
     const auto res =

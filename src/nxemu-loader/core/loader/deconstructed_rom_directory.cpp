@@ -5,7 +5,9 @@
 #include "core/core.h"
 #include "core/file_sys/content_archive.h"
 #include "core/file_sys/control_metadata.h"
+#include "core/file_sys/filesystem.h"
 #include "core/file_sys/patch_manager.h"
+#include "core/file_sys/romfs.h"
 #include "core/file_sys/romfs_factory.h"
 #include "core/loader/nso.h"
 #include "system_loader.h"
@@ -13,6 +15,12 @@
 #include "yuzu_common/interface_pointer_def.h"
 #include "yuzu_common/logging/log.h"
 #include "yuzu_common/settings.h"
+#include <cstring>
+#include <algorithm>
+#include <cctype>
+#include <string_view>
+#include <vector>
+#include <nxemu-core/settings/identifiers.h>
 #include <nxemu-cpu/cpu_settings_identifiers.h>
 #include <nxemu-module-spec/cpu.h>
 #include <nxemu-module-spec/operating_system.h>
@@ -22,6 +30,83 @@ template class InterfacePtr<IPatchCollection>;
 
 extern IModuleSettings * g_settings;
 
+namespace {
+
+bool EqualsIgnoreCase(std::string_view a, std::string_view b)
+{
+    return a.size() == b.size() &&
+           std::equal(a.begin(), a.end(), b.begin(), [](unsigned char x, unsigned char y) {
+               return std::tolower(x) == std::tolower(y);
+           });
+}
+
+FileSys::VirtualDir FindRomFSDirectory(const FileSys::VirtualDir & parent)
+{
+    if (!parent)
+    {
+        return nullptr;
+    }
+    if (auto dir = parent->GetSubdirectory("romfs"))
+    {
+        return dir;
+    }
+    for (const auto & dir : parent->GetSubdirectories())
+    {
+        if (EqualsIgnoreCase(dir->GetName(), "romfs"))
+        {
+            return dir;
+        }
+    }
+    return nullptr;
+}
+
+// Files next to an "exefs" folder belong to the same title (game/exefs + game/romfs,
+// game/control.nacp). A flat ExeFS folder has no such parent: its parent is usually the
+// game library, so never look there.
+FileSys::VirtualDir TitleRootDirectory(const FileSys::VirtualDir & exefs)
+{
+    return exefs && EqualsIgnoreCase(exefs->GetName(), "exefs") ? exefs->GetParentDirectory() : nullptr;
+}
+
+// Only called when the game actually asks for its RomFS. A library scan must not walk
+// an extracted game's potentially huge RomFS tree.
+FileSys::VirtualFile FindLooseRomFS(const FileSys::VirtualDir & exefs)
+{
+    if (!exefs)
+    {
+        return nullptr;
+    }
+    for (const auto & file : exefs->GetFiles())
+    {
+        if (EqualsIgnoreCase(file->GetExtension(), "romfs"))
+        {
+            return file;
+        }
+    }
+    auto romfs_dir = FindRomFSDirectory(exefs);
+    if (!romfs_dir)
+    {
+        romfs_dir = FindRomFSDirectory(TitleRootDirectory(exefs));
+    }
+    return romfs_dir ? FileSys::CreateRomFS(std::move(romfs_dir)) : nullptr;
+}
+
+std::vector<FileSys::VirtualDir> FindSidecarDirectories(const FileSys::VirtualDir & exefs)
+{
+    std::vector<FileSys::VirtualDir> dirs;
+    if (exefs)
+    {
+        dirs.push_back(exefs);
+        if (auto root = TitleRootDirectory(exefs))
+        {
+            dirs.push_back(std::move(root));
+        }
+    }
+    return dirs;
+}
+
+} // namespace
+
 namespace Loader {
 
 AppLoader_DeconstructedRomDirectory::AppLoader_DeconstructedRomDirectory(FileSys::VirtualFile file_, bool override_update_) : 
@@ -30,6 +115,8 @@ AppLoader_DeconstructedRomDirectory::AppLoader_DeconstructedRomDirectory(FileSys
     is_hbl(false) 
 {
     const auto file_dir = file->GetContainingDirectory();
+    romfs_exefs_dir = file_dir;
+    const auto sidecar_dirs = FindSidecarDirectories(file_dir);
 
     // Title ID
     const auto npdm = file_dir->GetFile("main.npdm");
@@ -44,12 +131,19 @@ AppLoader_DeconstructedRomDirectory::AppLoader_DeconstructedRomDirectory(FileSys
 
     // Icon
     FileSys::VirtualFile icon_file = nullptr;
-    for (const auto& language : FileSys::LANGUAGE_NAMES)
+    for (const auto & sidecar_dir : sidecar_dirs)
     {
-        icon_file = file_dir->GetFile("icon_" + std::string(language) + ".dat");
+        for (const auto & language : FileSys::LANGUAGE_NAMES)
+        {
+            icon_file = sidecar_dir->GetFile("icon_" + std::string(language) + ".dat");
+            if (icon_file != nullptr)
+            {
+                icon_data = icon_file->ReadAllBytes();
+                break;
+            }
+        }
         if (icon_file != nullptr)
         {
-            icon_data = icon_file->ReadAllBytes();
             break;
         }
     }
@@ -57,33 +151,52 @@ AppLoader_DeconstructedRomDirectory::AppLoader_DeconstructedRomDirectory(FileSys
     if (icon_data.empty())
     {
         // Any png, jpeg, or bmp file
-        const auto& files = file_dir->GetFiles();
-        const auto icon_iter = std::find_if(files.begin(), files.end(), [](const FileSys::VirtualFile& f)
+        for (const auto & sidecar_dir : sidecar_dirs)
+        {
+            const auto files = sidecar_dir->GetFiles();
+            const auto icon_iter = std::find_if(files.begin(), files.end(), [](const FileSys::VirtualFile& f)
             {
                 return f->GetExtension() == "png" || f->GetExtension() == "jpg" || f->GetExtension() == "bmp" || f->GetExtension() == "jpeg";
             });
-        if (icon_iter != files.end())
-        {        
-            icon_data = (*icon_iter)->ReadAllBytes();
+            if (icon_iter != files.end())
+            {
+                icon_data = (*icon_iter)->ReadAllBytes();
+                break;
+            }
         }
     }
 
     // Metadata
-    FileSys::VirtualFile nacp_file = file_dir->GetFile("control.nacp");
-    if (nacp_file == nullptr)
+    FileSys::VirtualFile nacp_file;
+    for (const auto & sidecar_dir : sidecar_dirs)
     {
-        const auto& files = file_dir->GetFiles();
-        const auto nacp_iter = std::find_if(files.begin(), files.end(), [](const FileSys::VirtualFile& f) { return f->GetExtension() == "nacp"; });
-        if (nacp_iter != files.end())
+        nacp_file = sidecar_dir->GetFile("control.nacp");
+        if (nacp_file == nullptr)
         {
-            nacp_file = *nacp_iter;        
+            const auto files = sidecar_dir->GetFiles();
+            const auto nacp_iter = std::find_if(files.begin(), files.end(), [](const FileSys::VirtualFile& f) { return f->GetExtension() == "nacp"; });
+            if (nacp_iter != files.end())
+            {
+                nacp_file = *nacp_iter;
+            }
+        }
+        if (nacp_file != nullptr)
+        {
+            break;
         }
     }
 
     if (nacp_file != nullptr)
     {
-        FileSys::NACP nacp(nacp_file);
-        name = nacp.GetApplicationName();
+        control.emplace(nacp_file);
+        if (control->IsValid())
+        {
+            name = control->GetApplicationName();
+        }
+        else
+        {
+            control.reset();
+        }
     }
 }
 
@@ -93,6 +206,15 @@ AppLoader_DeconstructedRomDirectory::AppLoader_DeconstructedRomDirectory(FileSys
     override_update(override_update_), 
     is_hbl(is_hbl_)
 {
+    romfs_exefs_dir = dir;
+}
+
+const FileSys::VirtualFile& AppLoader_DeconstructedRomDirectory::LooseRomFS()
+{
+    std::call_once(romfs_once, [this] {
+        romfs = FindLooseRomFS(romfs_exefs_dir);
+    });
+    return romfs;
 }
 
 LoaderFileType AppLoader_DeconstructedRomDirectory::IdentifyType(const FileSys::VirtualFile & dir_file)
@@ -111,6 +233,8 @@ AppLoader_DeconstructedRomDirectory::LoadResult AppLoader_DeconstructedRomDirect
         return { LoaderResultStatus::ErrorAlreadyLoaded, {}};
     }
 
+    // NCA/NSP loaders register their own RomFS factory; direct ExeFS loads do not.
+    const bool standalone = dir == nullptr;
     if (dir == nullptr)
     {
         if (file == nullptr)
@@ -155,14 +279,45 @@ AppLoader_DeconstructedRomDirectory::LoadResult AppLoader_DeconstructedRomDirect
     metadata.Print();
 
     const bool is_application = metadata.GetPoolPartition() == PoolPartition::Application;
+    LOG_INFO(Loader, "Process CPU: AArch{}, address-space type {}",
+             metadata.Is64BitProgram() ? 64 : 32, static_cast<unsigned>(metadata.GetAddressSpaceType()));
+    // Disable eligibility while publishing the new process metadata.
+    g_settings->SetBool(NXCoreSetting::Is64BitProgram, false);
+    g_settings->SetBool(NXCoreSetting::Has36BitAddressSpace, metadata.GetAddressSpaceType() == ProgramAddressSpaceType::Is36Bit);
+    g_settings->SetBool(NXCoreSetting::Has39BitAddressSpace, metadata.GetAddressSpaceType() == ProgramAddressSpaceType::Is39Bit);
+    g_settings->SetBool(NXCoreSetting::Is64BitProgram, metadata.Is64BitProgram());
+
+    IOperatingSystem & operatingSystem = systemModules.OperatingSystem();
+
+    // Enable direct memory mapping in case of NCE.
+    uint64_t fastmem_base = 0;
+    if (is_application && g_settings->GetBool(NXCpuSetting::NceEnabled))
+    {
+        IDeviceMemory & buffer = operatingSystem.DeviceMemory();
+        buffer.EnableDirectMappedAddress();
+        fastmem_base = reinterpret_cast<uint64_t>(buffer.VirtualBasePointer());
+#if defined(__APPLE__)
+        if (fastmem_base == 0)
+        {
+            LOG_WARNING(Loader, "NCE address windows unavailable, falling back to Dynarmic before patching");
+            g_settings->SetBool(NXCpuSetting::NceEnabled, false);
+        }
+#endif
+    }
 
     IPatchCollectionPtr patch_ctx(systemModules.Cpu().CreatePatchCollection(is_application));
     const std::array static_modules = {"rtld", "main", "subsdk0", "subsdk1", "subsdk2", "subsdk3", "subsdk4", "subsdk5", "subsdk6", "subsdk7", "subsdk8", "subsdk9", "sdk"};
     std::size_t code_size{};
+    // Both passes take the patch manager: patch sets add pages after a module, which the layout must hold
+    const FileSys::PatchManager pm{metadata.GetTitleID(), loader.GetFileSystemController(), loader.GetContentProvider()};
 
     // Use the NSO module loader to figure out the code layout
     for (size_t i = 0; i < static_modules.size(); i++)
     {
+        if (loader.PrepareRomCancelled())
+        {
+            return {LoaderResultStatus::ErrorCancelled, {}};
+        }
         const auto& module = static_modules[i];
         const FileSys::VirtualFile module_file{dir->GetFile(module)};
         if (!module_file)
@@ -172,7 +327,7 @@ AppLoader_DeconstructedRomDirectory::LoadResult AppLoader_DeconstructedRomDirect
 
         const bool should_pass_arguments = std::strcmp(module, "rtld") == 0;
         const int32_t patch_index = patch_ctx ? patch_ctx->GetLastIndex() : -1;
-        const std::optional<VAddr> tentative_next_load_addr = AppLoader_NSO::LoadModule(loader, systemModules, *module_file, code_size, should_pass_arguments, false, {}, patch_ctx.Get(), patch_index);
+        const std::optional<VAddr> tentative_next_load_addr = AppLoader_NSO::LoadModule(loader, systemModules, *module_file, code_size, should_pass_arguments, false, pm, patch_ctx.Get(), patch_index);
         if (!tentative_next_load_addr)
         {
             return {LoaderResultStatus::ErrorLoadingNSO, {}};
@@ -183,15 +338,6 @@ AppLoader_DeconstructedRomDirectory::LoadResult AppLoader_DeconstructedRomDirect
             patch_ctx->SaveIndex((uint32_t)i);
         }
         code_size = *tentative_next_load_addr;
-    }
-
-    IOperatingSystem & operatingSystem = systemModules.OperatingSystem();
-
-    // Enable direct memory mapping in case of NCE.
-    uint64_t fastmem_base = 0;
-    if (is_application && g_settings->GetBool(NXCpuSetting::NceEnabled))
-    {
-        UNIMPLEMENTED();
     }
 
     // Add patch size to the total module size
@@ -210,9 +356,12 @@ AppLoader_DeconstructedRomDirectory::LoadResult AppLoader_DeconstructedRomDirect
     // Load NSO modules
     modules.clear();
     VAddr next_load_addr{base_address};
-    const FileSys::PatchManager pm{metadata.GetTitleID(), loader.GetFileSystemController(), loader.GetContentProvider()};
     for (size_t i = 0; i < static_modules.size(); i++)
     {
+        if (loader.PrepareRomCancelled())
+        {
+            return {LoaderResultStatus::ErrorCancelled, {}};
+        }
         const auto& module = static_modules[i];
         const FileSys::VirtualFile module_file{dir->GetFile(module)};
         if (!module_file)
@@ -234,18 +383,43 @@ AppLoader_DeconstructedRomDirectory::LoadResult AppLoader_DeconstructedRomDirect
         LOG_DEBUG(Loader, "loaded module {} @ {:#X}", module, load_addr);
     }
 
+    if (standalone)
+    {
+        if (loader.PrepareRomCancelled())
+        {
+            return {LoaderResultStatus::ErrorCancelled, {}};
+        }
+
+        // Register even without a base RomFS. This preserves the process's filesystem
+        // registration and lets the factory apply a LayeredFS override when present.
+        loader.GetFileSystemController().RegisterProcess(
+            processID, metadata.GetTitleID(),
+            std::make_shared<FileSys::RomFSFactory>(
+                LooseRomFS(), true, loader.GetContentProvider(), loader.GetFileSystemController()));
+    }
+
     is_loaded = true;
     return {LoaderResultStatus::Success, LoadParameters{metadata.GetMainThreadPriority(), metadata.GetMainThreadStackSize(), base_address, processID}};
 }
 
 LoaderResultStatus AppLoader_DeconstructedRomDirectory::ReadRomFS(FileSys::VirtualFile& out_dir)
 {
-    if (romfs == nullptr)
+    if (LooseRomFS() == nullptr)
     {
         return LoaderResultStatus::ErrorNoRomFS;
     }
 
     out_dir = romfs;
+    return LoaderResultStatus::Success;
+}
+
+LoaderResultStatus AppLoader_DeconstructedRomDirectory::ReadControlData(FileSys::NACP& out_control)
+{
+    if (!control)
+    {
+        return LoaderResultStatus::ErrorNoControl;
+    }
+    out_control = *control;
     return LoaderResultStatus::Success;
 }
 

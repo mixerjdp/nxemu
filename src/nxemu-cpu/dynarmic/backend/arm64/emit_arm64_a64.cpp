@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
+// SPDX-License-Identifier: GPL-3.0-or-later
+// FPSR lazy-read changes adapted for NXEmu on 2026-10-30.
+
 /* This file is part of the dynarmic project.
  * Copyright (c) 2022 MerryMage
  * SPDX-License-Identifier: 0BSD
@@ -9,7 +13,9 @@
 #include "dynarmic/backend/arm64/a64_jitstate.h"
 #include "dynarmic/backend/arm64/abi.h"
 #include "dynarmic/backend/arm64/emit_arm64.h"
+#include "dynarmic/backend/arm64/emit_arm64_far_branch.h"
 #include "dynarmic/backend/arm64/emit_context.h"
+#include "dynarmic/backend/arm64/fpsr_manager.h"
 #include "dynarmic/backend/arm64/reg_alloc.h"
 #include "dynarmic/interface/halt_reason.h"
 #include "dynarmic/ir/basic_block.h"
@@ -154,7 +160,7 @@ void EmitA64CheckMemoryAbort(oaknut::CodeGenerator& code, EmitContext& ctx, IR::
 
     code.LDAR(Xscratch0, Xhalt);
     code.TST(Xscratch0, static_cast<u32>(HaltReason::MemoryAbort));
-    code.B(EQ, end);
+    EmitFarConditionalBranch(code, EQ, end);
     code.MOV(Xscratch0, current_location.PC());
     code.STR(Xscratch0, Xstate, offsetof(A64JitState, pc));
     EmitRelocation(code, ctx, LinkTarget::ReturnFromRunCode);
@@ -277,11 +283,11 @@ void EmitIR<IR::Opcode::A64GetFPCR>(oaknut::CodeGenerator& code, EmitContext& ct
 }
 
 template<>
-void EmitIR<IR::Opcode::A64GetFPSR>(oaknut::CodeGenerator& code, EmitContext& ctx, IR::Inst* inst) {
+void EmitIR<IR::Opcode::A64GetFPSR>(oaknut::CodeGenerator&, EmitContext& ctx, IR::Inst* inst) {
     auto Wresult = ctx.reg_alloc.WriteW(inst);
     RegAlloc::Realize(Wresult);
 
-    code.LDR(Wresult, Xstate, offsetof(A64JitState, fpsr));
+    ctx.fpsr.GetFpsr(Wresult);
 }
 
 template<>

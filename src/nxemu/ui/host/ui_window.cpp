@@ -1,0 +1,783 @@
+#include "ui_window.h"
+#include "system_fonts.h"
+#include "ui_dialog_window.h"
+#include "ui_pack.h"
+#include "ui_theme.h"
+#include <RmlUi/Core.h>
+#include <RmlUi_Platform_SDL.h>
+#define SDL_MAIN_HANDLED
+#include <SDL3/SDL_main.h>
+// Platform headers may expose X11 macros.
+#undef None
+#include <algorithm>
+#include <cstdlib>
+#include <cstring>
+#include <fstream>
+#include <iterator>
+#include <nxemu-module-spec/video.h>
+#include <nxemu/ui/i18n/translation.h>
+#include <nxemu/ui/platform/native_window.h>
+#include <nxemu/ui/platform/system_theme.h>
+#include <stb_image.h>
+#include <vector>
+#include <yuzu_common/fs/fs_util.h>
+#include <yuzu_common/string_util.h>
+
+namespace
+{
+// Width, in window coordinates, of the edges a window without a frame is
+// resized by.
+constexpr int kResizeEdge = 6;
+#if defined(__linux__)
+// Two presses on the title bar count as a double click within this time and
+// this distance, in window coordinates, of each other.
+constexpr uint64_t kDoubleClickMs = 500;
+constexpr int kDoubleClickReach = 4;
+#endif
+
+void * WindowPointer(SDL_Window * window, const char * property)
+{
+    return window != nullptr ? SDL_GetPointerProperty(SDL_GetWindowProperties(window), property, nullptr) : nullptr;
+}
+
+void * NativeWindowHandle(SDL_Window * window)
+{
+#if defined(_WIN32)
+    return WindowPointer(window, SDL_PROP_WINDOW_WIN32_HWND_POINTER);
+#elif defined(__APPLE__)
+    return WindowPointer(window, SDL_PROP_WINDOW_COCOA_WINDOW_POINTER);
+#else
+    (void)window;
+    return nullptr;
+#endif
+}
+
+SDL_DisplayID WindowDisplay(SDL_Window * window)
+{
+    const SDL_DisplayID display = SDL_GetDisplayForWindow(window);
+    return display != 0 ? display : SDL_GetPrimaryDisplay();
+}
+
+using UiSystemInterface = SystemInterface_SDL;
+} // namespace
+
+UiWindow::UiWindow() = default;
+
+UiWindow::~UiWindow()
+{
+#if defined(__linux__)
+    if (m_themeQuery.valid())
+    {
+        m_themeQuery.wait();
+    }
+#endif
+    m_dialogWindow.reset();
+    ReleaseRenderer();
+    if (m_rmlInitialised)
+    {
+        Rml::Shutdown();
+        Rml::SetRenderInterface(nullptr);
+        Rml::SetSystemInterface(nullptr);
+    }
+    m_renderer.reset();
+    m_presenter.reset();
+    m_system.reset();
+    if (m_metalView != nullptr)
+    {
+        SDL_Metal_DestroyView(m_metalView);
+    }
+    if (m_window != nullptr)
+    {
+        ReleaseNativeWindowStyle(m_window);
+        SDL_DestroyWindow(m_window);
+    }
+    if (m_sdlInitialised)
+    {
+        SDL_Quit();
+    }
+}
+
+bool UiWindow::Create(const char * title, int width, int height, const std::filesystem::path & assetDir, int32_t deviceIndex)
+{
+    SDL_SetMainReady();
+#if defined(__linux__)
+    // Wayland associates windows with their .desktop entry using the application ID.
+    // Keep this in sync with the AppImage desktop file and icon name.
+    SDL_SetAppMetadata("NxEmu", nullptr, "io.github.N3xoX1.nxemu");
+#endif
+    SDL_SetHint(SDL_HINT_MOUSE_FOCUS_CLICKTHROUGH, "1");
+    // A hidden dialog window would otherwise stop closing the main window
+    // from quitting; that close is handled as a quit request instead.
+    SDL_SetHint(SDL_HINT_QUIT_ON_LAST_WINDOW_CLOSE, "0");
+    m_assetDir = assetDir;
+#if defined(_WIN32)
+    // Keep what the window manager does for a framed window: snapping, the
+    // shadow, the animations.
+    SDL_SetHint("SDL_BORDERLESS_WINDOWED_STYLE", "1");
+    SDL_SetHint("SDL_BORDERLESS_RESIZABLE_STYLE", "1");
+#elif !defined(__APPLE__)
+    SDL_SetHint(SDL_HINT_VIDEO_DRIVER, "wayland");
+#endif
+    if (!SDL_Init(SDL_INIT_VIDEO | SDL_INIT_EVENTS))
+    {
+        return Fail(SDL_GetError());
+    }
+    m_sdlInitialised = true;
+#if defined(__linux__)
+    m_themeEvent = SDL_RegisterEvents(1);
+    if (m_themeEvent == 0)
+    {
+        return Fail("Unable to register the theme notification");
+    }
+#endif
+
+    SDL_WindowFlags flags = SDL_WINDOW_RESIZABLE | SDL_WINDOW_HIGH_PIXEL_DENSITY;
+#if defined(__APPLE__)
+    flags |= SDL_WINDOW_METAL;
+#else
+    flags |= SDL_WINDOW_BORDERLESS;
+    m_frameless = true;
+#endif
+    const SDL_PropertiesID properties = SDL_CreateProperties();
+    SDL_SetStringProperty(properties, SDL_PROP_WINDOW_CREATE_TITLE_STRING, title);
+    SDL_SetNumberProperty(properties, SDL_PROP_WINDOW_CREATE_X_NUMBER, SDL_WINDOWPOS_CENTERED);
+    SDL_SetNumberProperty(properties, SDL_PROP_WINDOW_CREATE_Y_NUMBER, SDL_WINDOWPOS_CENTERED);
+    SDL_SetNumberProperty(properties, SDL_PROP_WINDOW_CREATE_WIDTH_NUMBER, width);
+    SDL_SetNumberProperty(properties, SDL_PROP_WINDOW_CREATE_HEIGHT_NUMBER, height);
+    SDL_SetNumberProperty(properties, SDL_PROP_WINDOW_CREATE_FLAGS_NUMBER, static_cast<Sint64>(flags));
+    m_window = SDL_CreateWindowWithProperties(properties);
+    SDL_DestroyProperties(properties);
+    if (m_window == nullptr)
+    {
+        return Fail(SDL_GetError());
+    }
+    SDL_SetWindowMinimumSize(m_window, 400, 312);
+    SetWindowIcon(assetDir / "images" / "window-icon.png");
+    if (m_frameless)
+    {
+        const char * driver = SDL_GetCurrentVideoDriver();
+        m_waylandVideo = driver != nullptr && std::strcmp(driver, "wayland") == 0;
+        SDL_SetWindowHitTest(
+            m_window, [](SDL_Window *, const SDL_Point * point, void * self) { return static_cast<UiWindow *>(self)->HitTest(*point); }, this);
+    }
+#if defined(__APPLE__)
+    // The layer of this view is what the video module presents to.
+    m_metalView = SDL_Metal_CreateView(m_window);
+    if (m_metalView == nullptr)
+    {
+        return Fail(SDL_GetError());
+    }
+#endif
+
+    m_system = std::make_unique<UiSystemInterface>(m_window);
+    m_renderer = std::make_unique<UiRenderer>();
+    Rml::SetSystemInterface(m_system.get());
+    Rml::SetRenderInterface(m_renderer.get());
+    if (!Rml::Initialise())
+    {
+        return Fail("RmlUi initialization failed");
+    }
+    m_rmlInitialised = true;
+    m_packFiles = std::make_unique<UiPackFileInterface>(*Rml::GetFileInterface());
+    m_themeFiles = std::make_unique<UiThemeFileInterface>(*m_packFiles);
+    Rml::SetFileInterface(m_themeFiles.get());
+    if (!LoadFonts(assetDir / "fonts"))
+    {
+        return false;
+    }
+
+    m_context = Rml::CreateContext("nxemu", {width, height});
+    if (m_context == nullptr)
+    {
+        return Fail("Unable to create the RmlUi context");
+    }
+
+    m_systemTitleBar = ApplyNativeWindowStyle(m_window);
+    UpdateDimensions();
+
+    m_presenter = std::make_unique<UiPresenter>();
+    if (!m_presenter->Create(*this, deviceIndex))
+    {
+        return Fail(m_presenter->Error());
+    }
+    if (!m_renderer->Bind(m_presenter->Context()))
+    {
+        return Fail(m_renderer->Error());
+    }
+    return true;
+}
+
+bool UiWindow::AttachVideo(IVideo & video)
+{
+    ReleaseRenderer();
+    m_presenter->ReleaseWindow();
+    VideoInterfaceDevice device{};
+    if (!video.AttachInterface(&device))
+    {
+        return Fail("The video module cannot show the interface. Its Vulkan renderer is required.");
+    }
+    VulkanContext context;
+    context.getInstanceProcAddr = reinterpret_cast<PFN_vkGetInstanceProcAddr>(device.getInstanceProcAddr);
+    context.instance = static_cast<VkInstance>(device.instance);
+    context.physicalDevice = static_cast<VkPhysicalDevice>(device.physicalDevice);
+    context.device = static_cast<VkDevice>(device.device);
+    if (!m_renderer->Bind(context))
+    {
+        return Fail(m_renderer->Error());
+    }
+    m_video = &video;
+    return true;
+}
+
+void UiWindow::DetachVideo()
+{
+    if (m_video == nullptr)
+    {
+        return;
+    }
+    ReleaseRenderer();
+    if (!m_renderer->Bind(m_presenter->Context()))
+    {
+        Fail(m_renderer->Error());
+    }
+}
+
+void UiWindow::ReleaseRenderer()
+{
+    if (m_renderer == nullptr || !m_renderer->IsBound())
+    {
+        m_video = nullptr;
+        return;
+    }
+    if (m_video != nullptr)
+    {
+        m_video->WaitInterfaceIdle();
+    }
+    else
+    {
+        m_presenter->WaitIdle();
+    }
+    Rml::ReleaseTextures(m_renderer.get());
+    Rml::ReleaseCompiledGeometry(m_renderer.get());
+    m_renderer->Unbind();
+    m_video = nullptr;
+}
+
+UiDialogWindow * UiWindow::DialogWindow()
+{
+#if defined(_WIN32)
+    if (m_dialogWindow == nullptr)
+    {
+        m_dialogWindow = std::make_unique<UiDialogWindow>(m_window, *m_presenter, m_assetDir / "images" / "window-icon.png");
+        m_dialogWindow->SetLight(m_light);
+    }
+#endif
+    return m_dialogWindow.get();
+}
+
+Rml::Context * UiWindow::FrontContext() const
+{
+    return m_dialogWindow != nullptr && m_dialogWindow->IsShown() ? m_dialogWindow->Context() : m_context;
+}
+
+void UiWindow::HandleEvent(const SDL_Event & event)
+{
+    if (m_dialogWindow != nullptr && m_dialogWindow->Owns(event))
+    {
+        m_dialogWindow->HandleEvent(event);
+        return;
+    }
+#if defined(__linux__)
+    if (event.type == m_themeEvent)
+    {
+        const Uint32 result = static_cast<Uint32>(event.user.code);
+        if (m_themeChoice == "system" && event.user.windowID == SDL_GetWindowID(m_window) && (result >> 1) == m_themeRequest)
+        {
+            ApplyTheme((result & 1) != 0, false);
+        }
+        return;
+    }
+#endif
+    if (event.type >= SDL_EVENT_WINDOW_FIRST && event.type <= SDL_EVENT_WINDOW_LAST)
+    {
+        switch (event.type)
+        {
+        case SDL_EVENT_WINDOW_FOCUS_GAINED:
+            if (m_themeChoice == "system")
+            {
+#if defined(__linux__)
+                RefreshSystemTheme();
+#else
+                SetTheme(m_themeChoice);
+#endif
+            }
+            break;
+        case SDL_EVENT_WINDOW_PIXEL_SIZE_CHANGED:
+        case SDL_EVENT_WINDOW_DISPLAY_SCALE_CHANGED:
+        case SDL_EVENT_WINDOW_DISPLAY_CHANGED:
+        case SDL_EVENT_WINDOW_MOVED:
+        case SDL_EVENT_WINDOW_MAXIMIZED:
+        case SDL_EVENT_WINDOW_RESTORED:
+            UpdateDimensions();
+            break;
+        case SDL_EVENT_WINDOW_MOUSE_LEAVE:
+            m_context->ProcessMouseLeave();
+            break;
+#if defined(__linux__)
+        case SDL_EVENT_WINDOW_HIT_TEST:
+            if (!m_waylandVideo && m_overDragArea)
+            {
+                TitleBarPressed(m_dragAreaPoint);
+            }
+            break;
+#endif
+        }
+        return;
+    }
+
+#if defined(__linux__)
+    if ((event.type == SDL_EVENT_MOUSE_BUTTON_DOWN || event.type == SDL_EVENT_MOUSE_BUTTON_UP) && event.button.button == SDL_BUTTON_LEFT)
+    {
+        if (event.type == SDL_EVENT_MOUSE_BUTTON_UP && !m_leftButtonDown && m_waylandVideo && m_overDragArea)
+        {
+            TitleBarPressed(m_dragAreaPoint);
+        }
+        m_leftButtonDown = event.type == SDL_EVENT_MOUSE_BUTTON_DOWN;
+    }
+#endif
+
+    // The handler scales mouse positions by the window's pixel density.
+    SDL_Event forwarded = event;
+    RmlSDL::InputEventHandler(m_context, m_window, forwarded);
+}
+
+bool UiWindow::Render(const PixelRect * gameArea)
+{
+    if (m_dialogWindow != nullptr)
+    {
+        m_dialogWindow->Render();
+    }
+    const bool hidden = (SDL_GetWindowFlags(m_window) & (SDL_WINDOW_MINIMIZED | SDL_WINDOW_HIDDEN)) != 0;
+    if (hidden || m_drawableWidth <= 0 || m_drawableHeight <= 0)
+    {
+        return false;
+    }
+    if (m_video == nullptr)
+    {
+        if (!m_renderer->IsBound() && !m_renderer->Bind(m_presenter->Context()))
+        {
+            return false;
+        }
+        VkImage image = VK_NULL_HANDLE;
+        const VkCommandBuffer commandBuffer = m_presenter->BeginFrame(static_cast<uint32_t>(m_drawableWidth), static_cast<uint32_t>(m_drawableHeight), image);
+        if (commandBuffer == VK_NULL_HANDLE)
+        {
+            return false;
+        }
+        m_renderer->BeginFrame(commandBuffer, m_drawableWidth, m_drawableHeight);
+        m_context->Render();
+        m_renderer->EndFrame(image);
+        m_presenter->EndFrame();
+        return true;
+    }
+    VideoInterfaceFrame frame{};
+    if (!m_video->BeginInterfaceFrame(static_cast<uint32_t>(m_drawableWidth), static_cast<uint32_t>(m_drawableHeight), &frame))
+    {
+        return false;
+    }
+    m_renderer->BeginFrame(static_cast<VkCommandBuffer>(frame.commandBuffer), m_drawableWidth, m_drawableHeight);
+    m_context->Render();
+    m_renderer->EndFrame(reinterpret_cast<VkImage>(frame.image));
+
+    if (gameArea != nullptr)
+    {
+        const VideoInterfaceArea area{gameArea->x, gameArea->y, static_cast<uint32_t>(gameArea->width), static_cast<uint32_t>(gameArea->height)};
+        m_video->EndInterfaceFrame(&area);
+    }
+    else
+    {
+        m_video->EndInterfaceFrame(nullptr);
+    }
+    return true;
+}
+
+void UiWindow::PaceFrame()
+{
+    const uint64_t frequency = SDL_GetPerformanceFrequency();
+    const uint64_t elapsed = SDL_GetPerformanceCounter() - m_lastFrame;
+    if (elapsed < m_frameInterval)
+    {
+        SDL_Delay(static_cast<Uint32>((m_frameInterval - elapsed) * 1000 / frequency));
+    }
+    m_lastFrame = SDL_GetPerformanceCounter();
+}
+
+void * UiWindow::NativeHandle() const
+{
+    return NativeWindowHandle(m_window);
+}
+
+void * UiWindow::FrontNativeHandle() const
+{
+    return NativeWindowHandle(m_dialogWindow != nullptr && m_dialogWindow->IsShown() ? m_dialogWindow->Handle() : m_window);
+}
+
+void * UiWindow::RenderSurface() const
+{
+    if (m_metalView != nullptr)
+    {
+        return SDL_Metal_GetLayer(m_metalView);
+    }
+    switch (WindowSystem())
+    {
+    case RenderWindowSystem::Windows: return WindowPointer(m_window, SDL_PROP_WINDOW_WIN32_HWND_POINTER);
+    case RenderWindowSystem::Wayland: return WindowPointer(m_window, SDL_PROP_WINDOW_WAYLAND_SURFACE_POINTER);
+    default: return nullptr;
+    }
+}
+
+void * UiWindow::DisplayConnection() const
+{
+    if (WindowSystem() == RenderWindowSystem::Wayland)
+    {
+        return WindowPointer(m_window, SDL_PROP_WINDOW_WAYLAND_DISPLAY_POINTER);
+    }
+    return nullptr;
+}
+
+RenderWindowSystem UiWindow::WindowSystem() const
+{
+    const char * driver = m_window != nullptr ? SDL_GetCurrentVideoDriver() : nullptr;
+    if (driver == nullptr)
+    {
+        return RenderWindowSystem::Default;
+    }
+    if (std::strcmp(driver, "windows") == 0)
+    {
+        return RenderWindowSystem::Windows;
+    }
+    if (std::strcmp(driver, "cocoa") == 0)
+    {
+        return RenderWindowSystem::Cocoa;
+    }
+    if (std::strcmp(driver, "wayland") == 0)
+    {
+        return RenderWindowSystem::Wayland;
+    }
+    return RenderWindowSystem::Default;
+}
+
+float UiWindow::PixelRatio() const
+{
+    return m_pixelScale;
+}
+
+void UiWindow::SetTitle(const std::string & title)
+{
+    // Cocoa cannot construct an NSString from malformed UTF-8. Validate at the
+    // native boundary too, including titles read from an older library cache.
+    SDL_SetWindowTitle(m_window, Common::IsValidUTF8(title) ? title.c_str() : "NXEmu");
+}
+
+void UiWindow::SetTheme(const std::string & choice)
+{
+    const std::string next = choice == "light" || choice == "dark" ? choice : "system";
+    const bool modeChanged = next != m_themeChoice;
+    m_themeChoice = next;
+#if defined(__linux__)
+    if (m_themeChoice == "system" && m_context->GetNumDocuments() > 0)
+    {
+        RefreshSystemTheme();
+        return;
+    }
+#endif
+    const bool light = m_themeChoice == "light" || (m_themeChoice == "system" && !SystemPrefersDarkTheme());
+    ApplyTheme(light, modeChanged);
+}
+
+void UiWindow::ApplyTheme(bool light, bool modeChanged)
+{
+    const bool coloursChanged = m_themeFiles->SetLight(light);
+    m_light = light;
+    if (modeChanged || coloursChanged)
+    {
+        SetNativeWindowTheme(m_window, m_themeChoice.c_str());
+    }
+    if (!coloursChanged)
+    {
+        return;
+    }
+    m_context->ActivateTheme("light", light);
+    for (int index = 0; index < m_context->GetNumDocuments(); ++index)
+    {
+        m_context->GetDocument(index)->ReloadStyleSheet();
+    }
+    if (m_dialogWindow != nullptr)
+    {
+        m_dialogWindow->SetLight(light);
+    }
+}
+
+#if defined(__linux__)
+void UiWindow::RefreshSystemTheme()
+{
+    if (m_themeQuery.valid())
+    {
+        if (m_themeQuery.wait_for(std::chrono::seconds(0)) != std::future_status::ready)
+        {
+            return;
+        }
+        m_themeQuery.get();
+    }
+    const Uint32 type = m_themeEvent;
+    const Uint32 windowId = SDL_GetWindowID(m_window);
+    m_themeRequest = (m_themeRequest + 1) & 0x3fffffffu;
+    const Uint32 request = m_themeRequest;
+    m_themeQuery = std::async(std::launch::async, [type, windowId, request] {
+        SDL_Event event{};
+        event.type = type;
+        event.user.windowID = windowId;
+        event.user.code = static_cast<Sint32>((request << 1) | (SystemPrefersDarkTheme() ? 0u : 1u));
+        SDL_PushEvent(&event);
+    });
+}
+#endif
+
+bool UiWindow::IsFullscreen() const
+{
+#if defined(__APPLE__)
+    return NativeWindowIsFullscreen(m_window);
+#else
+    return (SDL_GetWindowFlags(m_window) & SDL_WINDOW_FULLSCREEN) != 0;
+#endif
+}
+
+void UiWindow::SyncNativeState()
+{
+    if (SyncNativeWindowState(m_window))
+    {
+        UpdateDimensions();
+    }
+}
+
+void UiWindow::SetFullscreen(bool fullscreen)
+{
+#if defined(__APPLE__)
+    SetNativeWindowFullscreen(m_window, fullscreen);
+#else
+    // Without a fullscreen mode set, SDL uses borderless desktop fullscreen.
+    SDL_SetWindowFullscreen(m_window, fullscreen);
+#endif
+}
+
+bool UiWindow::IsMaximised() const
+{
+    return (SDL_GetWindowFlags(m_window) & SDL_WINDOW_MAXIMIZED) != 0;
+}
+
+void UiWindow::SetMaximised(bool maximised)
+{
+    if (maximised)
+    {
+        SDL_MaximizeWindow(m_window);
+    }
+    else
+    {
+        SDL_RestoreWindow(m_window);
+    }
+}
+
+void UiWindow::Minimise()
+{
+    SDL_MinimizeWindow(m_window);
+}
+
+void UiWindow::TitleBarDoubleClicked()
+{
+    if (IsFullscreen())
+    {
+        return;
+    }
+#if defined(__APPLE__)
+    PerformNativeTitleBarDoubleClick(m_window);
+#else
+    SetMaximised(!IsMaximised());
+#endif
+}
+
+void UiWindow::GetClientSize(int & width, int & height) const
+{
+    SDL_GetWindowSize(m_window, &width, &height);
+}
+
+void UiWindow::SetClientSize(int width, int height)
+{
+    SDL_Rect usable{};
+    const bool bounded = SDL_GetDisplayUsableBounds(WindowDisplay(m_window), &usable);
+    int top = 0, left = 0, bottom = 0, right = 0;
+    SDL_GetWindowBordersSize(m_window, &top, &left, &bottom, &right);
+    if (bounded)
+    {
+        width = std::min(width, usable.w - left - right);
+        height = std::min(height, usable.h - top - bottom);
+    }
+    SDL_SetWindowSize(m_window, width, height);
+    if (bounded)
+    {
+        int x = 0, y = 0;
+        SDL_GetWindowPosition(m_window, &x, &y);
+        const int fitX = std::max(std::min(x, usable.x + usable.w - right - width), usable.x + left);
+        const int fitY = std::max(std::min(y, usable.y + usable.h - bottom - height), usable.y + top);
+        if (fitX != x || fitY != y)
+        {
+            SDL_SetWindowPosition(m_window, fitX, fitY);
+        }
+    }
+}
+
+void UiWindow::Centre()
+{
+    SDL_SetWindowPosition(m_window, SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED);
+}
+
+bool UiWindow::Fail(const std::string & message)
+{
+    m_error = message;
+    return false;
+}
+
+bool UiWindow::LoadFonts(const std::filesystem::path & fontDir)
+{
+    for (const char * font : {"LatoLatin-Regular.ttf", "LatoLatin-Bold.ttf"})
+    {
+        if (!Rml::LoadFontFace(Common::FS::PathToUTF8String(fontDir / font)))
+        {
+            return Fail(std::string("Unable to load font ") + font);
+        }
+    }
+    for (const SystemFont & font : SystemFallbackFonts())
+    {
+        Rml::LoadFontFace(Common::FS::PathToUTF8String(font.path), true, Rml::Style::FontWeight::Normal, font.faceIndex);
+    }
+    return true;
+}
+
+void UiWindow::SetWindowIcon(const std::filesystem::path & iconFile)
+{
+    std::string encoded;
+    if (!UiPack::ReadFile(iconFile, encoded))
+    {
+        return;
+    }
+    int width = 0, height = 0, channels = 0;
+    stbi_uc * pixels = stbi_load_from_memory(reinterpret_cast<const stbi_uc *>(encoded.data()), static_cast<int>(encoded.size()), &width, &height, &channels, 4);
+    if (pixels == nullptr)
+    {
+        return;
+    }
+    SDL_Surface * icon = SDL_CreateSurfaceFrom(width, height, SDL_PIXELFORMAT_RGBA32, pixels, width * 4);
+    if (icon != nullptr)
+    {
+        SDL_SetWindowIcon(m_window, icon);
+        SDL_DestroySurface(icon);
+    }
+    stbi_image_free(pixels);
+}
+
+void UiWindow::UpdateDimensions()
+{
+    const SDL_DisplayID display = WindowDisplay(m_window);
+    const SDL_DisplayMode * mode = SDL_GetCurrentDisplayMode(display);
+    const float rate = mode != nullptr && mode->refresh_rate > 0.0f ? mode->refresh_rate : 60.0f;
+    m_frameInterval = static_cast<uint64_t>(static_cast<double>(SDL_GetPerformanceFrequency()) / rate);
+    int width = 0, height = 0;
+    SDL_GetWindowSize(m_window, &width, &height);
+    SDL_GetWindowSizeInPixels(m_window, &m_drawableWidth, &m_drawableHeight);
+    if (width <= 0 || m_drawableWidth <= 0)
+    {
+        return;
+    }
+    m_pixelScale = static_cast<float>(m_drawableWidth) / static_cast<float>(width);
+    m_context->SetDimensions({m_drawableWidth, m_drawableHeight});
+
+    float contentScale = m_pixelScale;
+#if defined(_WIN32)
+    // Window coordinates are pixels on Windows; the display scale carries the DPI.
+    const float displayScale = SDL_GetWindowDisplayScale(m_window);
+    if (displayScale > 0.0f)
+    {
+        contentScale = std::max(contentScale, displayScale);
+    }
+#endif
+    m_context->SetDensityIndependentPixelRatio(contentScale);
+
+    m_hiddenFrame = 0;
+    SDL_Rect usable{};
+    if (m_frameless && IsMaximised() && !IsFullscreen() && SDL_GetDisplayUsableBounds(display, &usable))
+    {
+        int x = 0, y = 0;
+        SDL_GetWindowPosition(m_window, &x, &y);
+        m_hiddenFrame = static_cast<int>(static_cast<float>(std::max(usable.x - x, 0)) * m_pixelScale);
+    }
+}
+
+SDL_HitTestResult UiWindow::HitTest(const SDL_Point & point)
+{
+    m_overDragArea = false;
+    if (IsFullscreen())
+    {
+        return SDL_HITTEST_NORMAL;
+    }
+    if (!IsMaximised())
+    {
+        int width = 0, height = 0;
+        SDL_GetWindowSize(m_window, &width, &height);
+        const int column = point.x < kResizeEdge ? 0 : point.x >= width - kResizeEdge ? 2 : 1;
+        const int row = point.y < kResizeEdge ? 0 : point.y >= height - kResizeEdge ? 2 : 1;
+        static const SDL_HitTestResult edges[3][3] = {
+            {SDL_HITTEST_RESIZE_TOPLEFT, SDL_HITTEST_RESIZE_TOP, SDL_HITTEST_RESIZE_TOPRIGHT},
+            {SDL_HITTEST_RESIZE_LEFT, SDL_HITTEST_NORMAL, SDL_HITTEST_RESIZE_RIGHT},
+            {SDL_HITTEST_RESIZE_BOTTOMLEFT, SDL_HITTEST_RESIZE_BOTTOM, SDL_HITTEST_RESIZE_BOTTOMRIGHT},
+        };
+        if (edges[row][column] != SDL_HITTEST_NORMAL)
+        {
+            return edges[row][column];
+        }
+    }
+    const Rml::Vector2f position(static_cast<float>(point.x) * m_pixelScale, static_cast<float>(point.y) * m_pixelScale);
+    for (Rml::Element * element = m_context->GetElementAtPoint(position); element != nullptr; element = element->GetParentNode())
+    {
+        if (element->HasAttribute("data-window"))
+        {
+            if (element->GetAttribute<Rml::String>("data-window", "") != "drag")
+            {
+                return SDL_HITTEST_NORMAL;
+            }
+#if defined(__linux__)
+            m_overDragArea = true;
+            m_dragAreaPoint = point;
+#endif
+            return SDL_HITTEST_DRAGGABLE;
+        }
+    }
+    return SDL_HITTEST_NORMAL;
+}
+
+bool UiWindow::TitleBarPressed(const SDL_Point & point)
+{
+#if !defined(__linux__)
+    (void)point;
+    return false;
+#else
+    const uint64_t now = SDL_GetTicks();
+    const bool again = now - m_barPressTime <= kDoubleClickMs && std::abs(point.x - m_barPress.x) <= kDoubleClickReach &&
+                       std::abs(point.y - m_barPress.y) <= kDoubleClickReach;
+    m_barPressTime = again ? 0 : now;
+    m_barPress = point;
+    if (again)
+    {
+        TitleBarDoubleClicked();
+    }
+    return again;
+#endif
+}

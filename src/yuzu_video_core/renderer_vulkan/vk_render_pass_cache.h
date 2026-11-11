@@ -17,6 +17,9 @@ struct RenderPassKey {
     std::array<VideoCore::Surface::PixelFormat, 8> color_formats;
     VideoCore::Surface::PixelFormat depth_format;
     VkSampleCountFlagBits samples;
+    u32 color_scratch_mask{};
+    // TIR: render to multisample colors, resolve into single-sample targets.
+    bool resolve_color{};
 };
 
 } // namespace Vulkan
@@ -30,6 +33,8 @@ struct hash<Vulkan::RenderPassKey> {
         for (size_t i = 0; i < key.color_formats.size(); ++i) {
             value ^= static_cast<size_t>(key.color_formats[i]) << (i * 6);
         }
+        value ^= static_cast<size_t>(key.color_scratch_mask) << 56;
+        value ^= static_cast<size_t>(key.resolve_color) << 55;
         return value;
     }
 };

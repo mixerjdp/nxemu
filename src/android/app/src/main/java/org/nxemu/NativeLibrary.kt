@@ -14,6 +14,27 @@ object NativeLibrary {
     }
 
     private val settingChangedListeners = CopyOnWriteArrayList<(String) -> Unit>()
+    private val programEventListeners = CopyOnWriteArrayList<() -> Unit>()
+
+    // EmulationSession::ProgramEventResult in jni/emulation_session.h
+    const val PROGRAM_EVENT_NONE = 0
+    const val PROGRAM_EVENT_RELOADED = 1
+    const val PROGRAM_EVENT_EXITED = 2
+    const val PROGRAM_EVENT_FAILED = 3
+
+    fun addProgramEventListener(listener: () -> Unit) {
+        programEventListeners.add(listener)
+    }
+
+    fun removeProgramEventListener(listener: () -> Unit) {
+        programEventListeners.remove(listener)
+    }
+
+    /** Called from an emulation thread when the game asks to run another program or exits. */
+    @JvmStatic
+    fun onProgramEvent() {
+        programEventListeners.forEach { listener -> listener() }
+    }
 
     fun addSettingChangedListener(listener: (String) -> Unit) {
         settingChangedListeners.add(listener)
@@ -35,18 +56,38 @@ object NativeLibrary {
     external fun getSettingString(setting: String): String
     external fun getSettingBool(setting: String): Boolean
     external fun setSettingString(setting: String, value: String)
+    external fun setSettingBool(setting: String, value: Boolean)
+    external fun getSettingInt(setting: String): Int
+    external fun setSettingInt(setting: String, value: Int)
     external fun saveSettings()
 
     external fun queryRomMetadata(path: String): String
-    external fun queryRomInfo(path: String): String
+    external fun queryRomInfo(path: String, programId: Long): String
     external fun getPerfStats(): DoubleArray
     external fun getShadersBuilding(): Int
     external fun getFirmwareVersion(): String
+    external fun getGameCardFirmwareUpdate(path: String): String
+
+    external fun installFirmware(path: String, listener: FirmwareInstallListener): Int
+
+    interface FirmwareInstallListener {
+        fun onProgress(stage: Int, done: Long, total: Long): Boolean
+        fun confirmReplace(packageVersion: String, installedVersion: String): Boolean
+    }
+
     external fun getAppVersion(): String
 
-    external fun emulationSurfaceReady(surface: android.view.Surface, pixelRatio: Float, romPath: String): Boolean
+    external fun emulationSurfaceReady(surface: android.view.Surface, pixelRatio: Float, romPath: String, programId: Long): Boolean
+    external fun processProgramEvents(): Int
     external fun emulationSurfaceDestroyed()
+    external fun emulationStopped()
     external fun surfaceChanged(surface: android.view.Surface)
+    external fun pauseEmulation()
+    external fun unpauseEmulation()
+    external fun isPaused(): Boolean
+    external fun getAppletCaptureBuffer(): ByteArray
+    external fun getAppletCaptureWidth(): Int
+    external fun getAppletCaptureHeight(): Int
 
     /** Used from native [yuzu_common/fs/fs_android.cpp] via RegisterCallbacks. */
     @JvmStatic

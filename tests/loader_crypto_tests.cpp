@@ -172,7 +172,9 @@ int ErrorChild(const char* mode, const char* path) {
 void KeyErrorTests(const char* rom) {
     char exe[MAX_PATH];
     Check(GetModuleFileNameA(nullptr, exe, MAX_PATH) != 0, "module path");
-    const auto root = std::filesystem::temp_directory_path() / "nxemu-keyerr-tests";
+    const auto root = std::filesystem::temp_directory_path() /
+        ("nxemu-keyerr-tests-" + std::to_string(GetCurrentProcessId()) + "-" + std::to_string(GetTickCount64()));
+    Check(std::filesystem::create_directory(root), "create isolated key-error directory");
     const std::filesystem::path dirs[] = {root / "empty", root / "noheader", root / "badheader"};
     for (const auto& dir : dirs) std::filesystem::create_directories(dir);
     // prod.keys present but underivable -> ErrorMissingHeaderKey.

@@ -24,13 +24,13 @@ import androidx.core.content.ContextCompat
 import androidx.window.layout.WindowMetricsCalculator
 import kotlin.math.max
 import kotlin.math.min
+import org.nxemu.NXUISetting
+import org.nxemu.NativeLibrary
 import org.nxemu.features.input.NativeInput
 import org.nxemu.R
 import org.nxemu.features.input.model.NativeAnalog
 import org.nxemu.features.input.model.NativeButton
 import org.nxemu.features.input.model.NpadStyleIndex
-import org.nxemu.features.settings.model.BooleanSetting
-import org.nxemu.features.settings.model.IntSetting
 import org.nxemu.overlay.model.OverlayControl
 import org.nxemu.overlay.model.OverlayControlData
 import org.nxemu.overlay.model.OverlayLayout
@@ -119,7 +119,7 @@ class InputOverlay(context: Context, attrs: AttributeSet?) :
         }
 
         for (dpad in overlayDpads) {
-            if (!dpad.updateStatus(event, BooleanSetting.DPAD_SLIDE.getBoolean())) {
+            if (!dpad.updateStatus(event, true)) {
                 continue
             }
             NativeInput.onOverlayButtonEvent(
@@ -169,73 +169,19 @@ class InputOverlay(context: Context, attrs: AttributeSet?) :
             invalidate()
         }
 
-        if (!BooleanSetting.TOUCHSCREEN.getBoolean()) {
-            return true
-        }
-
-        val pointerIndex = event.actionIndex
-        val xPosition = event.getX(pointerIndex).toInt()
-        val yPosition = event.getY(pointerIndex).toInt()
-        val pointerId = event.getPointerId(pointerIndex)
-        val motionEvent = event.action and MotionEvent.ACTION_MASK
-        val isActionDown =
-            motionEvent == MotionEvent.ACTION_DOWN || motionEvent == MotionEvent.ACTION_POINTER_DOWN
-        val isActionMove = motionEvent == MotionEvent.ACTION_MOVE
-        val isActionUp =
-            motionEvent == MotionEvent.ACTION_UP || motionEvent == MotionEvent.ACTION_POINTER_UP
-
-        if (isActionDown && !isTouchInputConsumed(pointerId)) {
-            NativeInput.onTouchPressed(pointerId, xPosition.toFloat(), yPosition.toFloat())
-        }
-
-        if (isActionMove) {
-            for (i in 0 until event.pointerCount) {
-                val fingerId = event.getPointerId(i)
-                if (isTouchInputConsumed(fingerId)) {
-                    continue
-                }
-                NativeInput.onTouchMoved(fingerId, event.getX(i), event.getY(i))
-            }
-        }
-
-        if (isActionUp && !isTouchInputConsumed(pointerId)) {
-            NativeInput.onTouchReleased(pointerId)
-        }
-
         return true
     }
 
     private fun playHaptics(event: MotionEvent) {
-        if (BooleanSetting.HAPTIC_FEEDBACK.getBoolean()) {
-            when (event.actionMasked) {
-                MotionEvent.ACTION_DOWN,
-                MotionEvent.ACTION_POINTER_DOWN ->
-                    performHapticFeedback(HapticFeedbackConstants.VIRTUAL_KEY)
+        when (event.actionMasked) {
+            MotionEvent.ACTION_DOWN,
+            MotionEvent.ACTION_POINTER_DOWN ->
+                performHapticFeedback(HapticFeedbackConstants.VIRTUAL_KEY)
 
-                MotionEvent.ACTION_UP,
-                MotionEvent.ACTION_POINTER_UP ->
-                    performHapticFeedback(HapticFeedbackConstants.VIRTUAL_KEY_RELEASE)
-            }
+            MotionEvent.ACTION_UP,
+            MotionEvent.ACTION_POINTER_UP ->
+                performHapticFeedback(HapticFeedbackConstants.VIRTUAL_KEY_RELEASE)
         }
-    }
-
-    private fun isTouchInputConsumed(track_id: Int): Boolean {
-        for (button in overlayButtons) {
-            if (button.trackId == track_id) {
-                return true
-            }
-        }
-        for (dpad in overlayDpads) {
-            if (dpad.trackId == track_id) {
-                return true
-            }
-        }
-        for (joystick in overlayJoysticks) {
-            if (joystick.trackId == track_id) {
-                return true
-            }
-        }
-        return false
     }
 
     private fun onTouchWhileEditing(event: MotionEvent): Boolean {
@@ -310,7 +256,7 @@ class InputOverlay(context: Context, attrs: AttributeSet?) :
         }
 
         for (joystick in overlayJoysticks) {
-            when (event.action) {
+            when (event.action and MotionEvent.ACTION_MASK) {
                 MotionEvent.ACTION_DOWN,
                 MotionEvent.ACTION_POINTER_DOWN -> if (joystickBeingConfigured == null &&
                     joystick.bounds.contains(fingerPositionX, fingerPositionY)
@@ -600,8 +546,7 @@ class InputOverlay(context: Context, attrs: AttributeSet?) :
         overlayDpads.clear()
         overlayJoysticks.clear()
 
-        // Add all the enabled overlay items back to the HashSet.
-        if (BooleanSetting.SHOW_INPUT_OVERLAY.getBoolean()) {
+        if (inEditMode || NativeLibrary.getSettingBool(NXUISetting.ShowInputOverlay)) {
             addOverlayControls(layout)
         }
         invalidate()
@@ -624,6 +569,14 @@ class InputOverlay(context: Context, attrs: AttributeSet?) :
 
     fun setIsInEditMode(editMode: Boolean) {
         inEditMode = editMode
+        if (!editMode) {
+            buttonBeingConfigured = null
+            dpadBeingConfigured = null
+            joystickBeingConfigured = null
+        }
+        if (isLaidOut) {
+            refreshControls()
+        }
     }
 
     /**
@@ -659,6 +612,9 @@ class InputOverlay(context: Context, attrs: AttributeSet?) :
     }
 
     fun resetLayoutVisibilityAndPlacement() {
+        buttonBeingConfigured = null
+        dpadBeingConfigured = null
+        joystickBeingConfigured = null
         defaultOverlayPositionByLayout(layout)
 
         val overlayControlData = NativeConfig.getOverlayControlData()
@@ -857,7 +813,7 @@ class InputOverlay(context: Context, attrs: AttributeSet?) :
 
                 else -> 0.11f
             }
-            scale *= (IntSetting.OVERLAY_SCALE.getInt() + 50).toFloat()
+            scale *= (NativeLibrary.getSettingInt(NXUISetting.OverlayScale) + 50).toFloat()
             scale /= 100f
 
             // Initialize the InputOverlayDrawableButton.
@@ -896,7 +852,7 @@ class InputOverlay(context: Context, attrs: AttributeSet?) :
                 drawableX - (width / 2),
                 drawableY - (height / 2)
             )
-            overlayDrawable.setOpacity(IntSetting.OVERLAY_OPACITY.getInt() * 255 / 100)
+            overlayDrawable.setOpacity(NativeLibrary.getSettingInt(NXUISetting.OverlayOpacity) * 255 / 100)
             return overlayDrawable
         }
 
@@ -924,7 +880,7 @@ class InputOverlay(context: Context, attrs: AttributeSet?) :
 
             // Decide scale based on button ID and user preference
             var scale = 0.25f
-            scale *= (IntSetting.OVERLAY_SCALE.getInt() + 50).toFloat()
+            scale *= (NativeLibrary.getSettingInt(NXUISetting.OverlayScale) + 50).toFloat()
             scale /= 100f
 
             // Initialize the InputOverlayDrawableDpad.
@@ -963,7 +919,7 @@ class InputOverlay(context: Context, attrs: AttributeSet?) :
 
             // Need to set the image's position
             overlayDrawable.setPosition(drawableX - (width / 2), drawableY - (height / 2))
-            overlayDrawable.setOpacity(IntSetting.OVERLAY_OPACITY.getInt() * 255 / 100)
+            overlayDrawable.setOpacity(NativeLibrary.getSettingInt(NXUISetting.OverlayOpacity) * 255 / 100)
             return overlayDrawable
         }
 
@@ -997,7 +953,7 @@ class InputOverlay(context: Context, attrs: AttributeSet?) :
 
             // Decide scale based on user preference
             var scale = 0.3f
-            scale *= (IntSetting.OVERLAY_SCALE.getInt() + 50).toFloat()
+            scale *= (NativeLibrary.getSettingInt(NXUISetting.OverlayScale) + 50).toFloat()
             scale /= 100f
 
             // Initialize the InputOverlayDrawableJoystick.
@@ -1042,7 +998,7 @@ class InputOverlay(context: Context, attrs: AttributeSet?) :
 
             // Need to set the image's position
             overlayDrawable.setPosition(drawableX, drawableY)
-            overlayDrawable.setOpacity(IntSetting.OVERLAY_OPACITY.getInt() * 255 / 100)
+            overlayDrawable.setOpacity(NativeLibrary.getSettingInt(NXUISetting.OverlayOpacity) * 255 / 100)
             return overlayDrawable
         }
     }

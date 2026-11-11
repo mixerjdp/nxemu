@@ -9,9 +9,12 @@ add_library(nxemu_core STATIC
     modules/video_module.cpp
     settings/core_settings.cpp
     settings/settings.cpp
+    i18n/plural_rule.cpp
+    i18n/translation.cpp
     app_init.cpp
     logging.cpp
     notification.cpp
+    play_time.cpp
 )
 
 target_include_directories(nxemu_core PUBLIC

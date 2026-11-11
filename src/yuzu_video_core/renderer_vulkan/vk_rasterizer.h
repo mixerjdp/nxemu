@@ -45,7 +45,13 @@ namespace Vulkan {
 
 struct FramebufferTextureInfo;
 
+class Device;
 class StateTracker;
+
+/// Host viewport of a guest viewport, with its coordinates multiplied by scale
+[[nodiscard]] VkViewport GetViewportState(const Device& device,
+                                          const Tegra::Engines::Maxwell3D::Regs& regs,
+                                          size_t index, float scale, float depth_offset);
 
 class AccelerateDMA : public Tegra::Engines::AccelerateDMAInterface {
 public:
@@ -61,6 +67,10 @@ public:
 
     bool BufferToImage(const Tegra::DMA::ImageCopy& copy_info, const Tegra::DMA::BufferOperand& src,
                        const Tegra::DMA::ImageOperand& dst) override;
+
+    bool ImageToImage(Tegra::MemoryManager& gpu_memory, const Tegra::DMA::ImageCopy& copy_info,
+                      const Tegra::DMA::ImageOperand& src,
+                      const Tegra::DMA::ImageOperand& dst) override;
 
 private:
     template <bool IS_IMAGE_UPLOAD>
@@ -81,9 +91,18 @@ public:
                               const Device& device_, MemoryAllocator& memory_allocator_,
                               StateTracker& state_tracker_, Scheduler& scheduler_);
     ~RasterizerVulkan() override;
+    void WaitForShaderBuilds() { pipeline_cache.WaitForBuilds(); }
+
+    struct FrameDraws {
+        u32 total;
+        u32 skipped; ///< Skipped while their pipeline compiles
+        bool new_render_targets; ///< Some image was drawn to for the first time
+    };
+    /// Returns the draws since the previous call
+    FrameDraws TakeFrameDraws();
 
     void Draw(bool is_indexed, u32 instance_count) override;
-    void DrawIndirect() override;
+    bool DrawIndirect() override;
     void DrawTexture() override;
     void Clear(u32 layer_count) override;
     void DispatchCompute() override;
@@ -95,6 +114,15 @@ public:
     void FlushAll() override;
     void FlushRegion(DAddr addr, u64 size,
                      VideoCommon::CacheType which = VideoCommon::CacheType::All) override;
+    void FlushNativeRegion(DAddr addr, u64 size) override;
+    bool MayFlushSharedPage(DAddr addr, u64 size) override;
+    VideoCore::SharedPageAccess ObserveSharedPage(DAddr addr, u64 size) override;
+    bool AwaitsProtectedDownload(DAddr addr, u64 size) override;
+    bool CommitReadbacksForEarlySignal() override;
+    bool HasPendingResult(DAddr addr, u64 size) override;
+    void GpuWrittenResults(DAddr addr, u64 size,
+                           std::vector<std::pair<DAddr, u64>>& ranges) override;
+    void FlushRegionImpl(DAddr addr, u64 size, VideoCommon::CacheType which, bool native_read);
     bool MustFlushRegion(DAddr addr, u64 size,
                          VideoCommon::CacheType which = VideoCommon::CacheType::All) override;
     RasterizerDownloadArea GetFlushArea(DAddr addr, u64 size) override;
@@ -105,8 +133,10 @@ public:
     bool OnCPUWrite(DAddr addr, u64 size) override;
     void InvalidateGPUCache() override;
     void UnmapMemory(DAddr addr, u64 size) override;
-    void ModifyGPUMemory(size_t as_id, GPUVAddr addr, u64 size) override;
+    void ModifyGPUMemory(size_t as_id, GPUVAddr addr, u64 size, bool preserve_contents = false) override;
     void SignalFence(std::function<void()>&& func) override;
+    void SignalMemoryOperationFence(std::function<void()>&& func) override;
+    void WaitForFence() override;
     void SyncOperation(std::function<void()>&& func) override;
     void SignalSyncPoint(u32 value) override;
     void SignalReference() override;
@@ -126,7 +156,7 @@ public:
     void AccelerateInlineToMemory(GPUVAddr address, size_t copy_size,
                                   std::span<const u8> memory) override;
     void LoadDiskResources(u64 title_id, std::stop_token stop_loading,
-                           const VideoCore::DiskResourceLoadCallback& callback) override;
+                           const VideoCore::DiskResourceLoadCallback& callback, std::string_view content_identity = {}, std::string_view game_path = {}, std::string_view game_context = {}) override;
 
     void InitializeChannel(Tegra::Control::ChannelState& channel) override;
 
@@ -147,6 +177,8 @@ private:
 
     template <typename Func>
     void PrepareDraw(bool is_indexed, Func&&);
+
+    void DrawVtgAsCompute(const GraphicsPipeline* pipeline);
 
     void FlushWork();
 
@@ -179,19 +211,28 @@ private:
     void UpdateBlending(Tegra::Engines::Maxwell3D::Regs& regs);
 
     void UpdateVertexInput(Tegra::Engines::Maxwell3D::Regs& regs);
+    void RefreshVertexInput(Tegra::Engines::Maxwell3D::Regs& regs);
 
     Tegra::GPU& gpu;
     Tegra::MaxwellDeviceMemoryManager& device_memory;
 
     const Device& device;
+    const bool has_dynamic_vertex_input;
     MemoryAllocator& memory_allocator;
     StateTracker& state_tracker;
     Scheduler& scheduler;
 
     StagingBufferPool staging_pool;
+    VtgScratchAllocator indirect_scratch;
+    /// Instances of the draw being prepared, zero when it cannot run its stages as compute
+    u32 vtg_instance_count{};
+    /// The next draw running its stages as compute reads its arguments from GPU memory
+    bool vtg_indirect{};
+    u32 vtg_indirect_instance_mask{};
     DescriptorPool descriptor_pool;
     GuestDescriptorQueue guest_descriptor_queue;
     ComputePassDescriptorQueue compute_pass_descriptor_queue;
+    std::unique_ptr<IndirectCountPass> indirect_count_pass;
     BlitImageHelper blit_image;
     RenderPassCache render_pass_cache;
 
@@ -205,13 +246,15 @@ private:
     AccelerateDMA accelerate_dma;
     FenceManager fence_manager;
 
-    vk::Event wfi_event;
-
     boost::container::static_vector<u32, MAX_IMAGE_VIEWS> image_view_indices;
     std::array<VideoCommon::ImageViewId, MAX_IMAGE_VIEWS> image_view_ids;
     boost::container::static_vector<VkSampler, MAX_TEXTURES> sampler_handles;
 
+    VkPipelineStageFlags image_write_stages{};
     u32 draw_counter = 0;
+    u32 frame_draws = 0;
+    u32 frame_skipped_draws = 0;
+    float depth_compare_offset = 0.0f;
 };
 
 } // namespace Vulkan

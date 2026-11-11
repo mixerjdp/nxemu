@@ -27,7 +27,13 @@ public:
 
     void RegisterCallback(const char * setting, SettingChangeCallback callback, void * userData) override;
     void UnregisterCallback(const char * setting, SettingChangeCallback callback, void * userData) override;
+    void SetDebugSetting(const char * setting, bool debug) override;
+    bool DebugSettingsEnabled(void) const override;
+
+    const char * GetGameSectionSettings(const char * section) const override;
+    void SetGameSectionSettings(const char * section, const char * json) override;
 
 private:
     mutable std::string m_sectionSetting;
+    mutable std::string m_gameSectionSetting;
 };

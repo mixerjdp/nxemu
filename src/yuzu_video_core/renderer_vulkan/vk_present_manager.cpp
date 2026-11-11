@@ -1,104 +1,28 @@
 // SPDX-FileCopyrightText: Copyright 2023 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <algorithm>
+#include <exception>
+#include <utility>
+
 #include "yuzu_common/settings.h"
+#include "yuzu_common/logging/log.h"
 #include "video_settings.h"
 #include "yuzu_common/thread.h"
 #include "frontend/emu_window.h"
+#include "yuzu_video_core/renderer_vulkan/vk_display.h"
 #include "yuzu_video_core/renderer_vulkan/vk_present_manager.h"
 #include "yuzu_video_core/renderer_vulkan/vk_scheduler.h"
 #include "yuzu_video_core/renderer_vulkan/vk_swapchain.h"
 #include "yuzu_video_core/vulkan_common/vulkan_device.h"
-#include "yuzu_video_core/vulkan_common/vulkan_surface.h"
 
 namespace Vulkan {
 
-namespace {
-
-bool CanBlitToSwapchain(const vk::PhysicalDevice& physical_device, VkFormat format) {
-    const VkFormatProperties props{physical_device.GetFormatProperties(format)};
-    return (props.optimalTilingFeatures & VK_FORMAT_FEATURE_BLIT_DST_BIT);
-}
-
-[[nodiscard]] VkImageSubresourceLayers MakeImageSubresourceLayers() {
-    return VkImageSubresourceLayers{
-        .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
-        .mipLevel = 0,
-        .baseArrayLayer = 0,
-        .layerCount = 1,
-    };
-}
-
-[[nodiscard]] VkImageBlit MakeImageBlit(s32 frame_width, s32 frame_height, s32 swapchain_width,
-                                        s32 swapchain_height) {
-    return VkImageBlit{
-        .srcSubresource = MakeImageSubresourceLayers(),
-        .srcOffsets =
-            {
-                {
-                    .x = 0,
-                    .y = 0,
-                    .z = 0,
-                },
-                {
-                    .x = frame_width,
-                    .y = frame_height,
-                    .z = 1,
-                },
-            },
-        .dstSubresource = MakeImageSubresourceLayers(),
-        .dstOffsets =
-            {
-                {
-                    .x = 0,
-                    .y = 0,
-                    .z = 0,
-                },
-                {
-                    .x = swapchain_width,
-                    .y = swapchain_height,
-                    .z = 1,
-                },
-            },
-    };
-}
-
-[[nodiscard]] VkImageCopy MakeImageCopy(u32 frame_width, u32 frame_height, u32 swapchain_width,
-                                        u32 swapchain_height) {
-    return VkImageCopy{
-        .srcSubresource = MakeImageSubresourceLayers(),
-        .srcOffset =
-            {
-                .x = 0,
-                .y = 0,
-                .z = 0,
-            },
-        .dstSubresource = MakeImageSubresourceLayers(),
-        .dstOffset =
-            {
-                .x = 0,
-                .y = 0,
-                .z = 0,
-            },
-        .extent =
-            {
-                .width = std::min(frame_width, swapchain_width),
-                .height = std::min(frame_height, swapchain_height),
-                .depth = 1,
-            },
-    };
-}
-
-} // Anonymous namespace
-
-PresentManager::PresentManager(const vk::Instance& instance_,
-                               Core::Frontend::EmuWindow& render_window_, const Device& device_,
+PresentManager::PresentManager(Core::Frontend::EmuWindow& render_window_, const Device& device_,
                                MemoryAllocator& memory_allocator_, Scheduler& scheduler_,
-                               Swapchain& swapchain_, vk::SurfaceKHR& surface_)
-    : instance{instance_}, render_window{render_window_}, device{device_},
-      memory_allocator{memory_allocator_}, scheduler{scheduler_}, swapchain{swapchain_},
-      surface{surface_}, blit_supported{CanBlitToSwapchain(device.GetPhysical(),
-                                                           swapchain.GetImageViewFormat())},
+                               Display& display_)
+    : render_window{render_window_}, device{device_}, memory_allocator{memory_allocator_},
+      scheduler{scheduler_}, display{display_}, swapchain{display_.GetSwapchain()},
       use_present_thread{videoSettings.async_presentation} {
     SetImageCount();
 
@@ -134,37 +58,80 @@ PresentManager::PresentManager(const vk::Instance& instance_,
     }
 }
 
-PresentManager::~PresentManager() = default;
+PresentManager::~PresentManager() {
+    // Scheduler callbacks capture this manager. Drain them before the
+    // presentation thread or its queues can be destroyed.
+    try {
+        scheduler.WaitWorker();
+        WaitPresent();
+    } catch (const std::exception& e) {
+        LOG_ERROR(Render_Vulkan, "Unable to drain presentation jobs: {}", e.what());
+    }
+    present_thread.request_stop();
+    frame_cv.notify_all();
+    if (present_thread.joinable()) {
+        present_thread.join();
+    }
+    // The display may be keeping one of the frames about to be destroyed.
+    try {
+        display.ReleaseFrame();
+    } catch (const std::exception& e) {
+        LOG_ERROR(Render_Vulkan, "Unable to release presentation frame: {}", e.what());
+    }
+}
 
 Frame* PresentManager::GetRenderFrame() {
-    // Wait for free presentation frames
-    std::unique_lock lock{free_mutex};
-    free_cv.wait(lock, [this] { return !free_queue.empty(); });
-
-    // Take the frame from the queue
-    Frame* frame = free_queue.front();
-    free_queue.pop();
-
-    // Wait for the presentation to be finished so all frame resources are free
-    frame->present_done.Wait();
-    frame->present_done.Reset();
-
+    RethrowPresentError();
+    Frame* frame;
+    {
+        // The display hands every frame back, even dropped ones and after a
+        // device loss, so only a failed present thread can leave this empty.
+        std::unique_lock lock{free_mutex};
+        free_cv.wait(lock, [this] {
+            return !free_queue.empty() || present_failed.load(std::memory_order_acquire);
+        });
+        RethrowPresentError();
+        frame = free_queue.front();
+        free_queue.pop();
+    }
+    // Waiting for the GPU must not hold the free-queue mutex: the present
+    // thread needs it to return other frames. The wait is sliced so that a
+    // present thread that failed before submitting cannot block us forever.
+    while (!present_failed.load(std::memory_order_acquire)) {
+        const VkResult result = frame->present_done.Wait(10'000'000ULL);
+        if (result == VK_TIMEOUT) {
+            continue;
+        }
+        if (result == VK_ERROR_DEVICE_LOST) {
+            // Like the rest of the renderer, keep running without a picture
+            // so the user can still stop the emulation.
+            device.ReportLoss();
+        }
+        break;
+    }
+    RethrowPresentError();
+    // The fence is reset just before the next submission that signals it. A
+    // dropped frame either leaves it signaled or submits a semaphore drain.
     return frame;
 }
 
 void PresentManager::Present(Frame* frame) {
+    RethrowPresentError();
     if (!use_present_thread) {
         scheduler.WaitWorker();
         CopyToSwapchain(frame);
-        free_queue.push(frame);
         return;
     }
 
     scheduler.Record([this, frame](vk::CommandBuffer) {
         std::unique_lock lock{queue_mutex};
         present_queue.push(frame);
-        frame_cv.notify_one();
+        // WaitPresent waits on the same condition variable.
+        frame_cv.notify_all();
     });
+    // Flush() has already dispatched the GPU work. The presentation callback
+    // is in a fresh chunk and must not wait for the next emulated frame.
+    scheduler.DispatchWork();
 }
 
 void PresentManager::RecreateFrame(Frame* frame, u32 width, u32 height, VkFormat image_view_format,
@@ -174,6 +141,13 @@ void PresentManager::RecreateFrame(Frame* frame, u32 width, u32 height, VkFormat
     frame->width = width;
     frame->height = height;
 
+    // Views and framebuffers must be released before their old image.
+    frame->watermark_framebuffer.reset();
+    frame->framebuffer.reset();
+    frame->composite_pool.reset();
+    frame->composite_view.reset();
+    frame->image_view.reset();
+    frame->composite_set = VK_NULL_HANDLE;
     frame->image = memory_allocator.CreateImage({
         .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
         .pNext = nullptr,
@@ -190,7 +164,9 @@ void PresentManager::RecreateFrame(Frame* frame, u32 width, u32 height, VkFormat
         .arrayLayers = 1,
         .samples = VK_SAMPLE_COUNT_1_BIT,
         .tiling = VK_IMAGE_TILING_OPTIMAL,
-        .usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+        .usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT |
+                 VK_IMAGE_USAGE_TRANSFER_DST_BIT |
+                 (display.HasInterface() ? VK_IMAGE_USAGE_SAMPLED_BIT : 0U),
         .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
         .queueFamilyIndexCount = 0,
         .pQueueFamilyIndices = nullptr,
@@ -233,7 +209,7 @@ void PresentManager::RecreateFrame(Frame* frame, u32 width, u32 height, VkFormat
         .height = height,
         .layers = 1,
     });
-    frame->watermark_framebuffer = {};
+    display.PrepareFrame(*frame, swapchain.GetImageFormat());
 }
 
 void PresentManager::WaitPresent() {
@@ -244,239 +220,76 @@ void PresentManager::WaitPresent() {
     // Wait for the present queue to be empty
     {
         std::unique_lock queue_lock{queue_mutex};
-        frame_cv.wait(queue_lock, [this] { return present_queue.empty(); });
+        frame_cv.wait(queue_lock, [this] {
+            return present_queue.empty() || present_failed.load();
+        });
     }
 
     // The above condition will be satisfied when the last frame is taken from the queue.
     // To ensure that frame has been presented as well take hold of the swapchain
     // mutex.
     std::scoped_lock swapchain_lock{swapchain_mutex};
+    RethrowPresentError();
 }
 
 void PresentManager::PresentThread(std::stop_token token) {
     Common::SetCurrentThreadName("VulkanPresent");
-    while (!token.stop_requested()) {
-        std::unique_lock lock{queue_mutex};
+    try {
+        while (!token.stop_requested()) {
+            std::unique_lock lock{queue_mutex};
 
-        // Wait for presentation frames
-        Common::CondvarWait(frame_cv, lock, token, [this] { return !present_queue.empty(); });
-        if (token.stop_requested()) {
-            return;
+            // Wait for presentation frames
+            Common::CondvarWait(frame_cv, lock, token, [this] { return !present_queue.empty(); });
+            if (token.stop_requested()) {
+                return;
+            }
+
+            // Take the frame and notify anyone waiting
+            Frame* frame = present_queue.front();
+            present_queue.pop();
+            frame_cv.notify_one();
+
+            // Take the swapchain lock before releasing the queue lock, so
+            // WaitPresent cannot finish ahead of this active presentation.
+            std::exchange(lock, std::unique_lock{swapchain_mutex});
+
+            CopyToSwapchain(frame);
         }
-
-        // Take the frame and notify anyone waiting
-        Frame* frame = present_queue.front();
-        present_queue.pop();
-        frame_cv.notify_one();
-
-        // By exchanging the lock ownership we take the swapchain lock
-        // before the queue lock goes out of scope. This way the swapchain
-        // lock in WaitPresent is guaranteed to occur after here.
-        std::exchange(lock, std::unique_lock{swapchain_mutex});
-
-        CopyToSwapchain(frame);
-
-        // Free the frame for reuse
-        std::scoped_lock fl{free_mutex};
-        free_queue.push(frame);
-        free_cv.notify_one();
+    } catch (...) {
+        present_error = std::current_exception();
+        present_failed.store(true, std::memory_order_release);
+        frame_cv.notify_all();
+        free_cv.notify_all();
     }
 }
 
-void PresentManager::RecreateSwapchain(Frame* frame) {
-    swapchain.Create(*surface, frame->width, frame->height);
-    SetImageCount();
+void PresentManager::RethrowPresentError() const {
+    if (present_failed.load(std::memory_order_acquire)) {
+        std::rethrow_exception(present_error);
+    }
 }
 
 void PresentManager::SetImageCount() {
     // We cannot have more than 7 images in flight at any given time.
     // FRAMES_IN_FLIGHT is 8, and the cache TICKS_TO_DESTROY is 8.
     // Mali drivers will give us 6.
-    image_count = std::min<size_t>(swapchain.GetImageCount(), 7);
+    // The interface retains the last game frame while the next one is rendered.
+    // A single-image surface must not leave the producer without a free frame.
+    image_count = std::clamp<std::size_t>(swapchain.GetImageCount(), 2, 7);
 }
 
 void PresentManager::CopyToSwapchain(Frame* frame) {
-    bool requires_recreation = false;
-
-    while (true) {
-        try {
-            // Recreate surface and swapchain if needed.
-            if (requires_recreation) {
-                surface = CreateSurface(instance, render_window.GetWindowInfo());
-                RecreateSwapchain(frame);
-            }
-
-            // Draw to swapchain.
-            return CopyToSwapchainImpl(frame);
-        } catch (const vk::Exception& except) {
-            if (except.GetResult() != VK_ERROR_SURFACE_LOST_KHR) {
-                throw;
-            }
-
-            requires_recreation = true;
-        }
+    const auto window = render_window.GetWindowInfo();
+    bool presented = false;
+    Frame* const reusable = display.Present(frame, window, &presented);
+    if (presented) {
+        render_window.OnFramePresented(window.render_surface, frame->frame_interval_ns);
     }
-}
-
-void PresentManager::CopyToSwapchainImpl(Frame* frame) {
-    // If the size of the incoming frames has changed, recreate the swapchain
-    // to account for that.
-    const bool is_suboptimal = swapchain.NeedsRecreation();
-    const bool size_changed =
-        swapchain.GetWidth() != frame->width || swapchain.GetHeight() != frame->height;
-    if (is_suboptimal || size_changed) {
-        RecreateSwapchain(frame);
+    if (reusable != nullptr) {
+        std::scoped_lock lock{free_mutex};
+        free_queue.push(reusable);
+        free_cv.notify_one();
     }
-
-    while (swapchain.AcquireNextImage()) {
-        RecreateSwapchain(frame);
-    }
-
-    const vk::CommandBuffer cmdbuf{frame->cmdbuf};
-    cmdbuf.Begin({
-        .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
-        .pNext = nullptr,
-        .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
-        .pInheritanceInfo = nullptr,
-    });
-
-    const VkImage image{swapchain.CurrentImage()};
-    const VkExtent2D extent = swapchain.GetExtent();
-    const std::array pre_barriers{
-        VkImageMemoryBarrier{
-            .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
-            .pNext = nullptr,
-            .srcAccessMask = 0,
-            .dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
-            .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED,
-            .newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-            .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-            .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-            .image = image,
-            .subresourceRange{
-                .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
-                .baseMipLevel = 0,
-                .levelCount = 1,
-                .baseArrayLayer = 0,
-                .layerCount = VK_REMAINING_ARRAY_LAYERS,
-            },
-        },
-        VkImageMemoryBarrier{
-            .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
-            .pNext = nullptr,
-            .srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
-            .dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT,
-            .oldLayout = VK_IMAGE_LAYOUT_GENERAL,
-            .newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-            .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-            .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-            .image = *frame->image,
-            .subresourceRange{
-                .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
-                .baseMipLevel = 0,
-                .levelCount = 1,
-                .baseArrayLayer = 0,
-                .layerCount = VK_REMAINING_ARRAY_LAYERS,
-            },
-        },
-    };
-    const std::array post_barriers{
-        VkImageMemoryBarrier{
-            .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
-            .pNext = nullptr,
-            .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
-            .dstAccessMask = VK_ACCESS_MEMORY_READ_BIT,
-            .oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-            .newLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
-            .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-            .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-            .image = image,
-            .subresourceRange{
-                .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
-                .baseMipLevel = 0,
-                .levelCount = 1,
-                .baseArrayLayer = 0,
-                .layerCount = VK_REMAINING_ARRAY_LAYERS,
-            },
-        },
-        VkImageMemoryBarrier{
-            .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
-            .pNext = nullptr,
-            .srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT,
-            .dstAccessMask = VK_ACCESS_MEMORY_WRITE_BIT,
-            .oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-            .newLayout = VK_IMAGE_LAYOUT_GENERAL,
-            .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-            .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-            .image = *frame->image,
-            .subresourceRange{
-                .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
-                .baseMipLevel = 0,
-                .levelCount = 1,
-                .baseArrayLayer = 0,
-                .layerCount = VK_REMAINING_ARRAY_LAYERS,
-            },
-        },
-    };
-
-    cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, {},
-                           {}, {}, pre_barriers);
-
-    if (blit_supported) {
-        cmdbuf.BlitImage(*frame->image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, image,
-                         VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-                         MakeImageBlit(frame->width, frame->height, extent.width, extent.height),
-                         VK_FILTER_LINEAR);
-    } else {
-        cmdbuf.CopyImage(*frame->image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, image,
-                         VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-                         MakeImageCopy(frame->width, frame->height, extent.width, extent.height));
-    }
-
-    cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_GRAPHICS_BIT, {},
-                           {}, {}, post_barriers);
-
-    cmdbuf.End();
-
-    const VkSemaphore present_semaphore = swapchain.CurrentPresentSemaphore();
-    const VkSemaphore render_semaphore = swapchain.CurrentRenderSemaphore();
-    const std::array wait_semaphores = {present_semaphore, *frame->render_ready};
-
-    static constexpr std::array<VkPipelineStageFlags, 2> wait_stage_masks{
-        VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
-        VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
-    };
-
-    const VkSubmitInfo submit_info{
-        .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
-        .pNext = nullptr,
-        .waitSemaphoreCount = 2U,
-        .pWaitSemaphores = wait_semaphores.data(),
-        .pWaitDstStageMask = wait_stage_masks.data(),
-        .commandBufferCount = 1,
-        .pCommandBuffers = cmdbuf.address(),
-        .signalSemaphoreCount = 1U,
-        .pSignalSemaphores = &render_semaphore,
-    };
-
-    // Submit the image copy/blit to the swapchain
-    {
-        std::scoped_lock submit_lock{scheduler.submit_mutex};
-        switch (const VkResult result =
-                    device.GetGraphicsQueue().Submit(submit_info, *frame->present_done)) {
-        case VK_SUCCESS:
-            break;
-        case VK_ERROR_DEVICE_LOST:
-            device.ReportLoss();
-            [[fallthrough]];
-        default:
-            vk::Check(result);
-            break;
-        }
-    }
-
-    // Present
-    swapchain.Present(render_semaphore);
 }
 
 } // namespace Vulkan

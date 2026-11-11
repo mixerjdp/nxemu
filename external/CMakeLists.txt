@@ -3,6 +3,106 @@ if (NOT TARGET fmt::fmt)
     add_subdirectory(fmt)
 endif()
 
+# The GameCube adapter driver is built from source: on macOS against the
+# application deployment target, on Windows with the application's runtime.
+if(ENABLE_LIBUSB AND CMAKE_SYSTEM_NAME STREQUAL "Linux" AND NOT TARGET libusb::usb)
+    find_package(PkgConfig REQUIRED)
+    pkg_check_modules(NXEMU_LIBUSB REQUIRED IMPORTED_TARGET GLOBAL libusb-1.0)
+    add_library(libusb::usb ALIAS PkgConfig::NXEMU_LIBUSB)
+endif()
+if(ENABLE_LIBUSB AND NOT TARGET libusb::usb)
+    set(_nxemu_usb "${CMAKE_CURRENT_SOURCE_DIR}/libusb/libusb")
+    add_library(nxemu_libusb STATIC
+        ${_nxemu_usb}/core.c
+        ${_nxemu_usb}/descriptor.c
+        ${_nxemu_usb}/hotplug.c
+        ${_nxemu_usb}/io.c
+        ${_nxemu_usb}/strerror.c
+        ${_nxemu_usb}/sync.c)
+    target_include_directories(nxemu_libusb PUBLIC "${_nxemu_usb}")
+    if(APPLE)
+        target_sources(nxemu_libusb PRIVATE
+            ${_nxemu_usb}/os/events_posix.c
+            ${_nxemu_usb}/os/threads_posix.c
+            ${_nxemu_usb}/os/darwin_usb.c)
+        target_include_directories(nxemu_libusb PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/libusb/Xcode")
+        target_compile_options(nxemu_libusb PRIVATE -fvisibility=hidden)
+        target_link_libraries(nxemu_libusb PRIVATE Threads::Threads
+            "-framework IOKit" "-framework CoreFoundation" "-framework Security")
+    elseif(WIN32)
+        target_sources(nxemu_libusb PRIVATE
+            ${_nxemu_usb}/os/events_windows.c
+            ${_nxemu_usb}/os/threads_windows.c
+            ${_nxemu_usb}/os/windows_common.c
+            ${_nxemu_usb}/os/windows_usbdk.c
+            ${_nxemu_usb}/os/windows_winusb.c)
+        target_include_directories(nxemu_libusb PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/libusb/msvc")
+    endif()
+    add_library(libusb::usb ALIAS nxemu_libusb)
+    unset(_nxemu_usb)
+endif()
+
+# SDL is built from source on every platform, so the application ships its own copy.
+# The interface always needs it; ENABLE_SDL adds controller input and audio output.
+if(NOT ANDROID AND NOT TARGET SDL3::SDL3)
+    # The frontend and the dynamically loaded OS module both use SDL. They
+    # share one runtime: two copies would each claim the controllers, and
+    # on macOS would define the same Objective-C classes twice.
+    set(SDL_SHARED ON CACHE BOOL "Build shared SDL" FORCE)
+    set(SDL_STATIC OFF CACHE BOOL "Build static SDL" FORCE)
+    set(SDL_TEST_LIBRARY OFF CACHE BOOL "Build the SDL test library" FORCE)
+    set(SDL_TESTS OFF CACHE BOOL "Build SDL tests" FORCE)
+    set(SDL_EXAMPLES OFF CACHE BOOL "Build SDL examples" FORCE)
+    set(SDL_INSTALL OFF CACHE BOOL "Enable SDL installation" FORCE)
+    set(SDL_UNINSTALL OFF CACHE BOOL "Enable SDL uninstallation" FORCE)
+    if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+        # The interface runs on Wayland only. Audio goes through PipeWire,
+        # PulseAudio or ALSA, whichever the system has; SDL loads them at run time.
+        set(SDL_WAYLAND ON CACHE BOOL "Use the Wayland video driver" FORCE)
+        set(SDL_X11 OFF CACHE BOOL "Use the X11 video driver" FORCE)
+        set(SDL_KMSDRM OFF CACHE BOOL "Use the KMS DRM video driver" FORCE)
+        set(SDL_PIPEWIRE ON CACHE BOOL "Use PipeWire audio" FORCE)
+        set(SDL_PULSEAUDIO ON CACHE BOOL "Use PulseAudio" FORCE)
+        set(SDL_ALSA ON CACHE BOOL "Support the ALSA audio API" FORCE)
+        set(SDL_JACK OFF CACHE BOOL "Support the JACK audio API" FORCE)
+        set(SDL_SNDIO OFF CACHE BOOL "Support the sndio audio API" FORCE)
+        set(SDL_OSS OFF CACHE BOOL "Support the OSS audio API" FORCE)
+    endif()
+    add_subdirectory(sdl)
+    if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+        # SDL leaves out a driver whose development files are missing.
+        get_directory_property(_nxemu_sdl_wayland DIRECTORY sdl DEFINITION SDL_VIDEO_DRIVER_WAYLAND)
+        if(NOT _nxemu_sdl_wayland)
+            message(FATAL_ERROR "SDL was configured without Wayland. Install the development files for "
+                "wayland-client, wayland-egl, wayland-cursor, egl and xkbcommon, and wayland-scanner.")
+        endif()
+        set(_nxemu_sdl_audio FALSE)
+        foreach(_nxemu_sdl_driver PIPEWIRE PULSEAUDIO ALSA)
+            get_directory_property(_nxemu_sdl_found DIRECTORY sdl DEFINITION SDL_AUDIO_DRIVER_${_nxemu_sdl_driver})
+            if(_nxemu_sdl_found)
+                set(_nxemu_sdl_audio TRUE)
+            endif()
+        endforeach()
+        if(NOT _nxemu_sdl_audio)
+            message(WARNING "SDL was configured without PipeWire, PulseAudio or ALSA; its audio output will not work.")
+        endif()
+        get_directory_property(_nxemu_sdl_udev DIRECTORY sdl DEFINITION HAVE_LIBUDEV_H)
+        if(NOT _nxemu_sdl_udev)
+            message(WARNING "SDL was configured without libudev; controllers connected later may not be found.")
+        endif()
+        unset(_nxemu_sdl_wayland)
+        unset(_nxemu_sdl_audio)
+        unset(_nxemu_sdl_driver)
+        unset(_nxemu_sdl_found)
+        unset(_nxemu_sdl_udev)
+    endif()
+    if(NOT APPLE)
+        # The executable and the OS module find the library beside the executable.
+        nxemu_set_app_output(SDL3-shared)
+        set_target_properties(SDL3-shared PROPERTIES DEBUG_POSTFIX "")
+    endif()
+endif()
+
 # Boost
 if(NOT TARGET Boost::headers)
     set(BOOST_SUPERPROJECT_VERSION "1.84.0" CACHE STRING "Boost version string for modular CMakeLists")
@@ -38,6 +138,15 @@ if(NOT TARGET Boost::headers)
     add_subdirectory("${_NXEMU_BOOST_ROOT}/libs/core" "${CMAKE_BINARY_DIR}/external/boost/libs/core")
     add_subdirectory("${_NXEMU_BOOST_ROOT}/libs/predef" "${CMAKE_BINARY_DIR}/external/boost/libs/predef")
     add_subdirectory("${_NXEMU_BOOST_ROOT}/libs/context" "${CMAKE_BINARY_DIR}/external/boost/libs/context")
+    if(MSVC)
+        # The generic ASM language that nxemu-cpu and nxemu-video enable also
+        # claims .asm files, and Visual Studio then leaves them out of the build.
+        file(GLOB _nxemu_boost_masm "${_NXEMU_BOOST_ROOT}/libs/context/src/asm/*_masm.asm")
+        set_source_files_properties(${_nxemu_boost_masm}
+            DIRECTORY "${_NXEMU_BOOST_ROOT}/libs/context"
+            PROPERTIES LANGUAGE ASM_MASM)
+        unset(_nxemu_boost_masm)
+    endif()
 endif()
 
 # Oaknut
@@ -69,12 +178,16 @@ if(TARGET libzstd_static AND NOT TARGET zstd::zstd)
 endif()
 
 # zlib + minizip (nxemu-loader firmware zip extraction)
-if(NOT TARGET zlibstatic)
+# The bundled zlib 1.3.1 CMake temporarily renames its source zconf.h during
+# out-of-source configuration. Restoring that file immediately makes quoted
+# includes select the unconfigured source header on macOS, so POSIX prototypes
+# such as read/write/lseek are lost. Use the SDK zlib on Apple instead.
+if(APPLE)
+    find_package(ZLIB REQUIRED)
+elseif(NOT TARGET zlibstatic)
     set(ZLIB_BUILD_EXAMPLES OFF CACHE BOOL "Build zlib example/minigzip programs" FORCE)
     add_subdirectory("${CMAKE_SOURCE_DIR}/external/zlib" "${CMAKE_BINARY_DIR}/external/zlib")
-    # zlib's CMake renames the tracked source zconf.h -> zconf.h.included during
-    # out-of-source configure. Undo that so the submodule working tree stays clean.
-    # The build still uses the generated header in ${CMAKE_BINARY_DIR}/external/zlib.
+    # Preserve the existing non-Apple behavior.
     set(_nxemu_zlib_src "${CMAKE_SOURCE_DIR}/external/zlib")
     if(EXISTS "${_nxemu_zlib_src}/zconf.h.included" AND NOT EXISTS "${_nxemu_zlib_src}/zconf.h")
         file(RENAME "${_nxemu_zlib_src}/zconf.h.included" "${_nxemu_zlib_src}/zconf.h")
@@ -112,6 +225,7 @@ endif()
 
 # Sirit
 add_subdirectory(sirit)
+nxemu_apply_dependency_cache_settings(sirit)
 
 # httplib
 if (ENABLE_WEB_SERVICE AND NOT TARGET httplib::httplib)
@@ -121,7 +235,26 @@ endif()
 
 # Opus
 if (NOT TARGET Opus::opus)
+    # AArch64 always provides NEON. Opus 1.5.x does not recognize macOS'
+    # "arm64" processor name as its "aarch64" presume-NEON case, while
+    # runtime CPU capability detection is unavailable on this platform.
+    if (APPLE AND ARCHITECTURE_arm64)
+        set(OPUS_MAY_HAVE_NEON OFF CACHE BOOL "Use runtime NEON detection" FORCE)
+        set(OPUS_PRESUME_NEON ON CACHE BOOL "Assume NEON support" FORCE)
+    endif()
+    if(MSVC)
+        if(CMAKE_MSVC_RUNTIME_LIBRARY MATCHES "DLL")
+            set(OPUS_STATIC_RUNTIME OFF CACHE BOOL "Opus: static C runtime" FORCE)
+        else()
+            set(OPUS_STATIC_RUNTIME ON CACHE BOOL "Opus: static C runtime" FORCE)
+        endif()
+    endif()
     add_subdirectory(opus)
+    if (APPLE AND ARCHITECTURE_arm64)
+        # Opus also guards NEON declarations with MAY_HAVE, even when presumed.
+        target_compile_definitions(opus PRIVATE
+            OPUS_ARM_MAY_HAVE_NEON OPUS_ARM_MAY_HAVE_NEON_INTR)
+    endif()
 endif()
 
 # Vulkan — headers must come first: VulkanUtilityLibraries runs find_package(VulkanHeaders CONFIG),
@@ -133,6 +266,7 @@ add_subdirectory(vulkan-memory-allocator)
 # mcl
 if (NOT TARGET merry::mcl)
     add_subdirectory(mcl)
+    nxemu_apply_dependency_cache_settings(mcl)
 endif()
 
 # libadrenotools — Adreno BCn patching, turbo mode (Android arm64 only; see upstream CMake)
@@ -170,5 +304,93 @@ if(NOT TARGET tsl::robin_map)
     target_include_directories(robin_map INTERFACE "${CMAKE_SOURCE_DIR}/external/robin-map/include")
 endif()
 
-# sciter
-add_subdirectory(sciterui)
+# MoltenVK runtime (macOS)
+if(APPLE)
+    include(ExternalProject)
+
+    find_program(NXEMU_XCODEBUILD xcodebuild REQUIRED)
+    execute_process(COMMAND "${NXEMU_XCODEBUILD}" -version
+        RESULT_VARIABLE _nxemu_xcode_result OUTPUT_QUIET ERROR_VARIABLE _nxemu_xcode_error)
+    if(NOT _nxemu_xcode_result EQUAL 0)
+        message(FATAL_ERROR
+            "Building MoltenVK requires full Xcode, not only Command Line Tools. "
+            "Select Xcode with xcode-select. ${_nxemu_xcode_error}")
+    endif()
+
+    set(NXEMU_MOLTENVK_PREBUILT "" CACHE FILEPATH "Prebuilt MoltenVK runtime for this toolchain")
+    if(NXEMU_MOLTENVK_PREBUILT)
+        if(NOT EXISTS "${NXEMU_MOLTENVK_PREBUILT}")
+            message(FATAL_ERROR "Prebuilt MoltenVK runtime not found: ${NXEMU_MOLTENVK_PREBUILT}")
+        endif()
+        message(STATUS "Using prebuilt MoltenVK: ${NXEMU_MOLTENVK_PREBUILT}")
+        set(NXEMU_MOLTENVK_RUNTIME "${NXEMU_MOLTENVK_PREBUILT}" CACHE INTERNAL "" FORCE)
+    else()
+        set(_nxemu_moltenvk_root "${CMAKE_BINARY_DIR}/external/moltenvk")
+        set(_nxemu_moltenvk_source "${_nxemu_moltenvk_root}/fork")
+        set(_nxemu_moltenvk_runtime
+            "${_nxemu_moltenvk_source}/Package/Latest/MoltenVK/dynamic/dylib/macOS/libMoltenVK.dylib")
+        # The fork's nxemu branch carries the Ryujinx fixes and ours.
+        set(_nxemu_moltenvk_tag "fb1afa9b968226f694efa45625bb7ef90928f4df")
+        set(_nxemu_moltenvk_patches
+            "${CMAKE_CURRENT_SOURCE_DIR}/moltenvk-patches/0001-honor-spirv-dontinline.patch"
+            "${CMAKE_CURRENT_SOURCE_DIR}/moltenvk-patches/0002-compile-cached-libraries-on-use.patch")
+        list(JOIN _nxemu_moltenvk_patches "' '" _nxemu_moltenvk_patch_args)
+        ExternalProject_Add(nxemu_moltenvk
+            GIT_REPOSITORY "https://github.com/fab918/MoltenVK.git"
+            GIT_TAG "${_nxemu_moltenvk_tag}"
+            GIT_SHALLOW FALSE
+            # Runs only when the tag changes, so an existing build checks out a new tag without
+            # updating and rebuilding MoltenVK on every build.
+            UPDATE_DISCONNECTED TRUE
+            # The build step patches the checkout in place; drop that before changing tag.
+            UPDATE_COMMAND /bin/sh -c
+                "git reset --hard --quiet && git clean -fdq -- Scripts && (git cat-file -e ${_nxemu_moltenvk_tag}^{commit} 2>/dev/null || git fetch origin) && git checkout --quiet ${_nxemu_moltenvk_tag}"
+            SOURCE_DIR "${_nxemu_moltenvk_source}"
+            CONFIGURE_COMMAND ""
+            BUILD_IN_SOURCE TRUE
+            # Reapply from a clean checkout so an edited patch does not conflict with the old one.
+            BUILD_COMMAND /bin/sh -c
+                "git reset --hard --quiet && git clean -fdq -- Scripts && git apply '${_nxemu_moltenvk_patch_args}' && ./fetchDependencies --macos && make macos"
+            BUILD_BYPRODUCTS "${_nxemu_moltenvk_runtime}"
+            INSTALL_COMMAND ""
+        )
+
+        ExternalProject_Add_StepDependencies(nxemu_moltenvk build ${_nxemu_moltenvk_patches})
+
+        set(NXEMU_MOLTENVK_RUNTIME "${_nxemu_moltenvk_runtime}" CACHE INTERNAL "" FORCE)
+        unset(_nxemu_moltenvk_patches)
+        unset(_nxemu_moltenvk_patch_args)
+        unset(_nxemu_moltenvk_tag)
+        unset(_nxemu_moltenvk_root)
+        unset(_nxemu_moltenvk_source)
+        unset(_nxemu_moltenvk_runtime)
+    endif()
+endif()
+
+# Interface: RmlUi, with FreeType as its font engine. Both are built from
+# source so every platform renders text with the same library.
+set(BUILD_SHARED_LIBS OFF)
+foreach(_nxemu_ft_dependency ZLIB BZIP2 PNG HARFBUZZ BROTLI)
+    set(FT_DISABLE_${_nxemu_ft_dependency} ON CACHE BOOL "FreeType: no external dependency" FORCE)
+endforeach()
+unset(_nxemu_ft_dependency)
+set(SKIP_INSTALL_ALL ON)
+# FreeType's minimum predates what CMake 4 accepts.
+set(_nxemu_saved_policy_minimum "${CMAKE_POLICY_VERSION_MINIMUM}")
+if(NOT CMAKE_POLICY_VERSION_MINIMUM OR CMAKE_POLICY_VERSION_MINIMUM VERSION_LESS "3.5")
+    set(CMAKE_POLICY_VERSION_MINIMUM "3.5")
+endif()
+add_subdirectory(freetype)
+set(CMAKE_POLICY_VERSION_MINIMUM "${_nxemu_saved_policy_minimum}")
+unset(_nxemu_saved_policy_minimum)
+unset(SKIP_INSTALL_ALL)
+add_library(Freetype::Freetype ALIAS freetype)
+
+# RmlUi takes the target above instead of searching the system.
+set(CMAKE_DISABLE_FIND_PACKAGE_Freetype TRUE)
+set(_nxemu_saved_cxx_flags "${CMAKE_CXX_FLAGS}")
+nxemu_enable_rtti()
+add_subdirectory(rmlui)
+set(CMAKE_CXX_FLAGS "${_nxemu_saved_cxx_flags}")
+unset(_nxemu_saved_cxx_flags)
+unset(CMAKE_DISABLE_FIND_PACKAGE_Freetype)

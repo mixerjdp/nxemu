@@ -5,6 +5,7 @@
 #include "core/hle/service/am/am_results.h"
 #include "core/hle/service/am/applet.h"
 #include "core/hle/service/am/service/lock_accessor.h"
+#include "core/hle/service/am/service/storage.h"
 #include "core/hle/service/apm/apm_interface.h"
 #include "core/hle/service/cmif_serialization.h"
 #include "core/hle/service/pm/pm.h"
@@ -37,12 +38,12 @@ ICommonStateGetter::ICommonStateGetter(Core::System & system_, std::shared_ptr<A
         {8, D<&ICommonStateGetter::GetBootMode>, "GetBootMode"},
         {9, D<&ICommonStateGetter::GetCurrentFocusState>, "GetCurrentFocusState"},
         {10, D<&ICommonStateGetter::RequestToAcquireSleepLock>, "RequestToAcquireSleepLock"},
-        {11, nullptr, "ReleaseSleepLock"},
+        {11, D<&ICommonStateGetter::ReleaseSleepLock>, "ReleaseSleepLock"},
         {12, nullptr, "ReleaseSleepLockTransiently"},
         {13, D<&ICommonStateGetter::GetAcquiredSleepLockEvent>, "GetAcquiredSleepLockEvent"},
         {14, nullptr, "GetWakeupCount"},
-        {20, nullptr, "PushToGeneralChannel"},
-        {30, nullptr, "GetHomeButtonReaderLockAccessor"},
+        {20, D<&ICommonStateGetter::PushToGeneralChannel>, "PushToGeneralChannel"},
+        {30, D<&ICommonStateGetter::GetHomeButtonReaderLockAccessor>, "GetHomeButtonReaderLockAccessor"},
         {31, D<&ICommonStateGetter::GetReaderLockAccessorEx>, "GetReaderLockAccessorEx"},
         {32, D<&ICommonStateGetter::GetWriterLockAccessorEx>, "GetWriterLockAccessorEx"},
         {40, nullptr, "GetCradleFwVersion"},
@@ -55,8 +56,8 @@ ICommonStateGetter::ICommonStateGetter(Core::System & system_, std::shared_ptr<A
         {59, nullptr, "SetVrPositionForDebug"},
         {60, D<&ICommonStateGetter::GetDefaultDisplayResolution>, "GetDefaultDisplayResolution"},
         {61, D<&ICommonStateGetter::GetDefaultDisplayResolutionChangeEvent>, "GetDefaultDisplayResolutionChangeEvent"},
-        {62, nullptr, "GetHdcpAuthenticationState"},
-        {63, nullptr, "GetHdcpAuthenticationStateChangeEvent"},
+        {62, D<&ICommonStateGetter::GetHdcpAuthenticationState>, "GetHdcpAuthenticationState"},
+        {63, D<&ICommonStateGetter::GetHdcpAuthenticationStateChangeEvent>, "GetHdcpAuthenticationStateChangeEvent"},
         {64, nullptr, "SetTvPowerStateMatchingMode"},
         {65, nullptr, "GetApplicationIdByContentActionName"},
         {66, &ICommonStateGetter::SetCpuBoostMode, "SetCpuBoostMode"},
@@ -65,7 +66,7 @@ ICommonStateGetter::ICommonStateGetter(Core::System & system_, std::shared_ptr<A
         {80, D<&ICommonStateGetter::PerformSystemButtonPressingIfInFocus>, "PerformSystemButtonPressingIfInFocus"},
         {90, nullptr, "SetPerformanceConfigurationChangedNotification"},
         {91, nullptr, "GetCurrentPerformanceConfiguration"},
-        {100, nullptr, "SetHandlingHomeButtonShortPressedEnabled"},
+        {100, D<&ICommonStateGetter::SetHandlingHomeButtonShortPressedEnabled>, "SetHandlingHomeButtonShortPressedEnabled"},
         {110, nullptr, "OpenMyGpuErrorHandler"},
         {120, D<&ICommonStateGetter::GetAppletLaunchedHistory>, "GetAppletLaunchedHistory"},
         {200, D<&ICommonStateGetter::GetOperationModeSystemInfo>, "GetOperationModeSystemInfo"},
@@ -76,6 +77,8 @@ ICommonStateGetter::ICommonStateGetter(Core::System & system_, std::shared_ptr<A
         {501, nullptr, "SuppressDisablingSleepTemporarily"},
         {502, nullptr, "IsSleepEnabled"},
         {503, nullptr, "IsDisablingSleepSuppressed"},
+        {610, D<&ICommonStateGetter::Unknown610>, "Unknown610"}, //21.0.0+
+        {611, D<&ICommonStateGetter::Unknown611>, "Unknown611"}, //22.0.0+
         {900, D<&ICommonStateGetter::SetRequestExitToLibraryAppletAtExecuteNextProgramEnabled>, "SetRequestExitToLibraryAppletAtExecuteNextProgramEnabled"},
     };
     // clang-format on
@@ -88,7 +91,7 @@ ICommonStateGetter::~ICommonStateGetter() = default;
 Result ICommonStateGetter::GetEventHandle(OutCopyHandle<Kernel::KReadableEvent> out_event)
 {
     LOG_DEBUG(Service_AM, "called");
-    *out_event = &m_applet->message_queue.GetMessageReceiveEvent();
+    *out_event = m_applet->lifecycle_manager.GetSystemEvent().GetHandle();
     R_SUCCEED();
 }
 
@@ -96,9 +99,8 @@ Result ICommonStateGetter::ReceiveMessage(Out<AppletMessage> out_applet_message)
 {
     LOG_DEBUG(Service_AM, "called");
 
-    *out_applet_message = m_applet->message_queue.PopMessage();
-    if (*out_applet_message == AppletMessage::None)
-    {
+    std::scoped_lock lk{m_applet->lock};
+    if (!m_applet->lifecycle_manager.PopMessage(out_applet_message)) {
         LOG_ERROR(Service_AM, "Tried to pop message but none was available!");
         R_THROW(AM::ResultNoMessages);
     }
@@ -111,7 +113,7 @@ Result ICommonStateGetter::GetCurrentFocusState(Out<FocusState> out_focus_state)
     LOG_DEBUG(Service_AM, "called");
 
     std::scoped_lock lk{m_applet->lock};
-    *out_focus_state = m_applet->focus_state;
+    *out_focus_state = m_applet->lifecycle_manager.GetAndClearFocusState();
 
     R_SUCCEED();
 }
@@ -125,11 +127,40 @@ Result ICommonStateGetter::RequestToAcquireSleepLock()
     R_SUCCEED();
 }
 
+Result ICommonStateGetter::ReleaseSleepLock()
+{
+    LOG_WARNING(Service_AM, "(STUBBED) called");
+
+    m_applet->sleep_lock_event.Clear();
+    R_SUCCEED();
+}
+
 Result ICommonStateGetter::GetAcquiredSleepLockEvent(
     OutCopyHandle<Kernel::KReadableEvent> out_event)
 {
     LOG_WARNING(Service_AM, "called");
     *out_event = m_applet->sleep_lock_event.GetHandle();
+    R_SUCCEED();
+}
+
+Result ICommonStateGetter::PushToGeneralChannel(SharedPointer<IStorage> storage) {
+    LOG_DEBUG(Service_AM, "called");
+    system.PushGeneralChannelData(storage->GetData());
+    R_SUCCEED();
+}
+
+Result ICommonStateGetter::GetHomeButtonReaderLockAccessor(
+    Out<SharedPointer<ILockAccessor>> out_lock_accessor) {
+    LOG_DEBUG(Service_AM, "called");
+    *out_lock_accessor = std::make_shared<ILockAccessor>(system);
+    R_SUCCEED();
+}
+
+Result ICommonStateGetter::SetHandlingHomeButtonShortPressedEnabled(bool enabled) {
+    LOG_DEBUG(Service_AM, "called, enabled={} applet_id={}", enabled, m_applet->applet_id);
+
+    std::scoped_lock lk{m_applet->lock};
+    m_applet->home_button_short_pressed_blocked = !enabled;
     R_SUCCEED();
 }
 
@@ -149,17 +180,32 @@ Result ICommonStateGetter::GetWriterLockAccessorEx(
     R_SUCCEED();
 }
 
+Result ICommonStateGetter::GetHdcpAuthenticationState(Out<s32> out_state) {
+    LOG_DEBUG(Service_AM, "called");
+
+    std::scoped_lock lk{m_applet->lock};
+    *out_state = m_applet->hdcp_authentication_state;
+    R_SUCCEED();
+}
+
+Result ICommonStateGetter::GetHdcpAuthenticationStateChangeEvent(
+    OutCopyHandle<Kernel::KReadableEvent> out_event) {
+    LOG_DEBUG(Service_AM, "called");
+    *out_event = m_applet->hdcp_authentication_state_changed_event.GetHandle();
+    R_SUCCEED();
+}
+
 Result ICommonStateGetter::GetDefaultDisplayResolutionChangeEvent(
     OutCopyHandle<Kernel::KReadableEvent> out_event)
 {
     LOG_DEBUG(Service_AM, "called");
-    *out_event = &m_applet->message_queue.GetOperationModeChangedEvent();
+    *out_event = m_applet->lifecycle_manager.GetOperationModeChangedSystemEvent().GetHandle();
     R_SUCCEED();
 }
 
 Result ICommonStateGetter::GetOperationMode(Out<OperationMode> out_operation_mode)
 {
-    const bool use_docked_mode = g_settings->GetInt(NXOsSetting::DockedMode) == static_cast<int32_t>(DockedMode::Docked);
+    const bool use_docked_mode = osSettings.use_docked_mode == DockedMode::Docked;
     LOG_DEBUG(Service_AM, "called, use_docked_mode={}", use_docked_mode);
     *out_operation_mode = use_docked_mode ? OperationMode::Docked : OperationMode::Handheld;
     R_SUCCEED();
@@ -231,7 +277,7 @@ Result ICommonStateGetter::GetDefaultDisplayResolution(Out<s32> out_width, Out<s
 {
     LOG_DEBUG(Service_AM, "called");
 
-    const bool docked = g_settings->GetInt(NXOsSetting::DockedMode) == static_cast<int32_t>(DockedMode::Docked);
+    const bool docked = osSettings.use_docked_mode == DockedMode::Docked;
     if (docked)
     {
         *out_width = static_cast<u32>(Service::VI::DisplayResolution::DockedWidth);
@@ -310,6 +356,16 @@ Result ICommonStateGetter::SetRequestExitToLibraryAppletAtExecuteNextProgramEnab
     std::scoped_lock lk{m_applet->lock};
     m_applet->request_exit_to_library_applet_at_execute_next_program_enabled = true;
 
+    R_SUCCEED();
+}
+
+Result ICommonStateGetter::Unknown610(u64 unk) {
+    LOG_WARNING(Service_AM, "(STUBBED) called");
+    R_SUCCEED();
+}
+
+Result ICommonStateGetter::Unknown611(u8 unk) {
+    LOG_WARNING(Service_AM, "(STUBBED) called");
     R_SUCCEED();
 }
 

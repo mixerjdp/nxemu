@@ -28,14 +28,18 @@ void StorageOp(EmitContext& ctx, const IR::Value& binding, ScalarU32 offset,
     }
 }
 
-void GlobalStorageOp(EmitContext& ctx, Register address, bool pointer_based, std::string_view expr,
-                     std::string_view else_expr = {}) {
+void GlobalStorageOp(EmitContext& ctx, Register address, bool pointer_based, bool is_write,
+                     std::string_view expr, std::string_view else_expr = {}) {
     const size_t num_buffers{ctx.info.storage_buffers_descriptors.size()};
+    size_t num_used_buffers{};
     for (size_t index = 0; index < num_buffers; ++index) {
-        if (!ctx.info.nvn_buffer_used[index]) {
+        const auto& ssbo{ctx.info.storage_buffers_descriptors[index]};
+        // Indirect reads can reference tracked buffers outside the NVN table too.
+        // Writes only reach buffers already known to be written.
+        if (is_write && !ssbo.is_written) {
             continue;
         }
-        const auto& ssbo{ctx.info.storage_buffers_descriptors[index]};
+        ++num_used_buffers;
         const u64 ssbo_align_mask{~(ctx.profile.min_ssbo_alignment - 1U)};
         ctx.Add("LDC.U64 DC.x,c{}[{}];"    // unaligned_ssbo_addr
                 "AND.U64 DC.x,DC.x,{};"    // ssbo_addr = unaligned_ssbo_addr & ssbo_align_mask
@@ -65,7 +69,6 @@ void GlobalStorageOp(EmitContext& ctx, Register address, bool pointer_based, std
     if (!else_expr.empty()) {
         ctx.Add("{}", else_expr);
     }
-    const size_t num_used_buffers{ctx.info.nvn_buffer_used.count()};
     for (size_t index = 0; index < num_used_buffers; ++index) {
         ctx.Add("ENDIF;");
     }
@@ -95,18 +98,18 @@ void Load(EmitContext& ctx, IR::Inst& inst, const IR::Value& binding, ScalarU32 
 template <typename ValueType>
 void GlobalWrite(EmitContext& ctx, Register address, ValueType value, std::string_view size) {
     if (ctx.runtime_info.glasm_use_storage_buffers) {
-        GlobalStorageOp(ctx, address, false, fmt::format("STB.{} {}", size, value));
+        GlobalStorageOp(ctx, address, false, true, fmt::format("STB.{} {}", size, value));
     } else {
-        GlobalStorageOp(ctx, address, true, fmt::format("STORE.{} {},DC.x;", size, value));
+        GlobalStorageOp(ctx, address, true, true, fmt::format("STORE.{} {},DC.x;", size, value));
     }
 }
 
 void GlobalLoad(EmitContext& ctx, IR::Inst& inst, Register address, std::string_view size) {
     const Register ret{ctx.reg_alloc.Define(inst)};
     if (ctx.runtime_info.glasm_use_storage_buffers) {
-        GlobalStorageOp(ctx, address, false, fmt::format("LDB.{} {}", size, ret));
+        GlobalStorageOp(ctx, address, false, false, fmt::format("LDB.{} {}", size, ret));
     } else {
-        GlobalStorageOp(ctx, address, true, fmt::format("LOAD.{} {},DC.x;", size, ret),
+        GlobalStorageOp(ctx, address, true, false, fmt::format("LOAD.{} {},DC.x;", size, ret),
                         fmt::format("MOV.S {},0;", ret));
     }
 }

@@ -4,6 +4,7 @@
 #pragma once
 
 #include "yuzu_common/common_funcs.h"
+#include "core/file_sys/fs_filesystem.h"
 #include "core/file_sys/fsa/fs_i_filesystem.h"
 #include "core/hle/service/cmif_types.h"
 #include "core/hle/service/filesystem/filesystem.h"
@@ -30,12 +31,16 @@ public:
     Result DeleteDirectoryRecursively(const InLargeData<FileSys::Sf::Path, BufferAttr_HipcPointer> path);
     Result CleanDirectoryRecursively(const InLargeData<FileSys::Sf::Path, BufferAttr_HipcPointer> path);
     Result RenameFile(const InLargeData<FileSys::Sf::Path, BufferAttr_HipcPointer> old_path, const InLargeData<FileSys::Sf::Path, BufferAttr_HipcPointer> new_path);
+    Result RenameDirectory(const InLargeData<FileSys::Sf::Path, BufferAttr_HipcPointer> old_path, const InLargeData<FileSys::Sf::Path, BufferAttr_HipcPointer> new_path);
     Result OpenFile(OutInterface<IFile> out_interface, const InLargeData<FileSys::Sf::Path, BufferAttr_HipcPointer> path, u32 mode);
     Result OpenDirectory(OutInterface<IDirectory> out_interface, const InLargeData<FileSys::Sf::Path, BufferAttr_HipcPointer> path, u32 mode);
     Result GetEntryType(Out<u32> out_type, const InLargeData<FileSys::Sf::Path, BufferAttr_HipcPointer> path);
     Result Commit();
     Result GetFreeSpaceSize(Out<s64> out_size, const InLargeData<FileSys::Sf::Path, BufferAttr_HipcPointer> path);
     Result GetTotalSpaceSize(Out<s64> out_size, const InLargeData<FileSys::Sf::Path, BufferAttr_HipcPointer> path);
+    Result GetFileTimeStampRaw(Out<VirtualFileTimeStampRaw> out_timestamp,
+                               const InLargeData<FileSys::Sf::Path, BufferAttr_HipcPointer> path);
+    Result GetFileSystemAttribute(Out<FileSys::FileSystemAttribute> out_attribute);
 
 private:
     std::unique_ptr<FileSys::Fsa::IFileSystem> backend;

@@ -1,49 +1,19 @@
 #include "rom_info.h"
 #include "system_loader.h"
-#include "loader_settings.h"
 #include "core/file_sys/registered_cache.h"
 #include "core/file_sys/card_image.h"
 #include "core/file_sys/submission_package.h"
 #include "core/file_sys/content_archive.h"
 #include "core/file_sys/common_funcs.h"
 #include "core/file_sys/patch_manager.h"
+#include "core/file_sys/control_metadata.h"
+#include "core/file_sys/nca_metadata.h"
 #include "core/loader/loader.h"
+#include <set>
 #include <algorithm>
-#include <common/path.h>
+#include <cstring>
 #include <filesystem>
 #include <map>
-#include <yuzu_common/fs/fs.h>
-
-namespace
-{
-
-using UpdateVersionMap = std::map<uint64_t, uint32_t>;
-
-std::string ToLowerAscii(std::string value)
-{
-    std::transform(value.begin(), value.end(), value.begin(), [](unsigned char c) { return (char)std::tolower(c); });
-    return value;
-}
-
-bool IsAddOnContentExtension(const char * fileName)
-{
-    static const char * supported_extensions[] = {
-        "nca",
-        "dxci", "xci", "nsp",
-        "dnsp",
-    };
-
-    std::string ext = Path(fileName).GetExtension();
-    std::transform(ext.begin(), ext.end(), ext.begin(), ::tolower);
-    for (const char * supported : supported_extensions)
-    {
-        if (ext == supported)
-        {
-            return true;
-        }
-    }
-    return false;
-}
 
 void CollectUpdateVersions(const FileSys::NSP & nsp, UpdateVersionMap & versions)
 {
@@ -77,6 +47,15 @@ void CollectUpdateVersions(const FileSys::NSP & nsp, UpdateVersionMap & versions
             }
         }
     }
+}
+
+namespace
+{
+
+std::string ToLowerAscii(std::string value)
+{
+    std::transform(value.begin(), value.end(), value.begin(), [](unsigned char c) { return (char)std::tolower(c); });
+    return value;
 }
 
 void RegisterMatchingAddOnEntriesFromNsp(const FileSys::NSP & nsp, uint64_t base_program_id, IManualContentProvider & provider)
@@ -134,11 +113,11 @@ void RegisterMatchingAddOnEntriesFromFile(FileSys::VirtualFile file,
     const std::string ext = ToLowerAscii(file->GetExtension());
     if (ext == "dnsp" || ext == "nsp")
     {
-        RegisterMatchingAddOnEntriesFromNsp(FileSys::NSP(file), base_program_id, provider);
+        RegisterMatchingAddOnEntriesFromNsp(FileSys::NSP(file, 0, 0, base_program_id), base_program_id, provider);
     }
     else if (ext == "dxci" || ext == "xci")
     {
-        const FileSys::XCI xci(file);
+        const FileSys::XCI xci(file, 0, 0, base_program_id);
         if (xci.GetStatus() == LoaderResultStatus::Success)
         {
             const std::shared_ptr<FileSys::NSP> nsp = xci.GetSecurePartitionNSP();
@@ -171,18 +150,19 @@ void RegisterMatchingAddOnEntriesFromFile(FileSys::VirtualFile file,
     }
 }
 
-void RegisterSiblingAddOnEntries(uint64_t program_id, const FileSys::VirtualFile & game_file,
-                                 IManualContentProvider & provider)
+std::set<std::string> RegisterSiblingAddOnEntries(uint64_t program_id, const FileSys::VirtualFile & game_file,
+                                                  IManualContentProvider & provider)
 {
+    std::set<std::string> checked;
     if (program_id == 0 || !game_file)
     {
-        return;
+        return checked;
     }
 
     const FileSys::VirtualDir parent = game_file->GetContainingDirectory();
     if (!parent)
     {
-        return;
+        return checked;
     }
 
     const uint64_t base_program_id = FileSys::GetBaseTitleID(program_id);
@@ -199,49 +179,29 @@ void RegisterSiblingAddOnEntries(uint64_t program_id, const FileSys::VirtualFile
             continue;
         }
 
+        checked.insert(sibling->GetFullPath());
         RegisterMatchingAddOnEntriesFromFile(sibling, base_program_id, provider);
     }
+    return checked;
 }
 
-void RegisterConfiguredAddOnDirectoryEntries(uint64_t program_id, FileSys::VirtualFilesystem & vfs, IManualContentProvider & provider)
+void RegisterGameDirectoryAddOnEntries(Systemloader & systemloader, uint64_t program_id, const FileSys::VirtualFile & game_file,
+                                       FileSys::VirtualFilesystem & vfs, IManualContentProvider & provider,
+                                       const std::set<std::string> & siblings)
 {
-    if (program_id == 0 || loaderSettings.addOnDirectories.empty())
+    if (program_id == 0 || !game_file || !vfs)
     {
         return;
     }
-
     const uint64_t base_program_id = FileSys::GetBaseTitleID(program_id);
-
-    for (const std::string & dir : loaderSettings.addOnDirectories)
+    for (const std::string & path : systemloader.GameDirectoryAddOnFiles(base_program_id))
     {
-        if (dir.empty())
+        FileSys::VirtualFile file = vfs->OpenFile(path, VirtualFileOpenMode::Read);
+        if (!file || file->GetFullPath() == game_file->GetFullPath() || siblings.contains(file->GetFullPath()))
         {
             continue;
         }
-
-        const auto callback = [&](const std::filesystem::directory_entry & entry) -> bool {
-            const std::filesystem::path & path = entry.path();
-            if (!Common::FS::IsFile(path))
-            {
-                return true;
-            }
-            const std::string physical_name = Common::FS::PathToUTF8String(path);
-            if (!IsAddOnContentExtension(physical_name.c_str()))
-            {
-                return true;
-            }
-
-            FileSys::VirtualFile file = vfs->OpenFile(physical_name, VirtualFileOpenMode::Read);
-            if (!file)
-            {
-                return true;
-            }
-
-            RegisterMatchingAddOnEntriesFromFile(file, base_program_id, provider);
-            return true;
-        };
-
-        Common::FS::IterateDirEntriesRecursively(dir, callback, Common::FS::DirEntryFilter::File);
+        RegisterMatchingAddOnEntriesFromFile(file, base_program_id, provider);
     }
 }
 
@@ -283,6 +243,36 @@ LoaderResultStatus RomInfo::ReadTitle(char * buffer, uint32_t * bufferSize)
         return m_loader->ReadTitle(buffer, bufferSize);
     }
     return LoaderResultStatus::ErrorNotInitialized;
+}
+
+LoaderResultStatus RomInfo::ReadDisplayVersion(char * buffer, uint32_t * bufferSize)
+{
+    if (!m_loader)
+    {
+        return LoaderResultStatus::ErrorNotInitialized;
+    }
+    FileSys::NACP nacp;
+    const LoaderResultStatus st = m_loader->ReadControlData(nacp);
+    if (st != LoaderResultStatus::Success)
+    {
+        return st;
+    }
+    if (bufferSize == nullptr)
+    {
+        return LoaderResultStatus::ErrorNotImplemented;
+    }
+    const std::string version = nacp.GetVersionString();
+    if (buffer != nullptr && *bufferSize < (uint32_t)version.size())
+    {
+        return LoaderResultStatus::ErrorBufferTooSmall;
+    }
+    *bufferSize = (uint32_t)version.size();
+    if (buffer == nullptr)
+    {
+        return LoaderResultStatus::Success;
+    }
+    std::memcpy(buffer, version.data(), version.size());
+    return LoaderResultStatus::Success;
 }
 
 LoaderResultStatus RomInfo::ReadIcon(uint8_t * buffer, uint32_t * bufferSize)
@@ -430,13 +420,12 @@ void RomInfo::PrepareManualContent()
     ReadProgramId(program_id);
 
     // Automatically discover matching update/DLC containers stored next to the game.
-    // This makes a base DNSP/DXCI and a separate sibling update DNSP work without
-    // requiring the user to configure the same directory again as an add-on directory.
-    RegisterSiblingAddOnEntries(program_id, m_file, provider);
+    // This makes a base DNSP/DXCI and a separate sibling update DNSP work.
+    const std::set<std::string> siblings = RegisterSiblingAddOnEntries(program_id, m_file, provider);
 
-    // Keep the explicit add-on-directory mechanism for content stored elsewhere.
+    // Add-ons for the game stored elsewhere in the game directories
     FileSys::VirtualFilesystem vfs = m_systemloader.GetFilesystem();
-    RegisterConfiguredAddOnDirectoryEntries(program_id, vfs, provider);
+    RegisterGameDirectoryAddOnEntries(m_systemloader, program_id, m_file, vfs, provider, siblings);
 }
 
 uint32_t RomInfo::GetGamePatches(GamePatchInfo * patches, uint32_t maxCount)
@@ -458,6 +447,9 @@ uint32_t RomInfo::GetGamePatches(GamePatchInfo * patches, uint32_t maxCount)
     for (uint32_t i = 0; i < count; ++i)
     {
         patches[i].enabled = list[i].enabled;
+        patches[i].type = list[i].type == FileSys::PatchType::Update ? GamePatchType::Update
+                          : list[i].type == FileSys::PatchType::DLC  ? GamePatchType::AddOnContent
+                                                                     : GamePatchType::Mod;
         std::snprintf(patches[i].name, sizeof(patches[i].name), "%s", list[i].name.c_str());
         std::snprintf(patches[i].version, sizeof(patches[i].version), "%s", list[i].version.c_str());
         if (list[i].type == FileSys::PatchType::Update && list[i].title_id != list[i].program_id)

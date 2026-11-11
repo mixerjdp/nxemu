@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2018 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <cstring>
 #include <utility>
 #include <vector>
 
@@ -224,10 +225,31 @@ static bool LoadNroImpl(Systemloader & loader, ISystemModules & modules, const s
     program_image.resize(static_cast<u32>(program_image.size()) + bss_size);
     uint32_t image_size = (uint32_t)program_image.size();
 
-#if defined(FIX_NCE) && (defined(_M_ARM64) || defined(ARCHITECTURE_arm64))
-    const auto & code = codeset.CodeSegment();
-
+    g_settings->SetBool(NXCoreSetting::Is64BitProgram, false);
+    g_settings->SetBool(NXCoreSetting::Has36BitAddressSpace, false);
     g_settings->SetBool(NXCoreSetting::Has39BitAddressSpace, true);
+    g_settings->SetBool(NXCoreSetting::Is64BitProgram, true);
+
+    IOperatingSystem & operatingSystem = modules.OperatingSystem();
+
+    // Enable direct memory mapping in case of NCE.
+    uint64_t fastmem_base = 0;
+    if (g_settings->GetBool(NXCpuSetting::NceEnabled))
+    {
+        IDeviceMemory & buffer = operatingSystem.DeviceMemory();
+        buffer.EnableDirectMappedAddress();
+        fastmem_base = reinterpret_cast<uint64_t>(buffer.VirtualBasePointer());
+#if defined(__APPLE__)
+        if (fastmem_base == 0)
+        {
+            LOG_WARNING(Loader, "NCE address windows unavailable, falling back to Dynarmic before patching");
+            g_settings->SetBool(NXCpuSetting::NceEnabled, false);
+        }
+#endif
+    }
+
+#if defined(_M_ARM64) || defined(ARCHITECTURE_arm64)
+    const auto & code = codeset.CodeSegment();
 
     IPatchCollectionPtr patch_ctx(modules.Cpu().CreatePatchCollection(true));
     int32_t patch_index = -1;
@@ -240,14 +262,6 @@ static bool LoadNroImpl(Systemloader & loader, ISystemModules & modules, const s
     }
 #endif
 
-    IOperatingSystem & operatingSystem = modules.OperatingSystem();
-
-    // Enable direct memory mapping in case of NCE.
-    uint64_t fastmem_base = 0;
-    if (g_settings->GetBool(NXCpuSetting::NceEnabled)) {
-        UNIMPLEMENTED();
-    }
-
     uint64_t process_base = 0;
     if (!operatingSystem.SetupCurrentProcess(image_size, FileSys::ProgramMetadata::GetDefault(), fastmem_base, process_base, processID, false))
     {
@@ -257,7 +271,7 @@ static bool LoadNroImpl(Systemloader & loader, ISystemModules & modules, const s
 
     // Relocate code patch and copy to the program_image if running under NCE.
     // This needs to be after LoadFromMetadata so we can use the process entry point.
-#if defined(FIX_NCE) && (defined(_M_ARM64) || defined(ARCHITECTURE_arm64))
+#if defined(_M_ARM64) || defined(ARCHITECTURE_arm64)
     if (patch_ctx && patch_index >= 0 && g_settings->GetBool(NXCpuSetting::NceEnabled))
     {
         uint32_t reloc_size = static_cast<uint32_t>(program_image.size());

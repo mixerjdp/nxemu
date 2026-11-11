@@ -3,7 +3,9 @@
 
 #pragma once
 
+#include <chrono>
 #include <memory>
+#include <optional>
 #include <string>
 #include <variant>
 
@@ -11,6 +13,7 @@
 #include "yuzu_video_core/host1x/gpu_device_memory_manager.h"
 #include "yuzu_video_core/renderer_base.h"
 #include "yuzu_video_core/renderer_vulkan/vk_blit_screen.h"
+#include "yuzu_video_core/renderer_vulkan/vk_display.h"
 #include "yuzu_video_core/renderer_vulkan/vk_present_manager.h"
 #include "yuzu_video_core/renderer_vulkan/vk_rasterizer.h"
 #include "yuzu_video_core/renderer_vulkan/vk_scheduler.h"
@@ -57,9 +60,12 @@ class RendererVulkan final : public VideoCore::RendererBase {
     };
 
 public:
+    /// `display_` is the device to draw with and the window to present to;
+    /// it has to outlive the renderer.
     explicit RendererVulkan(Core::Frontend::EmuWindow& emu_window,
                             Tegra::MaxwellDeviceMemoryManager& device_memory_, Tegra::GPU& gpu_,
-                            std::unique_ptr<Core::Frontend::GraphicsContext> context_);
+                            std::unique_ptr<Core::Frontend::GraphicsContext> context_,
+                            Display& display_);
     ~RendererVulkan() override;
 
     void Composite(std::span<const Tegra::FramebufferConfig> framebuffers) override;
@@ -75,6 +81,7 @@ public:
     }
 
 private:
+    bool HoldIncompleteFrame();
     void InitializeWatermark();
     void CleanupWatermark();
     void RenderWatermark(Frame & frame);
@@ -92,19 +99,19 @@ private:
     Tegra::MaxwellDeviceMemoryManager& device_memory;
     Tegra::GPU& gpu;
     watermark_vk wm;
+    /// Start of the run of frames missing draws whose pipelines are still compiling
+    std::optional<std::chrono::steady_clock::time_point> incomplete_since;
+    /// Last time an image was drawn to for the first time, which marks a scene change
+    std::optional<std::chrono::steady_clock::time_point> last_new_render_target;
+    bool hold_incomplete = false;
+    bool presented_once = false;
 
-    std::shared_ptr<Common::DynamicLibrary> library;
-    vk::InstanceDispatch dld;
-
-    vk::Instance instance;
-    vk::DebugUtilsMessenger debug_messenger;
-    vk::SurfaceKHR surface;
-
-    Device device;
-    MemoryAllocator memory_allocator;
+    Display& display;
+    const Device& device;
+    MemoryAllocator& memory_allocator;
+    const Swapchain& swapchain;
     StateTracker state_tracker;
     Scheduler scheduler;
-    Swapchain swapchain;
     PresentManager present_manager;
     BlitScreen blit_swapchain;
     BlitScreen blit_capture;

@@ -16,6 +16,15 @@
     <CustomBuild Include="..\yuzu_video_core\host_shaders\convert_abgr8_to_d24s8.frag">
       <Filter>frag</Filter>
     </CustomBuild>
+    <CustomBuild Include="..\yuzu_video_core\host_shaders\convert_abgr8_to_d24s8_depth.frag">
+      <Filter>frag</Filter>
+    </CustomBuild>
+    <CustomBuild Include="..\yuzu_video_core\host_shaders\convert_abgr8_to_s8d24_depth.frag">
+      <Filter>frag</Filter>
+    </CustomBuild>
+    <CustomBuild Include="..\yuzu_video_core\host_shaders\convert_abgr8_to_s8d24.frag">
+      <Filter>frag</Filter>
+    </CustomBuild>
     <CustomBuild Include="..\yuzu_video_core\host_shaders\convert_abgr8_to_d32f.frag">
       <Filter>frag</Filter>
     </CustomBuild>
@@ -36,6 +45,42 @@
     </CustomBuild>
     <CustomBuild Include="..\yuzu_video_core\host_shaders\convert_non_msaa_to_msaa.comp">
       <Filter>comp</Filter>
+    </CustomBuild>
+    <CustomBuild Include="..\yuzu_video_core\host_shaders\blit_color_msaa.frag">
+      <Filter>frag</Filter>
+    </CustomBuild>
+    <CustomBuild Include="..\yuzu_video_core\host_shaders\blit_color_msaa_sint.frag">
+      <Filter>frag</Filter>
+    </CustomBuild>
+    <CustomBuild Include="..\yuzu_video_core\host_shaders\blit_color_msaa_uint.frag">
+      <Filter>frag</Filter>
+    </CustomBuild>
+    <CustomBuild Include="..\yuzu_video_core\host_shaders\blit_depth_msaa.frag">
+      <Filter>frag</Filter>
+    </CustomBuild>
+    <CustomBuild Include="..\yuzu_video_core\host_shaders\blit_depth_stencil_msaa.frag">
+      <Filter>frag</Filter>
+    </CustomBuild>
+    <CustomBuild Include="..\yuzu_video_core\host_shaders\convert_non_msaa_to_msaa.frag">
+      <Filter>frag</Filter>
+    </CustomBuild>
+    <CustomBuild Include="..\yuzu_video_core\host_shaders\convert_non_msaa_to_msaa_sint.frag">
+      <Filter>frag</Filter>
+    </CustomBuild>
+    <CustomBuild Include="..\yuzu_video_core\host_shaders\convert_non_msaa_to_msaa_uint.frag">
+      <Filter>frag</Filter>
+    </CustomBuild>
+    <CustomBuild Include="..\yuzu_video_core\host_shaders\convert_non_msaa_to_msaa_depth.frag">
+      <Filter>frag</Filter>
+    </CustomBuild>
+    <CustomBuild Include="..\yuzu_video_core\host_shaders\convert_non_msaa_to_msaa_depth_stencil.frag">
+      <Filter>frag</Filter>
+    </CustomBuild>
+    <CustomBuild Include="..\yuzu_video_core\host_shaders\convert_packed_depth_to_msaa.frag">
+      <Filter>frag</Filter>
+    </CustomBuild>
+    <CustomBuild Include="..\yuzu_video_core\host_shaders\convert_packed_depth_stencil_to_msaa.frag">
+      <Filter>frag</Filter>
     </CustomBuild>
     <CustomBuild Include="..\yuzu_video_core\host_shaders\convert_s8d24_to_abgr8.frag">
       <Filter>frag</Filter>
@@ -115,13 +160,28 @@
     <CustomBuild Include="..\yuzu_video_core\host_shaders\resolve_conditional_render.comp">
       <Filter>comp</Filter>
     </CustomBuild>
+    <CustomBuild Include="..\yuzu_video_core\host_shaders\vulkan_indirect_count.comp">
+      <Filter>comp</Filter>
+    </CustomBuild>
     <CustomBuild Include="..\yuzu_video_core\host_shaders\vulkan_quad_indexed.comp">
+      <Filter>comp</Filter>
+    </CustomBuild>
+    <CustomBuild Include="..\yuzu_video_core\host_shaders\vulkan_readback_delta.comp">
+      <Filter>comp</Filter>
+    </CustomBuild>
+    <CustomBuild Include="..\yuzu_video_core\host_shaders\vulkan_block_linear_unswizzle_2d_buffer.comp">
+      <Filter>comp</Filter>
+    </CustomBuild>
+    <CustomBuild Include="..\yuzu_video_core\host_shaders\vulkan_tracked_readback.comp">
       <Filter>comp</Filter>
     </CustomBuild>
     <CustomBuild Include="..\yuzu_video_core\host_shaders\vulkan_turbo_mode.comp">
       <Filter>comp</Filter>
     </CustomBuild>
     <CustomBuild Include="..\yuzu_video_core\host_shaders\vulkan_uint8.comp">
+      <Filter>comp</Filter>
+    </CustomBuild>
+    <CustomBuild Include="..\yuzu_video_core\host_shaders\vulkan_vtg_indirect.comp">
       <Filter>comp</Filter>
     </CustomBuild>
     <CustomBuild Include="..\yuzu_video_core\host_shaders\vulkan_color_clear.vert">
@@ -160,10 +220,61 @@
     <CustomBuild Include="..\yuzu_video_core\host_shaders\vulkan_color_clear.frag">
       <Filter>vulkan.frag</Filter>
     </CustomBuild>
+    <CustomBuild Include="..\yuzu_video_core\host_shaders\vulkan_color_clear_sint.frag">
+      <Filter>vulkan.frag</Filter>
+    </CustomBuild>
+    <CustomBuild Include="..\yuzu_video_core\host_shaders\vulkan_color_clear_uint.frag">
+      <Filter>vulkan.frag</Filter>
+    </CustomBuild>
     <CustomBuild Include="..\yuzu_video_core\host_shaders\vulkan_blit_depth_stencil.frag">
       <Filter>vulkan.frag</Filter>
     </CustomBuild>
     <CustomBuild Include="..\yuzu_video_core\host_shaders\opengl_smaa.glsl">
+      <Filter>glsl</Filter>
+    </CustomBuild>
+    <CustomBuild Include="..\yuzu_video_core\host_shaders\present_area.frag">
+      <Filter>frag</Filter>
+    </CustomBuild>
+    <CustomBuild Include="..\yuzu_video_core\host_shaders\present_catmull_rom.frag">
+      <Filter>frag</Filter>
+    </CustomBuild>
+    <CustomBuild Include="..\yuzu_video_core\host_shaders\opengl_present_cas.frag">
+      <Filter>frag</Filter>
+    </CustomBuild>
+    <CustomBuild Include="..\yuzu_video_core\host_shaders\vulkan_present_capture.frag">
+      <Filter>vulkan.frag</Filter>
+    </CustomBuild>
+    <CustomBuild Include="..\yuzu_video_core\host_shaders\vulkan_present_cas.frag">
+      <Filter>vulkan.frag</Filter>
+    </CustomBuild>
+    <CustomBuild Include="..\yuzu_video_core\host_shaders\vulkan_present_cas_quad.frag">
+      <Filter>vulkan.frag</Filter>
+    </CustomBuild>
+    <CustomBuild Include="..\yuzu_video_core\host_shaders\vulkan_present_cas_catmull.frag">
+      <Filter>vulkan.frag</Filter>
+    </CustomBuild>
+    <CustomBuild Include="..\yuzu_video_core\host_shaders\vulkan_present_cas_catmull_quad.frag">
+      <Filter>vulkan.frag</Filter>
+    </CustomBuild>
+    <CustomBuild Include="..\yuzu_video_core\host_shaders\vulkan_present_easu_fp16.frag">
+      <Filter>vulkan.frag</Filter>
+    </CustomBuild>
+    <CustomBuild Include="..\yuzu_video_core\host_shaders\vulkan_present_easu_fp32.frag">
+      <Filter>vulkan.frag</Filter>
+    </CustomBuild>
+    <CustomBuild Include="..\yuzu_video_core\host_shaders\vulkan_present_rcas_fp16.frag">
+      <Filter>vulkan.frag</Filter>
+    </CustomBuild>
+    <CustomBuild Include="..\yuzu_video_core\host_shaders\vulkan_present_rcas_fp32.frag">
+      <Filter>vulkan.frag</Filter>
+    </CustomBuild>
+    <CustomBuild Include="..\yuzu_video_core\host_shaders\vulkan_present_scaleforce_fast_fp16.frag">
+      <Filter>vulkan.frag</Filter>
+    </CustomBuild>
+    <CustomBuild Include="..\yuzu_video_core\host_shaders\vulkan_present_scaleforce_fast_fp32.frag">
+      <Filter>vulkan.frag</Filter>
+    </CustomBuild>
+    <CustomBuild Include="..\yuzu_video_core\host_shaders\catmull_rom.glsl">
       <Filter>glsl</Filter>
     </CustomBuild>
     <CustomBuild Include="..\3rd_party\fidelityfx_fsr\ffx-fsr\ffx_a.h">

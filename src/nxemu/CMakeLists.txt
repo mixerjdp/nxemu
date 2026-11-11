@@ -1,75 +1,28 @@
+option(NXEMU_MACOS_BUNDLE "Build NxEmu as a macOS application bundle" ON)
+
+# The interface derives from RmlUi's classes.
+nxemu_enable_rtti()
+
+add_subdirectory(ui)
+
+option(NXEMU_BUILD_UI_SETTINGS_TESTS "Test frontend settings after removing the legacy UI" OFF)
+if(NXEMU_BUILD_UI_SETTINGS_TESTS)
+    add_executable(nxemu_ui_settings_tests
+        settings/ui_settings_tests.cpp
+        settings/ui_settings.cpp)
+    target_include_directories(nxemu_ui_settings_tests PRIVATE "${CMAKE_SOURCE_DIR}/src")
+    target_link_libraries(nxemu_ui_settings_tests PRIVATE nxemu_core common yuzu_common)
+    add_test(NAME nxemu_ui_settings COMMAND nxemu_ui_settings_tests)
+    set_property(TEST nxemu_ui_settings APPEND PROPERTY LABELS linux_ci)
+endif()
+
+
 add_executable(nxemu
     main.cpp
     startup_checks.cpp
     startup_checks.h
     vulkan_probe.cpp
     vulkan_probe.h
-    settings/ui_settings.cpp
-    settings/ui_settings.h
-    settings/ui_identifiers.h
-    user_interface/about_dialog.cpp
-    user_interface/about_dialog.h
-    user_interface/discord_presence.cpp
-    user_interface/discord_presence.h
-    user_interface/game_list_worker.cpp
-    user_interface/game_list_worker.h
-    user_interface/hotkey_map.cpp
-    user_interface/hotkey_map.h
-    user_interface/html_utils.cpp
-    user_interface/html_utils.h
-    user_interface/key_mappings.cpp
-    user_interface/key_mappings.h
-    user_interface/notification.cpp
-    user_interface/notification.h
-    user_interface/app_events.h
-    user_interface/file_dialogs.cpp
-    user_interface/file_dialogs.h
-    user_interface/sciter_main_window.cpp
-    user_interface/sciter_main_window.h
-    user_interface/widgets/rom_browser.cpp
-    user_interface/widgets/rom_browser.h
-    user_interface/settings/config_setting.cpp
-    user_interface/settings/config_setting.h
-    user_interface/settings/game_config.cpp
-    user_interface/settings/game_config.h
-    user_interface/settings/game_config_addons.cpp
-    user_interface/settings/game_config_addons.h
-    user_interface/settings/input_config.cpp
-    user_interface/settings/input_config.h
-    user_interface/settings/input_config_player.cpp
-    user_interface/settings/input_config_player.h
-    user_interface/settings/profile_editor_dialog.cpp
-    user_interface/settings/profile_editor_dialog.h
-    user_interface/settings/profile_firmware_avatar_dialog.cpp
-    user_interface/settings/profile_firmware_avatar_dialog.h
-    user_interface/settings/profile_image_selector_dialog.cpp
-    user_interface/settings/profile_image_selector_dialog.h
-    user_interface/settings/system_config.cpp
-    user_interface/settings/system_config.h
-    user_interface/settings/system_config_audio.cpp
-    user_interface/settings/system_config_audio.h
-    user_interface/settings/system_config_game_browser.cpp
-    user_interface/settings/system_config_game_browser.h
-    user_interface/settings/system_config_general.cpp
-    user_interface/settings/system_config_general.h
-    user_interface/settings/system_config_graphics.cpp
-    user_interface/settings/system_config_graphics.h
-    user_interface/settings/system_config_hotkeys.cpp
-    user_interface/settings/system_config_hotkeys.h
-    user_interface/settings/system_config_input.cpp
-    user_interface/settings/system_config_input.h
-    user_interface/settings/system_config_logging.cpp
-    user_interface/settings/system_config_logging.h
-    user_interface/settings/system_config_profiles.cpp
-    user_interface/settings/system_config_profiles.h
-    user_interface/settings/system_config_system.cpp
-    user_interface/settings/system_config_system.h
-    user_interface/settings/system_config_system_tab.cpp
-    user_interface/settings/system_config_system_tab.h
-    applets/profile_select.cpp
-    applets/profile_select.h
-    applets/web_browser.cpp
-    applets/web_browser.h
 )
 
 target_include_directories(nxemu PRIVATE
@@ -80,46 +33,149 @@ target_include_directories(nxemu PRIVATE
     ${CMAKE_SOURCE_DIR}/src/common
     ${CMAKE_SOURCE_DIR}/src/yuzu_common
     ${CMAKE_SOURCE_DIR}/external/boost
-    ${CMAKE_SOURCE_DIR}/external/sciterui/include
 )
 
 if(UNIX)
     target_compile_definitions(nxemu PRIVATE NXEMU_UNIX=1)
 endif()
 
+if(WIN32)
+    # A windowed application: no console, and the icon and version details
+    # Explorer shows.
+    set_target_properties(nxemu PROPERTIES WIN32_EXECUTABLE TRUE)
+    target_sources(nxemu PRIVATE windows/nxemu.rc)
+endif()
+
 target_link_libraries(nxemu PRIVATE
-    sciterui
+    nxemu_ui
     common
     yuzu_common
     nxemu_core
-    discord-rpc
     fmt::fmt
     Vulkan::Headers
     Vulkan::UtilityHeaders
     ${CMAKE_DL_LIBS}
 )
 nxemu_set_app_output(nxemu)
-include(nxemu_setup_environment)
-nxemu_setup_environment(nxemu)
-
-# Runtime needs the Sciter engine beside the executable
-if(WIN32)
-    set(_nxemu_sciter_lib "${CMAKE_SOURCE_DIR}/external/sciterui/src/3rd_party/sciter-js-sdk-main/bin/windows.d2d/x64/sciter.dll")
-    set(_nxemu_sciter_dest "sciter.dll")
-elseif(APPLE)
-    set(_nxemu_sciter_lib "${CMAKE_SOURCE_DIR}/external/sciterui/src/3rd_party/sciter-js-sdk-main/bin/macosx/libsciter.dylib")
-    set(_nxemu_sciter_dest "libsciter.dylib")
-elseif(ARCHITECTURE_arm64)
-    set(_nxemu_sciter_lib "${CMAKE_SOURCE_DIR}/external/sciterui/src/3rd_party/sciter-js-sdk-main/bin/linux/arm64/libsciter.so")
-    set(_nxemu_sciter_dest "libsciter.so")
-else()
-    set(_nxemu_sciter_lib "${CMAKE_SOURCE_DIR}/external/sciterui/src/3rd_party/sciter-js-sdk-main/bin/linux/x64/libsciter.so")
-    set(_nxemu_sciter_dest "libsciter.so")
+add_dependencies(nxemu nxemu-loader nxemu-cpu nxemu-video nxemu-os)
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    # The bundled SDL is beside the executable.
+    set_property(TARGET nxemu APPEND PROPERTY BUILD_RPATH "$ORIGIN")
 endif()
 
-if(EXISTS "${_nxemu_sciter_lib}")
+set(_nxemu_ui_assets "${CMAKE_CURRENT_SOURCE_DIR}/ui/assets")
+# The catalogues at the root are shared with the Android build.
+set(_nxemu_lang_dir "${CMAKE_SOURCE_DIR}/lang")
+file(GLOB _nxemu_ui_catalogues CONFIGURE_DEPENDS "${_nxemu_lang_dir}/*.po")
+add_executable(ui_packer
+    ../ui_packer/ui_packer.cpp
+    ../ui_packer/pe_resource_dll.cpp)
+set(_nxemu_ui_pack "${CMAKE_CURRENT_BINARY_DIR}/nxemu.lang")
+file(GLOB_RECURSE _nxemu_ui_pack_inputs CONFIGURE_DEPENDS "${_nxemu_ui_assets}/*")
+add_custom_command(OUTPUT "${_nxemu_ui_pack}"
+    COMMAND $<TARGET_FILE:ui_packer> "${_nxemu_ui_assets}"
+        "${_nxemu_lang_dir}" "${_nxemu_ui_pack}"
+    DEPENDS ui_packer ${_nxemu_ui_pack_inputs} ${_nxemu_ui_catalogues}
+    VERBATIM)
+add_custom_target(nxemu_ui_pack DEPENDS "${_nxemu_ui_pack}")
+add_dependencies(nxemu nxemu_ui_pack)
+set_property(TARGET nxemu APPEND PROPERTY LINK_DEPENDS "${_nxemu_ui_pack}")
+# Updating a translation also refreshes the files beside the executable.
+set_property(TARGET nxemu APPEND PROPERTY LINK_DEPENDS ${_nxemu_ui_catalogues})
+
+if(APPLE)
+    if(NOT NXEMU_MOLTENVK_RUNTIME)
+        message(FATAL_ERROR "MoltenVK runtime was not configured")
+    endif()
+    if(TARGET nxemu_moltenvk)
+        add_dependencies(nxemu nxemu_moltenvk)
+    endif()
+endif()
+
+if(APPLE AND NXEMU_MACOS_BUNDLE)
+    set(_nxemu_icon "${CMAKE_CURRENT_SOURCE_DIR}/macos/nxemu.icns")
+    set_target_properties(nxemu PROPERTIES
+        MACOSX_BUNDLE TRUE
+        MACOSX_BUNDLE_INFO_PLIST "${CMAKE_CURRENT_SOURCE_DIR}/macos/Info.plist.in"
+        MACOSX_BUNDLE_GUI_IDENTIFIER "org.nxemu"
+        MACOSX_BUNDLE_BUNDLE_NAME "NxEmu"
+        MACOSX_BUNDLE_SHORT_VERSION_STRING "${VERSION_MAJOR}.${VERSION_MINOR}.${VERSION_REVISION}"
+        MACOSX_BUNDLE_BUNDLE_VERSION "${VERSION_BUILD}"
+        OUTPUT_NAME "NxEmu"
+        BUILD_RPATH "@executable_path/../Frameworks")
+    # Declare SDK 12.3: XNU then keeps x18 for the whole process, which native code execution
+    # needs (guest code uses it as a scratch register). The headers stay those of the build SDK.
+    target_link_options(nxemu PRIVATE "LINKER:-platform_version,macos,${CMAKE_OSX_DEPLOYMENT_TARGET},12.3")
+    find_program(NXEMU_CODESIGN codesign REQUIRED)
+    find_program(NXEMU_INSTALL_NAME_TOOL install_name_tool REQUIRED)
+    find_program(NXEMU_OTOOL otool REQUIRED)
+    set(_nxemu_bundle_script "${CMAKE_SOURCE_DIR}/src/cmake/modules/nxemu_macos_bundle.cmake")
+    set(_nxemu_bundle_command ${CMAKE_COMMAND}
+        "-DBUNDLE=$<TARGET_BUNDLE_DIR:nxemu>"
+        "-DEXECUTABLE=$<TARGET_FILE:nxemu>"
+        "-DLOADER=$<TARGET_FILE:nxemu-loader>"
+        "-DCPU=$<TARGET_FILE:nxemu-cpu>"
+        "-DVIDEO=$<TARGET_FILE:nxemu-video>"
+        "-DOS=$<TARGET_FILE:nxemu-os>"
+        "-DMOLTENVK=${NXEMU_MOLTENVK_RUNTIME}"
+        "-DSDL=$<TARGET_FILE:SDL3-shared>"
+        "-DASSETS=${_nxemu_ui_assets}"
+        "-DLANG_DIR=${_nxemu_lang_dir}"
+        "-DUI_PACK=${_nxemu_ui_pack}"
+        "-DMODS=${CMAKE_SOURCE_DIR}/external/nxemu-switch-mods"
+        "-DCODESIGN=${NXEMU_CODESIGN}"
+        "-DINSTALL_NAME_TOOL=${NXEMU_INSTALL_NAME_TOOL}"
+        "-DOTOOL=${NXEMU_OTOOL}"
+        "-DINFO_PLIST=${CMAKE_CURRENT_SOURCE_DIR}/macos/Info.plist.in"
+        "-DICON=${_nxemu_icon}"
+        "-DSHORT_VERSION=${VERSION_MAJOR}.${VERSION_MINOR}.${VERSION_REVISION}"
+        "-DBUILD_VERSION=${VERSION_BUILD}"
+        "-DMINIMUM_MACOS=${CMAKE_OSX_DEPLOYMENT_TARGET}"
+        -P "${_nxemu_bundle_script}")
+    # Module-only rebuilds must refresh the app even when its own code did not change.
+    # LINK_DEPENDS also covers an explicit --target nxemu build.
+    set_property(TARGET nxemu APPEND PROPERTY LINK_DEPENDS
+        "$<TARGET_FILE:nxemu-loader>" "$<TARGET_FILE:nxemu-cpu>"
+        "$<TARGET_FILE:nxemu-video>" "$<TARGET_FILE:nxemu-os>"
+        "${NXEMU_MOLTENVK_RUNTIME}" "${_nxemu_bundle_script}"
+        "${CMAKE_CURRENT_SOURCE_DIR}/macos/Info.plist.in" "${_nxemu_icon}")
     add_custom_command(TARGET nxemu POST_BUILD
-        COMMAND ${CMAKE_COMMAND} -E copy_if_different "${_nxemu_sciter_lib}" "$<TARGET_FILE_DIR:nxemu>/${_nxemu_sciter_dest}"
-        COMMENT "Copy Sciter engine next to nxemu"
-    )
+        COMMAND ${_nxemu_bundle_command} VERBATIM
+        COMMENT "Package and sign NxEmu.app with this build's modules")
+    add_custom_target(nxemu_bundle ALL
+        COMMAND ${_nxemu_bundle_command}
+        DEPENDS nxemu
+        VERBATIM
+        COMMENT "Refresh NxEmu.app modules and interface files")
+else()
+    add_custom_command(TARGET nxemu POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different "${_nxemu_ui_pack}" "$<TARGET_FILE_DIR:nxemu>/nxemu.lang"
+        VERBATIM)
+    include(nxemu_setup_environment)
+    nxemu_setup_environment(nxemu)
+    foreach(_module nxemu-loader nxemu-cpu nxemu-video nxemu-os)
+        if(_module STREQUAL "nxemu-os")
+            set(_folder operating_system)
+        else()
+            string(REPLACE "nxemu-" "" _folder "${_module}")
+        endif()
+        set_property(TARGET nxemu APPEND PROPERTY LINK_DEPENDS "$<TARGET_FILE:${_module}>")
+        add_custom_command(TARGET nxemu POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E make_directory "$<TARGET_FILE_DIR:nxemu>/modules/${_folder}"
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                "$<TARGET_FILE:${_module}>" "$<TARGET_FILE_DIR:nxemu>/modules/${_folder}"
+            VERBATIM)
+    endforeach()
+    # The interface's documents, fonts and images ship beside the executable.
+    add_custom_command(TARGET nxemu POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_directory "${_nxemu_ui_assets}" "$<TARGET_FILE_DIR:nxemu>/ui"
+        COMMAND ${CMAKE_COMMAND} -E make_directory "$<TARGET_FILE_DIR:nxemu>/ui/lang"
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different ${_nxemu_ui_catalogues} "$<TARGET_FILE_DIR:nxemu>/ui/lang"
+        VERBATIM)
+    if(APPLE)
+        add_custom_command(TARGET nxemu POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                "${NXEMU_MOLTENVK_RUNTIME}" "$<TARGET_FILE_DIR:nxemu>/libMoltenVK.dylib"
+            VERBATIM)
+    endif()
 endif()

@@ -12,6 +12,13 @@ enum class EmulationState : int32_t
     Stopping,
 };
 
+enum class GpuInitializationState : int32_t
+{
+    Preparing,
+    Ready,
+    Failed,
+};
+
 namespace NXCoreSetting
 {
 constexpr const char * AppBaseDirectory = "nxcore:AppBaseDirectory";
@@ -19,6 +26,7 @@ constexpr const char * AppDirectory = "nxcore:AppDirectory";
 constexpr const char * ConfigFile = "nxcore:ConfigFile";
 constexpr const char * GameFile = "nxcore:GameFile";
 constexpr const char * GameName = "nxcore:GameName";
+constexpr const char * GameTitleId = "nxcore:GameTitleId";
 constexpr const char * ModuleDirectory = "nxcore:ModuleDirectory";
 constexpr const char * ModuleLoader = "nxcore:ModuleLoader";
 constexpr const char * ModuleCpu = "nxcore:ModuleCpu";
@@ -26,10 +34,16 @@ constexpr const char * ModuleVideo = "nxcore:ModuleVideo";
 constexpr const char * ModuleOs = "nxcore:ModuleOs";
 constexpr const char * ShowLogConsole = "nxcore:ShowLogConsole";
 constexpr const char * LogFilter = "nxcore:LogFilter";
+constexpr const char * DebugSettingsEnabled = "nxcore:DebugSettingsEnabled";
 constexpr const char * EmulationRunning = "nxcore:EmulationRunning";
 constexpr const char * EmulationState = "nxcore:EmulationState";
+constexpr const char * GameLoadResult = "nxcore:GameLoadResult";
 constexpr const char * Has39BitAddressSpace = "nxcore:Has39BitAddressSpace";
+constexpr const char * Has36BitAddressSpace = "nxcore:Has36BitAddressSpace";
+constexpr const char * Is64BitProgram = "nxcore:Is64BitProgram";
 constexpr const char * DisplayedFrames = "nxcore:DisplayedFrames";
+// Runtime-only readiness state; never a configurable user preference.
+constexpr const char * GpuInitializationState = "nxcore:GpuInitializationState";
 constexpr const char * ShuttingDown = "nxcore:ShuttingDown";
 constexpr const char * DiskCacheLoadStage = "nxcore:DiskCacheLoadStage";
 constexpr const char * DiskCacheLoadCurrent = "nxcore:DiskCacheLoadCurrent";
@@ -39,5 +53,6 @@ constexpr const char * GpuHookLibDir = "nxcore:GpuHookLibDir";
 constexpr const char * GpuCustomDriverDir = "nxcore:GpuCustomDriverDir";
 constexpr const char * GpuCustomDriverName = "nxcore:GpuCustomDriverName";
 constexpr const char * GpuFileRedirectDir = "nxcore:GpuFileRedirectDir";
+constexpr const char * SystemLanguageIndex = "nxcore:SystemLanguageIndex";
 
 } // namespace NXCoreSetting

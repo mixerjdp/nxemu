@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <span>
+#include <string_view>
 #include <tuple>
 #include <type_traits>
 #include <utility>
@@ -13,6 +14,7 @@
 #include "yuzu_shader_recompiler/backend/spirv/emit_spirv_instructions.h"
 #include "yuzu_shader_recompiler/backend/spirv/spirv_emit_context.h"
 #include "yuzu_shader_recompiler/frontend/ir/basic_block.h"
+#include "yuzu_shader_recompiler/frontend/ir/modifiers.h"
 #include "yuzu_shader_recompiler/frontend/ir/program.h"
 
 namespace Shader::Backend::SPIRV {
@@ -96,7 +98,112 @@ void Invoke(EmitContext& ctx, IR::Inst* inst) {
     }
 }
 
-void EmitInst(EmitContext& ctx, IR::Inst* inst) {
+/// Bytes a storage buffer instruction writes, or zero when it writes none
+u32 StorageWriteSize(IR::Opcode opcode) {
+    const std::string_view name{IR::NameOf(opcode)};
+    if (!name.starts_with("WriteStorage") && !name.starts_with("StorageAtomic")) {
+        return 0;
+    }
+    if (name.ends_with("128")) {
+        return 16;
+    }
+    if (name.ends_with("64") || name.ends_with("32x2")) {
+        return 8;
+    }
+    if (name.ends_with("U16") || name.ends_with("S16")) {
+        return 2;
+    }
+    if (name.ends_with("U8") || name.ends_with("S8")) {
+        return 1;
+    }
+    return 4;
+}
+
+bool IsImageWrite(IR::Opcode opcode) {
+    const std::string_view name{IR::NameOf(opcode)};
+    return name.starts_with("ImageWrite") || name.starts_with("ImageAtomic");
+}
+
+/// Stores whose destination is not a written storage or image buffer of the shader
+bool IsUntrackedWrite(IR::Opcode opcode) {
+    const std::string_view name{IR::NameOf(opcode)};
+    return name.starts_with("WriteGlobal") || name.starts_with("GlobalAtomic") ||
+           name.starts_with("BindlessImageWrite") || name.starts_with("BindlessImageAtomic") ||
+           name.starts_with("BoundImageWrite") || name.starts_with("BoundImageAtomic");
+}
+
+/// Slots of written buffers in descriptor order, or zero when a store cannot be attributed
+u32 WriteTrackingSlots(const Profile& profile, const IR::Program& program) {
+    const Info& info{program.info};
+    if (!profile.track_storage_writes || !profile.unified_descriptor_binding ||
+        program.stage != Stage::Compute) {
+        return 0;
+    }
+    // One slot per written descriptor: the host binds the elements of an array one by one
+    u32 slots{};
+    for (const auto& desc : info.storage_buffers_descriptors) {
+        if (desc.is_written && desc.count != 1) {
+            return 0;
+        }
+        slots += desc.is_written ? 1U : 0U;
+    }
+    for (const auto& desc : info.image_buffer_descriptors) {
+        if (desc.is_written && desc.count != 1) {
+            return 0;
+        }
+        slots += desc.is_written ? 1U : 0U;
+    }
+    if (slots == 0 || slots > MAX_WRITE_TRACK_SLOTS) {
+        return 0;
+    }
+    for (IR::Block* const block : program.post_order_blocks) {
+        for (const IR::Inst& inst : block->Instructions()) {
+            const IR::Opcode opcode{inst.GetOpcode()};
+            if (IsUntrackedWrite(opcode)) {
+                return 0;
+            }
+            if (StorageWriteSize(opcode) != 0) {
+                const IR::Value binding{inst.Arg(0)};
+                if (!binding.IsImmediate() ||
+                    binding.U32() >= info.storage_buffers_descriptors.size() ||
+                    !info.storage_buffers_descriptors[binding.U32()].is_written) {
+                    return 0;
+                }
+            } else if (IsImageWrite(opcode)) {
+                const auto flags{inst.Flags<IR::TextureInstInfo>()};
+                if (flags.type == TextureType::Buffer &&
+                    (flags.descriptor_index >= info.image_buffer_descriptors.size() ||
+                     !info.image_buffer_descriptors[flags.descriptor_index].is_written)) {
+                    return 0;
+                }
+            }
+        }
+    }
+    return slots;
+}
+
+void TrackWrite(EmitContext& ctx, IR::Inst* inst) {
+    const IR::Opcode opcode{inst->GetOpcode()};
+    if (const u32 size{StorageWriteSize(opcode)}; size != 0) {
+        const u32 slot{ctx.ssbo_write_slots[inst->Arg(0).U32()]};
+        ctx.OpFunctionCall(ctx.void_id, ctx.track_write_func, ctx.Const(slot),
+                           ctx.Def(inst->Arg(1)), ctx.Const(size));
+    } else if (IsImageWrite(opcode)) {
+        const auto flags{inst->Flags<IR::TextureInstInfo>()};
+        if (flags.type != TextureType::Buffer) {
+            return;
+        }
+        // Texel coordinates, relative to the range the guest bound
+        const u32 slot{ctx.image_buffer_write_slots[flags.descriptor_index]};
+        ctx.OpFunctionCall(ctx.void_id, ctx.track_write_func, ctx.Const(slot),
+                           ctx.Def(inst->Arg(1)), ctx.Const(1U));
+    }
+}
+
+void EmitInst(EmitContext& ctx, IR::Inst* inst) try {
+    if (Sirit::ValidId(ctx.track_write_func)) {
+        TrackWrite(ctx, inst);
+    }
     switch (inst->GetOpcode()) {
 #define OPCODE(name, result_type, ...)                                                             \
     case IR::Opcode::name:                                                                         \
@@ -105,17 +212,83 @@ void EmitInst(EmitContext& ctx, IR::Inst* inst) {
 #undef OPCODE
     }
     throw LogicError("Invalid opcode {}", inst->GetOpcode());
+} catch (Exception& exception) {
+    exception.Prepend(fmt::format("SPIR-V opcode {}: ", inst->GetOpcode()));
+    throw;
 }
 
 Id TypeId(const EmitContext& ctx, IR::Type type) {
+    Id id{};
     switch (type) {
     case IR::Type::U1:
-        return ctx.U1;
+        id = ctx.U1;
+        break;
+    case IR::Type::U8:
+        id = ctx.U8;
+        break;
+    case IR::Type::U16:
+        id = ctx.U16;
+        break;
     case IR::Type::U32:
-        return ctx.U32[1];
+        id = ctx.U32[1];
+        break;
+    case IR::Type::U64:
+        id = ctx.U64;
+        break;
+    case IR::Type::F16:
+        id = ctx.F16[1];
+        break;
+    case IR::Type::F32:
+        id = ctx.F32[1];
+        break;
+    case IR::Type::F64:
+        id = ctx.F64[1];
+        break;
+    case IR::Type::U32x2:
+        id = ctx.U32[2];
+        break;
+    case IR::Type::U32x3:
+        id = ctx.U32[3];
+        break;
+    case IR::Type::U32x4:
+        id = ctx.U32[4];
+        break;
+    case IR::Type::F16x2:
+        id = ctx.F16[2];
+        break;
+    case IR::Type::F16x3:
+        id = ctx.F16[3];
+        break;
+    case IR::Type::F16x4:
+        id = ctx.F16[4];
+        break;
+    case IR::Type::F32x2:
+        id = ctx.F32[2];
+        break;
+    case IR::Type::F32x3:
+        id = ctx.F32[3];
+        break;
+    case IR::Type::F32x4:
+        id = ctx.F32[4];
+        break;
+    case IR::Type::F64x2:
+        id = ctx.F64[2];
+        break;
+    case IR::Type::F64x3:
+        id = ctx.F64[3];
+        break;
+    case IR::Type::F64x4:
+        id = ctx.F64[4];
+        break;
     default:
         throw NotImplementedException("Phi node type {}", type);
     }
+    // Int8/16/64 and floating-point capabilities are conditional. An absent
+    // SPIR-V type id must not silently emit a malformed OpPhi instruction.
+    if (!Sirit::ValidId(id)) {
+        throw NotImplementedException("Phi node type {} is unavailable on this device", type);
+    }
+    return id;
 }
 
 void Traverse(EmitContext& ctx, IR::Program& program) {
@@ -327,6 +500,44 @@ void DefineEntryPoint(const IR::Program& program, EmitContext& ctx, Id main) {
     ctx.AddEntryPoint(execution_model, main, "main", interfaces);
 }
 
+enum class Fp16DenormMode { Default, Flush, Preserve };
+
+struct Fp16DenormPlan {
+    Fp16DenormMode mode{Fp16DenormMode::Default};
+    bool emulate_conversions{};
+};
+
+// Choose the fp16 denorm execution mode, and whether fp16 <-> fp32 conversions must rebuild
+// denormals themselves because that mode cannot keep them.
+Fp16DenormPlan PlanFp16Denorms(const Profile& profile, const Info& info) {
+    Fp16DenormPlan plan{};
+    const bool modes_usable{profile.support_float_controls &&
+                            profile.support_separate_denorm_behavior &&
+                            !profile.has_broken_fp16_float_controls};
+    if (modes_usable) {
+        const bool wants_preserve{info.uses_fp16_denorms_preserve ||
+                                  info.uses_fp16_denorm_conversions};
+        if (info.uses_fp16_denorms_flush && info.uses_fp16_denorms_preserve) {
+            LOG_DEBUG(Shader_SPIRV, "Fp16 denorm flush and preserve on the same shader");
+        } else if (info.uses_fp16_denorms_flush) {
+            if (profile.support_fp16_denorm_flush) {
+                plan.mode = Fp16DenormMode::Flush;
+            }
+        } else if (wants_preserve) {
+            if (profile.support_fp16_denorm_preserve) {
+                plan.mode = Fp16DenormMode::Preserve;
+            } else if (info.uses_fp16_denorms_preserve) {
+                LOG_DEBUG(Shader_SPIRV, "Fp16 denorm preserve used in shader without host support");
+            }
+        }
+    }
+    // NVIDIA cannot use fp16 float controls, but its hardware always keeps fp16 denormals.
+    plan.emulate_conversions = info.uses_fp16_denorm_conversions &&
+                               plan.mode != Fp16DenormMode::Preserve &&
+                               !profile.has_broken_fp16_float_controls;
+    return plan;
+}
+
 void SetupDenormControl(const Profile& profile, const IR::Program& program, EmitContext& ctx,
                         Id main_func) {
     const Info& info{program.info};
@@ -347,26 +558,17 @@ void SetupDenormControl(const Profile& profile, const IR::Program& program, Emit
             LOG_DEBUG(Shader_SPIRV, "Fp32 denorm preserve used in shader without host support");
         }
     }
-    if (!profile.support_separate_denorm_behavior || profile.has_broken_fp16_float_controls) {
-        // No separate denorm behavior
-        return;
-    }
-    if (info.uses_fp16_denorms_flush && info.uses_fp16_denorms_preserve) {
-        LOG_DEBUG(Shader_SPIRV, "Fp16 denorm flush and preserve on the same shader");
-    } else if (info.uses_fp16_denorms_flush) {
-        if (profile.support_fp16_denorm_flush) {
-            ctx.AddCapability(spv::Capability::DenormFlushToZero);
-            ctx.AddExecutionMode(main_func, spv::ExecutionMode::DenormFlushToZero, 16U);
-        } else {
-            // Same as fp32, no need to warn as most drivers will flush by default
-        }
-    } else if (info.uses_fp16_denorms_preserve) {
-        if (profile.support_fp16_denorm_preserve) {
-            ctx.AddCapability(spv::Capability::DenormPreserve);
-            ctx.AddExecutionMode(main_func, spv::ExecutionMode::DenormPreserve, 16U);
-        } else {
-            LOG_DEBUG(Shader_SPIRV, "Fp16 denorm preserve used in shader without host support");
-        }
+    switch (PlanFp16Denorms(profile, info).mode) {
+    case Fp16DenormMode::Default:
+        break;
+    case Fp16DenormMode::Flush:
+        ctx.AddCapability(spv::Capability::DenormFlushToZero);
+        ctx.AddExecutionMode(main_func, spv::ExecutionMode::DenormFlushToZero, 16U);
+        break;
+    case Fp16DenormMode::Preserve:
+        ctx.AddCapability(spv::Capability::DenormPreserve);
+        ctx.AddExecutionMode(main_func, spv::ExecutionMode::DenormPreserve, 16U);
+        break;
     }
 }
 
@@ -398,6 +600,27 @@ void SetupTransformFeedbackCapabilities(EmitContext& ctx, Id main_func) {
 }
 
 void SetupCapabilities(const Profile& profile, const Info& info, EmitContext& ctx) {
+    if (ctx.uses_nonuniform_storage_image) {
+        if (profile.supported_spirv < 0x00010500) {
+            ctx.AddExtension("SPV_EXT_descriptor_indexing");
+        }
+        ctx.AddCapability(spv::Capability::ShaderNonUniform);
+        ctx.AddCapability(spv::Capability::StorageImageArrayNonUniformIndexing);
+    }
+    if (ctx.uses_nonuniform_sampled_image) {
+        if (profile.supported_spirv < 0x00010500) {
+            ctx.AddExtension("SPV_EXT_descriptor_indexing");
+        }
+        ctx.AddCapability(spv::Capability::ShaderNonUniform);
+        ctx.AddCapability(spv::Capability::SampledImageArrayNonUniformIndexing);
+    }
+    if (ctx.uses_nonuniform_uniform_texel_buffer) {
+        if (profile.supported_spirv < 0x00010500) {
+            ctx.AddExtension("SPV_EXT_descriptor_indexing");
+        }
+        ctx.AddCapability(spv::Capability::ShaderNonUniform);
+        ctx.AddCapability(spv::Capability::UniformTexelBufferArrayNonUniformIndexing);
+    }
     if (info.uses_sampled_1d) {
         ctx.AddCapability(spv::Capability::Sampled1D);
     }
@@ -430,7 +653,7 @@ void SetupCapabilities(const Profile& profile, const Info& info, EmitContext& ct
     }
     if ((info.uses_subgroup_vote || info.uses_subgroup_invocation_id ||
          info.uses_subgroup_shuffles) &&
-        profile.support_vote) {
+        profile.support_vote && !ctx.single_lane_subgroup) {
         ctx.AddCapability(spv::Capability::GroupNonUniformBallot);
         ctx.AddCapability(spv::Capability::GroupNonUniformShuffle);
         if (!profile.warp_size_potentially_larger_than_guest) {
@@ -483,7 +706,9 @@ void PatchPhiNodes(IR::Program& program, EmitContext& ctx) {
 
 std::vector<u32> EmitSPIRV(const Profile& profile, const RuntimeInfo& runtime_info,
                            IR::Program& program, Bindings& bindings) {
+    program.info.write_tracking_slots = WriteTrackingSlots(profile, program);
     EmitContext ctx{profile, runtime_info, program, bindings};
+    ctx.emulate_fp16_denormals = PlanFp16Denorms(profile, program.info).emulate_conversions;
     const Id main{DefineMain(ctx, program)};
     DefineEntryPoint(program, ctx, main);
     if (profile.support_float_controls) {

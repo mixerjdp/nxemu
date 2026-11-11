@@ -3,6 +3,7 @@
 
 #include "yuzu_shader_recompiler/backend/spirv/emit_spirv.h"
 #include "yuzu_shader_recompiler/backend/spirv/emit_spirv_instructions.h"
+#include "yuzu_shader_recompiler/alpha_to_coverage_dither.h"
 #include "yuzu_shader_recompiler/backend/spirv/spirv_emit_context.h"
 
 namespace Shader::Backend::SPIRV {
@@ -72,6 +73,11 @@ void AlphaTest(EmitContext& ctx) {
     if (!Sirit::ValidId(ctx.frag_color[0])) {
         return;
     }
+    // The alpha test does not apply to integer color outputs.
+    const AttributeType output_type{ctx.runtime_info.color_output_types[0]};
+    if (output_type == AttributeType::SignedInt || output_type == AttributeType::UnsignedInt) {
+        return;
+    }
 
     const Id type{ctx.F32[1]};
     const Id rt0_color{ctx.OpLoad(ctx.F32[4], ctx.frag_color[0])};
@@ -88,9 +94,62 @@ void AlphaTest(EmitContext& ctx) {
     ctx.OpKill();
     ctx.AddLabel(true_label);
 }
+
+void AlphaToCoverageDither(EmitContext& ctx) {
+    if (!ctx.alpha_to_coverage_dither || !Sirit::ValidId(ctx.frag_color[0]) ||
+        !Sirit::ValidId(ctx.input_position)) {
+        return;
+    }
+    const AttributeType output_type{ctx.runtime_info.color_output_types[0]};
+    if (output_type == AttributeType::SignedInt || output_type == AttributeType::UnsignedInt) {
+        return;
+    }
+    const Id f32{ctx.F32[1]};
+    const Id rt0_color{ctx.OpLoad(ctx.F32[4], ctx.frag_color[0])};
+    const Id raw_alpha{ctx.OpCompositeExtract(f32, rt0_color, 3u)};
+    // Raw host FragCoord stays at single-pixel granularity at every resolution scale.
+    // Do not use the guest-scaled Position attributes or a temporal/jitter seed.
+    const Id frag_coord{ctx.OpLoad(ctx.F32[4], ctx.input_position)};
+    const Id x{ctx.OpCompositeExtract(f32, frag_coord, 0u)};
+    const Id y{ctx.OpCompositeExtract(f32, frag_coord, 1u)};
+    const Id nx{ctx.OpFMul(f32, x, ctx.Const(IGN_X))};
+    const Id ny{ctx.OpFMul(f32, y, ctx.Const(IGN_Y))};
+    const Id gradient{ctx.OpFAdd(f32, nx, ny)};
+    const Id value{ctx.OpFMul(f32, ctx.OpFract(f32, gradient), ctx.Const(IGN_MULTIPLIER))};
+    // Keep the threshold deterministic across compiler contraction choices.
+    for (const Id id : {nx, ny, gradient, value}) {
+        ctx.Decorate(id, spv::Decoration::NoContraction);
+    }
+    const Id noise{ctx.OpFract(f32, value)};
+    const Id keep{ctx.OpFOrdGreaterThan(ctx.U1, raw_alpha, noise)};
+
+    const Id keep_label{ctx.OpLabel()};
+    const Id discard_label{ctx.OpLabel()};
+    ctx.OpSelectionMerge(keep_label, spv::SelectionControlMask::MaskNone);
+    ctx.OpBranchConditional(keep, keep_label, discard_label);
+    ctx.AddLabel(discard_label);
+    ctx.OpKill();
+    ctx.AddLabel(keep_label);
+}
 } // Anonymous namespace
 
 void EmitPrologue(EmitContext& ctx) {
+    if (ctx.stage == Stage::Fragment && ctx.runtime_info.dual_source_blend &&
+        Sirit::ValidId(ctx.frag_color[1])) {
+        // Vulkan leaves the secondary blend source undefined when it is not written.
+        Id type{ctx.F32[4]};
+        switch (ctx.runtime_info.color_output_types[0]) {
+        case AttributeType::SignedInt:
+            type = ctx.S32[4];
+            break;
+        case AttributeType::UnsignedInt:
+            type = ctx.U32[4];
+            break;
+        default:
+            break;
+        }
+        ctx.OpStore(ctx.frag_color[1], ctx.ConstantNull(type));
+    }
     if (ctx.stage == Stage::VertexB) {
         const Id zero{ctx.Const(0.0f)};
         const Id one{ctx.Const(1.0f)};
@@ -120,8 +179,12 @@ void EmitEpilogue(EmitContext& ctx) {
         !ctx.profile.support_native_ndc) {
         ConvertDepthMode(ctx);
     }
+    if (ctx.stage == Stage::VertexB && ctx.runtime_info.forwarded_layer_attribute) {
+        EmitForwardLayer(ctx, *ctx.runtime_info.forwarded_layer_attribute);
+    }
     if (ctx.stage == Stage::Fragment) {
         AlphaTest(ctx);
+        AlphaToCoverageDither(ctx);
     }
 }
 
@@ -130,7 +193,11 @@ void EmitEmitVertex(EmitContext& ctx, const IR::Value& stream) {
         ConvertDepthMode(ctx);
     }
     if (!ctx.profile.support_geometry_streams) {
-        throw NotImplementedException("Geometry streams");
+        // The non-stream instructions are exactly stream 0 and need no GeometryStreams capability
+        if (!stream.IsImmediate() || stream.U32() != 0) {
+            throw NotImplementedException("Geometry streams");
+        }
+        ctx.OpEmitVertex();
     } else if (stream.IsImmediate()) {
         ctx.OpEmitStreamVertex(ctx.Def(stream));
     } else {
@@ -143,7 +210,10 @@ void EmitEmitVertex(EmitContext& ctx, const IR::Value& stream) {
 
 void EmitEndPrimitive(EmitContext& ctx, const IR::Value& stream) {
     if (!ctx.profile.support_geometry_streams) {
-        throw NotImplementedException("Geometry streams");
+        if (!stream.IsImmediate() || stream.U32() != 0) {
+            throw NotImplementedException("Geometry streams");
+        }
+        ctx.OpEndPrimitive();
     } else if (stream.IsImmediate()) {
         ctx.OpEndStreamPrimitive(ctx.Def(stream));
     } else {

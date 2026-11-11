@@ -3,6 +3,8 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cstdio>
+#include <cstdlib>
 #include <iterator>
 #include <mutex>
 #include <numeric>
@@ -76,6 +78,27 @@ void PerfStats::EndSystemFrame() {
 
 void PerfStats::EndGameFrame() {
     game_frames.fetch_add(1, std::memory_order_relaxed);
+    if (!measure_game_frames.load(std::memory_order_relaxed)) {
+        return;
+    }
+
+    const Clock::rep now = Clock::now().time_since_epoch().count();
+    const Clock::rep previous = last_game_frame.exchange(now, std::memory_order_relaxed);
+    if (previous == 0) {
+        return;
+    }
+    const Clock::rep length = now - previous;
+    Clock::rep longest = longest_game_frame.load(std::memory_order_relaxed);
+    while (length > longest &&
+           !longest_game_frame.compare_exchange_weak(longest, length, std::memory_order_relaxed)) {
+    }
+}
+
+void PerfStats::MeasureGameFrames(bool measure) {
+    if (measure_game_frames.exchange(measure, std::memory_order_relaxed) != measure) {
+        last_game_frame.store(0, std::memory_order_relaxed);
+        longest_game_frame.store(0, std::memory_order_relaxed);
+    }
 }
 
 double PerfStats::GetMeanFrametime() const {
@@ -100,13 +123,26 @@ PerfStatsResults PerfStats::GetAndResetStats(microseconds current_system_time_us
     const auto system_us_per_second = (current_system_time_us - reset_point_system_us) / interval;
     const auto current_frames = static_cast<double>(game_frames.load(std::memory_order_relaxed));
     const auto current_fps = current_frames / interval;
+    const Clock::rep last_frame = last_game_frame.load(std::memory_order_relaxed);
+    const Clock::duration longest_frame{
+        std::max(longest_game_frame.exchange(0, std::memory_order_relaxed),
+                 last_frame != 0 ? now.time_since_epoch().count() - last_frame : Clock::rep{0})};
     const PerfStatsResults results{
         .system_fps = static_cast<double>(system_frames) / interval,
         .average_game_fps = (current_fps + previous_fps) / 2.0,
         .frametime = duration_cast<DoubleSecs>(accumulated_frametime).count() /
                      static_cast<double>(system_frames),
         .emulation_speed = system_us_per_second.count() / 1'000'000.0,
+        .longest_game_frame = duration_cast<DoubleSecs>(longest_frame).count(),
     };
+
+    // Temporary opt-in measurement alongside the NCE readback trace.
+    static const bool profile = std::getenv("NXEMU_NCE_READBACK_PROFILE") != nullptr;
+    if (profile) {
+        std::fprintf(stderr, "[NCE-FPS] interval=%.6f frames=%.0f fps=%.3f system_fps=%.3f longest_ms=%.3f at_s=%.6f\n",
+                     interval, current_frames, current_fps, results.system_fps,
+                     results.longest_game_frame * 1000.0, duration_cast<DoubleSecs>(now.time_since_epoch()).count());
+    }
 
     // Reset counters
     reset_point = now;

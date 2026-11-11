@@ -29,7 +29,6 @@ IF %ERRORLEVEL% NEQ 0 GOTO EndErr
 
 rd "%base_dir%\bin\package" /Q /S > NUL 2>&1
 md "%base_dir%\bin\package\"
-md "%base_dir%\bin\package\lang\"
 md "%base_dir%\bin\package\user\"
 md "%base_dir%\bin\package\modules\"
 md "%base_dir%\bin\package\modules\cpu\"
@@ -39,16 +38,23 @@ md "%base_dir%\bin\package\modules\video\"
 )
 
 copy "%base_dir%\bin\%VSPlatform%\Release\user\portable.txt" "%base_dir%\bin\package\user"
-copy "%base_dir%\bin\%VSPlatform%\Release\sciter.dll" "%base_dir%\bin\package"
 copy "%base_dir%\bin\%VSPlatform%\Release\nxemu.exe" "%base_dir%\bin\package"
+copy "%base_dir%\bin\%VSPlatform%\Release\SDL3.dll" "%base_dir%\bin\package"
 copy "%base_dir%\modules\%VSPlatform%\cpu\nxemu-cpu.dll" "%base_dir%\bin\package\modules\cpu"
 copy "%base_dir%\modules\%VSPlatform%\loader\nxemu-loader.dll" "%base_dir%\bin\package\modules\loader"
 copy "%base_dir%\modules\%VSPlatform%\operating_system\nxemu-os.dll" "%base_dir%\bin\package\modules\operating_system"
 copy "%base_dir%\modules\%VSPlatform%\video\nxemu-video.dll" "%base_dir%\bin\package\modules\video"
 
-:: Language
-echo packaging languages
-"%base_dir%\bin\%VSPlatform%\Release\resource_packer.exe" "%base_dir%\lang\english" "%base_dir%\bin\package\lang\english.lang"
+echo packaging mods
+rem The mods that ship with NXEmu: the game folders of external/nxemu-switch-mods ("<Game name> [<title id>]"), with their licenses
+md "%base_dir%\bin\package\mods\"
+for /d %%d in ("%base_dir%\external\nxemu-switch-mods\*") do (
+	echo %%~nxd| findstr /R /C:"\]$" >nul && xcopy /E /I /Q /Y "%%d" "%base_dir%\bin\package\mods\%%~nxd" >nul
+)
+
+echo packaging interface
+"%base_dir%\bin\%VSPlatform%\Release\ui_packer.exe" "%base_dir%\src\nxemu\ui\assets" "%base_dir%\lang" "%base_dir%\bin\package\nxemu.lang"
+IF %ERRORLEVEL% NEQ 0 GOTO EndErr
 
 cd %base_dir%\bin\package
 "%zip%" a -tzip -r "%base_dir%\package\%ZipFileName%" *

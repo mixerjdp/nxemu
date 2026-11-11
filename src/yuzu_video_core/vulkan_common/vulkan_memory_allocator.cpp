@@ -230,9 +230,11 @@ MemoryAllocator::MemoryAllocator(const Device& device_)
 
 MemoryAllocator::~MemoryAllocator() = default;
 
-vk::Image MemoryAllocator::CreateImage(const VkImageCreateInfo& ci) const {
+vk::Image MemoryAllocator::CreateImage(const VkImageCreateInfo& ci, bool dedicated) const {
+    const auto image_allocator = device.GetImageAllocator();
     const VmaAllocationCreateInfo alloc_ci = {
-        .flags = VMA_ALLOCATION_CREATE_WITHIN_BUDGET_BIT,
+        .flags = VMA_ALLOCATION_CREATE_WITHIN_BUDGET_BIT |
+                 (dedicated ? VMA_ALLOCATION_CREATE_DEDICATED_MEMORY_BIT : 0U),
         .usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE,
         .requiredFlags = 0,
         .preferredFlags = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
@@ -245,9 +247,49 @@ vk::Image MemoryAllocator::CreateImage(const VkImageCreateInfo& ci) const {
     VkImage handle{};
     VmaAllocation allocation{};
 
-    vk::Check(vmaCreateImage(allocator, &ci, &alloc_ci, &handle, &allocation, nullptr));
+    if (!dedicated) {
+        // Prefer free space in existing blocks before VMA considers a driver-
+        // preferred dedicated allocation. Required dedicated allocations and
+        // exhausted blocks still use the normal budget-aware fallback below.
+        auto reuse_ci = alloc_ci;
+        reuse_ci.flags |= VMA_ALLOCATION_CREATE_NEVER_ALLOCATE_BIT;
+        // Do not prefer spare host-memory upload blocks over fresh device memory.
+        reuse_ci.requiredFlags |= VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
+        const VkResult result =
+            vmaCreateImage(image_allocator, &ci, &reuse_ci, &handle, &allocation, nullptr);
+        if (result == VK_SUCCESS) {
+            return vk::Image(handle, *device.GetLogical(), image_allocator, allocation,
+                             device.GetDispatchLoader());
+        }
+        if (result != VK_ERROR_OUT_OF_DEVICE_MEMORY && result != VK_ERROR_FEATURE_NOT_PRESENT) {
+            vk::Check(result);
+        }
+    }
+    vk::Check(vmaCreateImage(image_allocator, &ci, &alloc_ci, &handle, &allocation, nullptr));
 
-    return vk::Image(handle, *device.GetLogical(), allocator, allocation,
+    return vk::Image(handle, *device.GetLogical(), image_allocator, allocation,
+                     device.GetDispatchLoader());
+}
+
+vk::Image MemoryAllocator::CreateTransientImage(const VkImageCreateInfo& ci) const {
+    const auto image_allocator = device.GetImageAllocator();
+    const VmaAllocationCreateInfo alloc_ci = {
+        .flags = VMA_ALLOCATION_CREATE_WITHIN_BUDGET_BIT,
+        .usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE,
+        .requiredFlags = 0,
+        .preferredFlags =
+            VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT | VK_MEMORY_PROPERTY_LAZILY_ALLOCATED_BIT,
+        .memoryTypeBits = 0,
+        .pool = VK_NULL_HANDLE,
+        .pUserData = nullptr,
+        .priority = 0.f,
+    };
+    VkImage handle{};
+    VmaAllocation allocation{};
+
+    vk::Check(vmaCreateImage(image_allocator, &ci, &alloc_ci, &handle, &allocation, nullptr));
+
+    return vk::Image(handle, *device.GetLogical(), image_allocator, allocation,
                      device.GetDispatchLoader());
 }
 

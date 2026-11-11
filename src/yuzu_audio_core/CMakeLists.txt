@@ -1,8 +1,11 @@
-# Audio engine (matches src/yuzu_audio_core/yuzu_audio_core.vcxproj).
+# Audio engine.
 cmake_minimum_required(VERSION 3.18)
 
 if(NOT TARGET cubeb)
     set(USE_SANITIZERS OFF CACHE BOOL "cubeb: skip sanitizers-cmake" FORCE)
+    if(APPLE OR WIN32 OR ANDROID)
+        set(BUNDLE_SPEEX ON CACHE BOOL "cubeb: use bundled Speex resampler" FORCE)
+    endif()
     set(BUILD_TESTS OFF CACHE BOOL "cubeb: skip gtest" FORCE)
     set(BUILD_TOOLS OFF CACHE BOOL "cubeb: skip tools" FORCE)
     add_subdirectory("${CMAKE_SOURCE_DIR}/external/cubeb" "${CMAKE_BINARY_DIR}/external/cubeb")
@@ -10,10 +13,16 @@ endif()
 
 file(GLOB_RECURSE YUZU_AUDIO_CORE_SOURCES CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/*.cpp")
 
-list(FILTER YUZU_AUDIO_CORE_SOURCES EXCLUDE REGEX ".*/sdl2_sink\\.cpp$")
+list(FILTER YUZU_AUDIO_CORE_SOURCES EXCLUDE REGEX ".*/sdl_sink\\.cpp$")
 list(FILTER YUZU_AUDIO_CORE_SOURCES EXCLUDE REGEX ".*/oboe_sink\\.cpp$")
 
 add_library(yuzu_audio_core STATIC ${YUZU_AUDIO_CORE_SOURCES})
+
+if(ENABLE_SDL)
+    target_sources(yuzu_audio_core PRIVATE sink/sdl_sink.cpp)
+    target_compile_definitions(yuzu_audio_core PRIVATE HAVE_SDL)
+    target_link_libraries(yuzu_audio_core PRIVATE SDL3::SDL3)
+endif()
 
 target_include_directories(yuzu_audio_core PUBLIC
     ${CMAKE_SOURCE_DIR}/src

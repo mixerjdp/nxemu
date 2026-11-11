@@ -93,7 +93,7 @@ public:
         return true;
     }
 
-    bool CanUploadMSAA() const noexcept {
+    bool CanUploadMSAA(const Image&) const noexcept {
         return true;
     }
 
@@ -143,6 +143,10 @@ public:
 
     void BarrierFeedbackLoop() const noexcept {
         // OpenGL does not require a barrier for attachment feedback loops.
+    }
+
+    u64 AttachmentBarrierTick() const noexcept {
+        return 0;
     }
 
 private:

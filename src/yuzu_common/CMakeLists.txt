@@ -1,4 +1,6 @@
 add_library(yuzu_common STATIC
+    android/performance_hint.cpp
+    android/performance_hint.h
     address_space.cpp
     algorithm.h
     alignment.h
@@ -45,6 +47,8 @@ add_library(yuzu_common STATIC
     hex_util.h
     host_memory.cpp
     host_memory.h
+    nce_direct_map.cpp
+    nce_direct_map.h
     input.h
     intrusive_red_black_tree.h
     literals.h
@@ -116,6 +120,8 @@ add_library(yuzu_common STATIC
     wall_clock.h
     yuzu_assert.cpp
     yuzu_assert.h
+    zbic_compression.cpp
+    zbic_compression.h
     zstd_compression.cpp
     zstd_compression.h
 )
@@ -136,8 +142,14 @@ if (NOT WIN32)
 endif()
 
 if(ANDROID)
+    option(NXEMU_ENABLE_ANDROID_ADPF "Enable Android Vulkan worker performance hints" ON)
+    if(NXEMU_ENABLE_ANDROID_ADPF)
+        target_compile_definitions(yuzu_common PRIVATE NXEMU_ENABLE_ANDROID_ADPF=1)
+    endif()
+    target_link_libraries(yuzu_common PRIVATE ${CMAKE_DL_LIBS})
     target_sources(yuzu_common PRIVATE
         android/java_bridge.cpp
+        android/frame_interval.h
         android/java_bridge.h
         fs/fs_android.cpp
         fs/fs_android.h
@@ -168,11 +180,21 @@ if(ARCHITECTURE_arm64)
     )
 endif()
 
-set_source_files_properties(stb.cpp PROPERTIES COMPILE_OPTIONS "-Wno-implicit-fallthrough;-Wno-missing-declarations;-Wno-missing-field-initializers")
+if(NOT MSVC)
+    set_source_files_properties(stb.cpp PROPERTIES COMPILE_OPTIONS "-Wno-implicit-fallthrough;-Wno-missing-declarations;-Wno-missing-field-initializers")
+endif()
+
+set_source_files_properties(zbic_compression.cpp PROPERTIES
+    INCLUDE_DIRECTORIES "${CMAKE_SOURCE_DIR}/external/zbic/src"
+    COMPILE_OPTIONS "$<$<CXX_COMPILER_ID:Clang,GNU>:-Wno-unused-function;-Wno-missing-declarations;-Wno-shadow>")
 
 if (CMAKE_CXX_COMPILER_ID STREQUAL "Clang")
+  # Public headers call sized operator delete; their consumers need Clang's
+  # opt-in as well, especially when using Linux libstdc++.
+  target_compile_options(yuzu_common PUBLIC
+    "$<$<COMPILE_LANGUAGE:CXX>:-fsized-deallocation>"
+  )
   target_compile_options(yuzu_common PRIVATE
-    -fsized-deallocation
     -Werror=unreachable-code-aggressive
   )
   target_compile_definitions(yuzu_common PRIVATE
@@ -188,5 +210,10 @@ target_include_directories(yuzu_common PUBLIC
 
 target_link_libraries(yuzu_common PUBLIC Boost::context Boost::headers fmt::fmt stb::headers Threads::Threads)
 target_link_libraries(yuzu_common PRIVATE lz4::lz4 zstd::zstd)
+
+if(APPLE)
+    find_library(YUZU_COMMON_COREFOUNDATION_FRAMEWORK CoreFoundation REQUIRED)
+    target_link_libraries(yuzu_common PRIVATE ${YUZU_COMMON_COREFOUNDATION_FRAMEWORK})
+endif()
 
 create_target_directory_groups(yuzu_common)

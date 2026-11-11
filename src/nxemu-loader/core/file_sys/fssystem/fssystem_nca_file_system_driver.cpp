@@ -1,6 +1,8 @@
 // SPDX-FileCopyrightText: Copyright 2023 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <cstring>
+
 #include "core/file_sys/fssystem/fssystem_nca_file_system_driver.h"
 #include "core/file_sys/fssystem/fssystem_aes_ctr_counter_extended_storage.h"
 #include "core/file_sys/fssystem/fssystem_alignment_matching_storage.h"
@@ -789,7 +791,8 @@ Result NcaFileSystemDriver::CreatePatchMetaStorage(
     ASSERT(Common::IsAligned<s64>(patch_info.aes_ctr_ex_size, NcaHeader::XtsBlockSize));
 
     // Validate patch info extents.
-    R_UNLESS(patch_info.aes_ctr_ex_size >= 0 && patch_info.HasAesCtrExTable(),
+    R_UNLESS(patch_info.aes_ctr_ex_size >= 0 &&
+                 (patch_info.aes_ctr_ex_size > 0 || patch_info.indirect_offset == 0),
              ResultInvalidNcaPatchInfoAesCtrExSize);
     R_UNLESS(patch_info.indirect_size > 0 && patch_info.HasIndirectTable(),
              ResultInvalidNcaPatchInfoIndirectSize);

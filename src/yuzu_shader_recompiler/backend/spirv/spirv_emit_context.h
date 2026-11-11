@@ -4,6 +4,8 @@
 #pragma once
 
 #include <array>
+#include <bitset>
+#include <unordered_set>
 
 #include <sirit/sirit.h>
 
@@ -36,6 +38,11 @@ struct TextureDefinition {
     Id image_type;
     u32 count;
     bool is_multisample;
+    bool is_direct{};
+    /// Slot of the host selector reading this texture from a color attachment instead
+    u32 attachment_read_slot{NO_ATTACHMENT_READ};
+
+    static constexpr u32 NO_ATTACHMENT_READ = ~0U;
 };
 
 struct TextureBufferDefinition {
@@ -53,8 +60,11 @@ struct ImageBufferDefinition {
 struct ImageDefinition {
     Id id;
     Id image_type;
+    Id pointer_type;
     u32 count;
     bool is_integer;
+    bool is_signed{};
+    bool is_direct{};
 };
 
 struct UniformDefinitions {
@@ -155,6 +165,18 @@ struct GenericElementInfo {
 
 class EmitContext final : public Sirit::Module {
 public:
+    Id runtime_samplers{};
+    Id runtime_sampler_type{};
+    Id runtime_sampler_pointer{};
+    bool runtime_samplers_linked{};
+    Id runtime_image_write_mask{};
+    Id runtime_image_write_mask_element{};
+    Id write_track_bitmap{};
+    Id write_track_bitmap_element{};
+    Id track_write_func{};
+    u32 write_track_member_index{};
+    std::array<u32, Info::MAX_SSBOS> ssbo_write_slots{};
+    std::vector<u32> image_buffer_write_slots;
     explicit EmitContext(const Profile& profile, const RuntimeInfo& runtime_info,
                          IR::Program& program, Bindings& binding);
     ~EmitContext();
@@ -163,6 +185,7 @@ public:
 
     [[nodiscard]] Id BitOffset8(const IR::Value& offset);
     [[nodiscard]] Id BitOffset16(const IR::Value& offset);
+    [[nodiscard]] Id RemapSharedMemoryOffset(Id offset);
 
     Id Const(u32 value) {
         return Constant(U32[1], value);
@@ -203,8 +226,12 @@ public:
     }
 
     const Profile& profile;
+    /// Rebuild fp16 denormals in conversions because the shader cannot ask the host to keep them.
+    bool emulate_fp16_denormals{};
     const RuntimeInfo& runtime_info;
     Stage stage{};
+    /// The stage has no host subgroups; warp operations see a single lane
+    bool single_lane_subgroup{};
 
     Id void_id{};
     Id U1{};
@@ -246,12 +273,27 @@ public:
     Id image_buffer_type{};
     Id image_u32{};
 
+    /// Pointer to one view of a texel buffer descriptor, which holds two when
+    /// Profile::texel_buffer_size_view is set: the one that is read, then the one that has the
+    /// size the guest bound
+    [[nodiscard]] Id TexelBufferView(Id descriptor, Id image_type, Id element);
+
+    /// Coordinate in the view that is read for a coordinate the guest uses, given both views
+    [[nodiscard]] Id TexelBufferCoord(Id coords, Id image, Id size_image);
+
     std::array<UniformDefinitions, Info::MAX_CBUFS> cbufs{};
     std::array<StorageDefinitions, Info::MAX_SSBOS> ssbos{};
+    /// Buffers accessed only by non-returning 64-bit additions in this shader.
+    std::bitset<Info::MAX_SSBOS> atomic64_add_reduction_buffers;
     std::vector<TextureBufferDefinition> texture_buffers;
     std::vector<ImageBufferDefinition> image_buffers;
     std::vector<TextureDefinition> textures;
     std::vector<ImageDefinition> images;
+
+    bool uses_nonuniform_sampled_image{};
+    bool uses_nonuniform_uniform_texel_buffer{};
+    bool uses_nonuniform_storage_image{};
+    std::unordered_set<u32> nonuniform_sampled_ids;
 
     Id workgroup_id{};
     Id local_invocation_id{};
@@ -294,14 +336,19 @@ public:
     u32 rescaling_textures_member_index{};
     u32 rescaling_images_member_index{};
     u32 rescaling_downfactor_member_index{};
+    u32 rescaling_attachment_reads_member_index{};
     u32 texture_rescaling_index{};
     u32 image_rescaling_index{};
+
+    Id input_attachment_type{};
+    std::array<Id, 8> input_attachments{};
 
     Id render_area_push_constant{};
     u32 render_are_member_index{};
 
     Id local_memory{};
 
+    bool shared_memory_16_to_12_packing{};
     Id shared_memory_u8{};
     Id shared_memory_u16{};
     Id shared_memory_u32{};
@@ -334,8 +381,20 @@ public:
     Id write_global_func_u32x2{};
     Id write_global_func_u32x4{};
 
+    Id global_atomic_iadd_func_u32{};
+    Id global_atomic_smin_func_u32{};
+    Id global_atomic_umin_func_u32{};
+    Id global_atomic_smax_func_u32{};
+    Id global_atomic_umax_func_u32{};
+    Id global_atomic_and_func_u32{};
+    Id global_atomic_or_func_u32{};
+    Id global_atomic_xor_func_u32{};
+    Id global_atomic_exchange_func_u32{};
+
     bool need_input_position_indirect{};
     Id input_position{};
+    /// The fragment shader emulates the alpha-to-coverage dither of render target 0
+    bool alpha_to_coverage_dither{};
     std::array<InputGenericInfo, 32> input_generics{};
 
     Id output_point_size{};
@@ -371,15 +430,19 @@ private:
     void DefineStorageBuffers(const Info& info, u32& binding);
     void DefineTextureBuffers(const Info& info, u32& binding);
     void DefineImageBuffers(const Info& info, u32& binding);
-    void DefineTextures(const Info& info, u32& binding, u32& scaling_index);
+    void DefineTextures(const Info& info, u32& binding, u32& scaling_index, u32& table_binding);
+    void DefineRuntimeSamplers(const Info& info, u32& table_binding);
     void DefineImages(const Info& info, u32& binding, u32& scaling_index);
     void DefineAttributeMemAccess(const Info& info);
     void DefineWriteStorageCasLoopFunction(const Info& info);
-    void DefineGlobalMemoryFunctions(const Info& info);
+    void DefineGlobalMemoryFunctions(const IR::Program& program);
     void DefineRescalingInput(const Info& info);
-    void DefineRescalingInputPushConstant();
+    void DefineRescalingInputPushConstant(const Info& info);
     void DefineRescalingInputUniformConstant();
+    void DefineWriteTrackingBitmap(const Info& info, u32& binding);
+    void DefineWriteTrackingFunction(const Info& info);
     void DefineRenderArea(const Info& info);
+    void DefineInputAttachments(const Info& info, u32& binding);
 
     void DefineInputs(const IR::Program& program);
     void DefineOutputs(const IR::Program& program);

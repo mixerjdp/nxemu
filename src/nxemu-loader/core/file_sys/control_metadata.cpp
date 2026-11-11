@@ -1,10 +1,15 @@
 // SPDX-FileCopyrightText: Copyright 2018 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <cstring>
+#include <algorithm>
+
 #include "core/file_sys/control_metadata.h"
 #include "core/file_sys/vfs/vfs.h"
+#include "loader_settings.h"
 #include <nxemu-module-spec/base.h>
 #include "nxemu-os/os_settings_identifiers.h"
+#include <nxemu-core/settings/identifiers.h>
 #include "yuzu_common/string_util.h"
 #include "yuzu_common/swap.h"
 
@@ -67,7 +72,18 @@ NACP::NACP() = default;
 
 NACP::NACP(VirtualFile file)
 {
-    file->ReadObject(&raw);
+    valid = file != nullptr && file->GetSize() == sizeof(raw) &&
+            file->ReadObject(&raw) == sizeof(raw);
+    const auto valid_string = [](const auto& buffer) {
+        const auto end = std::find(buffer.begin(), buffer.end(), '\0');
+        return end != buffer.end() && Common::IsValidUTF8(
+            std::string_view(buffer.data(), static_cast<size_t>(end - buffer.begin())));
+    };
+    valid = valid && std::all_of(raw.language_entries.begin(), raw.language_entries.end(),
+        [&](const auto& entry) {
+            return valid_string(entry.application_name) && valid_string(entry.developer_name);
+        }) && valid_string(raw.version_string);
+    if (!valid) raw = {};
     version = Common::StringFromFixedZeroTerminatedBuffer(raw.version_string.data(), raw.version_string.size());
 }
 
@@ -78,6 +94,7 @@ NACP & NACP::operator=(const NACP & other)
     if (this != &other)
     {
         raw = other.raw;
+        valid = other.valid;
         version = other.version;
         developer = other.developer;
     }
@@ -86,7 +103,7 @@ NACP & NACP::operator=(const NACP & other)
 
 const LanguageEntry & NACP::GetLanguageEntry() const
 {
-    Language language = language_to_codes[g_settings->GetInt(NXOsSetting::LanguageIndex)];
+    Language language = language_to_codes[loaderSettings.languageIndex];
 
     {
         const auto & language_entry = raw.language_entries.at(static_cast<u8>(language));
@@ -162,6 +179,16 @@ uint64_t NACP::GetDeviceSaveDataSize() const
 u32 NACP::GetParentalControlFlag() const
 {
     return raw.parental_control;
+}
+
+uint16_t NACP::GetCacheStorageMaxIndex() const
+{
+    return raw.cache_storage_max_index;
+}
+
+uint64_t NACP::GetCacheStorageDataAndJournalMaxSize() const
+{
+    return raw.cache_storage_data_and_journal_max_size;
 }
 
 std::vector<u8> NACP::GetRawBytes() const

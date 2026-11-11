@@ -4,6 +4,7 @@
 #pragma once
 
 #include <array>
+#include <limits>
 #include <optional>
 #include <vector>
 #include <boost/container/small_vector.hpp>
@@ -42,6 +43,8 @@ enum class ImageFlagBits : u32 {
 
     AsynchronousDecode = 1 << 16,
     IsDecoding = 1 << 17, ///< Is currently being decoded asynchronously.
+    DownloadQueued = 1 << 18, ///< Temporary mark while deduplicating a download batch.
+    NativeReadTracked = 1 << 19, ///< Native reads require GPU-written image data downloaded.
 };
 DECLARE_ENUM_FLAG_OPERATORS(ImageFlagBits)
 
@@ -94,6 +97,8 @@ struct ImageBase {
     bool has_scaled = false;
 
     size_t channel = 0;
+    // Page-table storage owning this image; garbage collection can run on another channel.
+    size_t gpu_page_table_index = SIZE_MAX;
 
     ImageFlagBits flags = ImageFlagBits::CpuModified;
 
@@ -102,6 +107,16 @@ struct ImageBase {
     VAddr cpu_addr_end = 0;
 
     u64 modification_tick = 0;
+    /// Modification tick of the contents last written back to guest memory
+    u64 published_tick = 0;
+    /// The last write back only covered the pages the CPU observed
+    bool published_observed_pages = false;
+    /// Modification tick of the last GPU write; alias synchronization does not change it
+    u64 gpu_write_tick = 0;
+    /// Attachment barrier tick, plus one, of the last write to the image as a render target
+    u64 attachment_write_tick = 0;
+    /// Frame in which the image was first bound as a render target
+    u64 first_render_frame = std::numeric_limits<u64>::max();
     size_t lru_index = SIZE_MAX;
 
     std::array<u32, MAX_MIP_LEVELS> mip_level_offsets{};

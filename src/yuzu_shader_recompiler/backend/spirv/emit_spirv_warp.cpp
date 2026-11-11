@@ -11,6 +11,9 @@ Id SubgroupScope(EmitContext& ctx) {
 }
 
 Id GetThreadId(EmitContext& ctx) {
+    if (ctx.single_lane_subgroup) {
+        return ctx.u32_zero_value;
+    }
     return ctx.OpLoad(ctx.U32[1], ctx.subgroup_local_invocation_id);
 }
 
@@ -35,7 +38,10 @@ Id WarpExtract(EmitContext& ctx, Id value) {
     }
 }
 
-Id LoadMask(EmitContext& ctx, Id mask) {
+Id LoadMask(EmitContext& ctx, Id mask, u32 single_lane_value) {
+    if (ctx.single_lane_subgroup) {
+        return ctx.Const(single_lane_value);
+    }
     const Id value{ctx.OpLoad(ctx.U32[4], mask)};
     if (!ctx.profile.warp_size_potentially_larger_than_guest) {
         return ctx.OpCompositeExtract(ctx.U32[1], value, 0U);
@@ -67,10 +73,47 @@ Id GetMaxThreadId(EmitContext& ctx, Id thread_id, Id clamp, Id segmentation_mask
     return ComputeMaxThreadId(ctx, min_thread_id, clamp, not_seg_mask);
 }
 
+Id ShuffleAbsolute(EmitContext& ctx, Id value, Id src_thread_id) {
+    if (!ctx.profile.has_broken_spirv_subgroup_shuffle) {
+        return ctx.OpGroupNonUniformShuffle(ctx.U32[1], SubgroupScope(ctx), value, src_thread_id);
+    }
+
+    // Dynamic shuffle is miscompiled by some Qualcomm drivers. Broadcast uses a constant
+    // source lane and remains valid when the guest's requested lane is nonuniform.
+    Id result{ctx.u32_zero_value};
+    for (u32 lane = 0; lane < ctx.profile.max_subgroup_size; ++lane) {
+        const Id broadcast{ctx.OpGroupNonUniformBroadcast(ctx.U32[1], SubgroupScope(ctx),
+                                                         value, ctx.Const(lane))};
+        const Id selected{ctx.OpIEqual(ctx.U1, src_thread_id, ctx.Const(lane))};
+        result = ctx.OpSelect(ctx.U32[1], selected, broadcast, result);
+    }
+    return result;
+}
+
+// Reads a constant guest lane. When the host subgroup holds several 32-lane guest warps,
+// each partition reads the lane from its own warp.
+Id BroadcastGuestLane(EmitContext& ctx, Id value, u32 lane) {
+    Id result{
+        ctx.OpGroupNonUniformBroadcast(ctx.U32[1], SubgroupScope(ctx), value, ctx.Const(lane))};
+    if (!ctx.profile.warp_size_potentially_larger_than_guest) {
+        return result;
+    }
+    const Id partition_idx{ctx.OpShiftRightLogical(ctx.U32[1], GetThreadId(ctx), ctx.Const(5u))};
+    for (u32 base = 32; base < ctx.profile.max_subgroup_size; base += 32) {
+        const Id broadcast{ctx.OpGroupNonUniformBroadcast(ctx.U32[1], SubgroupScope(ctx), value,
+                                                          ctx.Const(base + lane))};
+        const Id selected{ctx.OpIEqual(ctx.U1, partition_idx, ctx.Const(base >> 5))};
+        result = ctx.OpSelect(ctx.U32[1], selected, broadcast, result);
+    }
+    return result;
+}
+
 Id SelectValue(EmitContext& ctx, Id in_range, Id value, Id src_thread_id) {
+    if (ctx.single_lane_subgroup) {
+        return value;
+    }
     return ctx.OpSelect(
-        ctx.U32[1], in_range,
-        ctx.OpGroupNonUniformShuffle(ctx.U32[1], SubgroupScope(ctx), value, src_thread_id), value);
+        ctx.U32[1], in_range, ShuffleAbsolute(ctx, value, src_thread_id), value);
 }
 
 Id AddPartitionBase(EmitContext& ctx, Id thread_id) {
@@ -89,6 +132,9 @@ Id EmitLaneId(EmitContext& ctx) {
 }
 
 Id EmitVoteAll(EmitContext& ctx, Id pred) {
+    if (ctx.single_lane_subgroup) {
+        return pred;
+    }
     if (!ctx.profile.warp_size_potentially_larger_than_guest) {
         return ctx.OpGroupNonUniformAll(ctx.U1, SubgroupScope(ctx), pred);
     }
@@ -102,6 +148,9 @@ Id EmitVoteAll(EmitContext& ctx, Id pred) {
 }
 
 Id EmitVoteAny(EmitContext& ctx, Id pred) {
+    if (ctx.single_lane_subgroup) {
+        return pred;
+    }
     if (!ctx.profile.warp_size_potentially_larger_than_guest) {
         return ctx.OpGroupNonUniformAny(ctx.U1, SubgroupScope(ctx), pred);
     }
@@ -115,6 +164,9 @@ Id EmitVoteAny(EmitContext& ctx, Id pred) {
 }
 
 Id EmitVoteEqual(EmitContext& ctx, Id pred) {
+    if (ctx.single_lane_subgroup) {
+        return ctx.true_value;
+    }
     if (!ctx.profile.warp_size_potentially_larger_than_guest) {
         return ctx.OpGroupNonUniformAllEqual(ctx.U1, SubgroupScope(ctx), pred);
     }
@@ -129,6 +181,9 @@ Id EmitVoteEqual(EmitContext& ctx, Id pred) {
 }
 
 Id EmitSubgroupBallot(EmitContext& ctx, Id pred) {
+    if (ctx.single_lane_subgroup) {
+        return ctx.OpSelect(ctx.U32[1], pred, ctx.Const(1U), ctx.u32_zero_value);
+    }
     const Id ballot{ctx.OpGroupNonUniformBallot(ctx.U32[4], SubgroupScope(ctx), pred)};
     if (!ctx.profile.warp_size_potentially_larger_than_guest) {
         return ctx.OpCompositeExtract(ctx.U32[1], ballot, 0U);
@@ -137,23 +192,23 @@ Id EmitSubgroupBallot(EmitContext& ctx, Id pred) {
 }
 
 Id EmitSubgroupEqMask(EmitContext& ctx) {
-    return LoadMask(ctx, ctx.subgroup_mask_eq);
+    return LoadMask(ctx, ctx.subgroup_mask_eq, 1U);
 }
 
 Id EmitSubgroupLtMask(EmitContext& ctx) {
-    return LoadMask(ctx, ctx.subgroup_mask_lt);
+    return LoadMask(ctx, ctx.subgroup_mask_lt, 0U);
 }
 
 Id EmitSubgroupLeMask(EmitContext& ctx) {
-    return LoadMask(ctx, ctx.subgroup_mask_le);
+    return LoadMask(ctx, ctx.subgroup_mask_le, 1U);
 }
 
 Id EmitSubgroupGtMask(EmitContext& ctx) {
-    return LoadMask(ctx, ctx.subgroup_mask_gt);
+    return LoadMask(ctx, ctx.subgroup_mask_gt, 0U);
 }
 
 Id EmitSubgroupGeMask(EmitContext& ctx) {
-    return LoadMask(ctx, ctx.subgroup_mask_ge);
+    return LoadMask(ctx, ctx.subgroup_mask_ge, 1U);
 }
 
 Id EmitShuffleIndex(EmitContext& ctx, IR::Inst* inst, Id value, Id index, Id clamp,
@@ -172,6 +227,16 @@ Id EmitShuffleIndex(EmitContext& ctx, IR::Inst* inst, Id value, Id index, Id cla
     }
 
     SetInBoundsFlag(inst, in_range);
+    // A constant guest lane can be broadcast directly. This avoids the expensive
+    // dynamic-index workaround on Qualcomm for the common unsegmented case.
+    if (ctx.profile.has_broken_spirv_subgroup_shuffle && !ctx.single_lane_subgroup) {
+        const IR::Value lane{inst->Arg(1).Resolve()};
+        const IR::Value segment{inst->Arg(3).Resolve()};
+        if (lane.IsImmediate() && segment.IsImmediate() && segment.U32() == 0) {
+            return ctx.OpSelect(ctx.U32[1], in_range,
+                                BroadcastGuestLane(ctx, value, lane.U32() & 31u), value);
+        }
+    }
     return SelectValue(ctx, in_range, value, src_thread_id);
 }
 
@@ -222,7 +287,7 @@ Id EmitShuffleButterfly(EmitContext& ctx, IR::Inst* inst, Id value, Id index, Id
 
 Id EmitFSwizzleAdd(EmitContext& ctx, Id op_a, Id op_b, Id swizzle) {
     const Id three{ctx.Const(3U)};
-    Id mask{ctx.OpLoad(ctx.U32[1], ctx.subgroup_local_invocation_id)};
+    Id mask{GetThreadId(ctx)};
     mask = ctx.OpBitwiseAnd(ctx.U32[1], mask, three);
     mask = ctx.OpShiftLeftLogical(ctx.U32[1], mask, ctx.Const(1U));
     mask = ctx.OpShiftRightLogical(ctx.U32[1], swizzle, mask);

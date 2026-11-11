@@ -3,7 +3,7 @@
 
 #pragma once
 
-#include <chrono>
+#include <condition_variable>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -20,8 +20,8 @@ class System;
 }
 
 namespace Kernel {
+class KAutoObject;
 class KClientPort;
-class KClientSession;
 class KernelCore;
 class KPort;
 class SessionRequestHandler;
@@ -45,8 +45,8 @@ private:
     void RegisterServiceTipc(HLERequestContext& ctx);
     void UnregisterService(HLERequestContext& ctx);
 
-    Result GetServiceImpl(Kernel::KClientSession** out_client_session, HLERequestContext& ctx);
-    void RegisterServiceImpl(HLERequestContext& ctx, std::string name, u32 max_session_count,
+    Result GetServiceImpl(Kernel::KAutoObject** out_client_session, HLERequestContext& ctx);
+    void RegisterServiceImpl(HLERequestContext& ctx, std::string name, s32 max_session_count,
                              bool is_light);
 
     ServiceManager& service_manager;
@@ -59,28 +59,39 @@ public:
     ~ServiceManager();
 
     Result RegisterService(Kernel::KServerPort** out_server_port, std::string name,
-                           u32 max_sessions, SessionRequestHandlerFactory handler_factory);
+                           s32 max_sessions, SessionRequestHandlerFactory handler_factory,
+                           bool is_light = false);
     Result UnregisterService(const std::string& name);
     Result GetServicePort(Kernel::KClientPort** out_client_port, const std::string& name);
 
     template <Common::DerivedFrom<SessionRequestHandler> T>
     std::shared_ptr<T> GetService(const std::string& service_name, bool block = false) const {
-        auto service = registered_services.find(service_name);
-        if (service == registered_services.end() && !block) {
-            LOG_DEBUG(Service, "Can't find service: {}", service_name);
-            return nullptr;
-        } else if (block) {
-            using namespace std::literals::chrono_literals;
-            while (service == registered_services.end()) {
-                Kernel::Svc::SleepThread(
-                    kernel.System(),
-                    std::chrono::duration_cast<std::chrono::nanoseconds>(100ms).count());
+        SessionRequestHandlerFactory factory;
+
+        {
+            std::unique_lock lk{lock};
+            auto service = registered_services.find(service_name);
+            if (service == registered_services.end()) {
+                if (!block) {
+                    LOG_DEBUG(Service, "Can't find service: {}", service_name);
+                    return nullptr;
+                }
+                if (!WaitForRegistration(lk, service_name)) {
+                    return nullptr;
+                }
                 service = registered_services.find(service_name);
             }
+
+            // Copy the factory under the lock, then invoke it outside the lock.
+            factory = service->second;
         }
 
-        return std::static_pointer_cast<T>(service->second());
+        return std::static_pointer_cast<T>(factory());
     }
+
+    /// Ends the waits of host threads for services that will not register: a blocking
+    /// GetService on a host thread then returns nullptr.
+    void Close();
 
     void InvokeControlRequest(HLERequestContext& context);
 
@@ -89,13 +100,18 @@ public:
     }
 
 private:
+    bool WaitForRegistration(std::unique_lock<std::mutex>& lk, const std::string& name) const;
+
     std::shared_ptr<SM> sm_interface;
     std::unique_ptr<Controller> controller_interface;
 
     /// Map of registered services, retrieved using GetServicePort.
-    std::mutex lock;
+    mutable std::mutex lock;
     std::unordered_map<std::string, SessionRequestHandlerFactory> registered_services;
     std::unordered_map<std::string, Kernel::KClientPort*> service_ports;
+    mutable std::condition_variable registration_cv;
+    mutable size_t host_waiters{};
+    bool closed{};
 
     /// Kernel context
     Kernel::KernelCore& kernel;

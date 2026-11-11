@@ -18,6 +18,7 @@ namespace Service::AM {
 
 struct Applet;
 class ILockAccessor;
+class IStorage;
 
 class ICommonStateGetter final : public ServiceFramework<ICommonStateGetter> {
 public:
@@ -29,12 +30,19 @@ private:
     Result ReceiveMessage(Out<AppletMessage> out_applet_message);
     Result GetCurrentFocusState(Out<FocusState> out_focus_state);
     Result RequestToAcquireSleepLock();
+    Result ReleaseSleepLock();
     Result GetAcquiredSleepLockEvent(OutCopyHandle<Kernel::KReadableEvent> out_event);
+    Result PushToGeneralChannel(SharedPointer<IStorage> storage);
+    Result GetHomeButtonReaderLockAccessor(
+        Out<SharedPointer<ILockAccessor>> out_lock_accessor);
+    Result SetHandlingHomeButtonShortPressedEnabled(bool enabled);
     Result GetReaderLockAccessorEx(Out<SharedPointer<ILockAccessor>> out_lock_accessor,
                                    u32 button_type);
     Result GetWriterLockAccessorEx(Out<SharedPointer<ILockAccessor>> out_lock_accessor,
                                    u32 button_type);
     Result GetDefaultDisplayResolutionChangeEvent(OutCopyHandle<Kernel::KReadableEvent> out_event);
+    Result GetHdcpAuthenticationState(Out<s32> out_state);
+    Result GetHdcpAuthenticationStateChangeEvent(OutCopyHandle<Kernel::KReadableEvent> out_event);
     Result GetOperationMode(Out<OperationMode> out_operation_mode);
     Result GetPerformanceMode(Out<APM::PerformanceMode> out_performance_mode);
     Result GetBootMode(Out<PM::SystemBootMode> out_boot_mode);
@@ -53,6 +61,8 @@ private:
                                     OutArray<AppletId, BufferAttr_HipcMapAlias> out_applet_ids);
     Result GetSettingsPlatformRegion(Out<Set::PlatformRegion> out_settings_platform_region);
     Result SetRequestExitToLibraryAppletAtExecuteNextProgramEnabled();
+    Result Unknown610(u64 unk);
+    Result Unknown611(u8 unk);
 
     void SetCpuBoostMode(HLERequestContext& ctx);
 

@@ -107,8 +107,9 @@ void CheckCBufNVN(Info& info, IR::Inst& inst) {
         return;
     }
     const u32 offset{cbuf_offset.U32()};
-    const u32 descriptor_size{0x10};
-    const u32 upper_limit{info.nvn_buffer_base + descriptor_size * 16};
+    const u32 descriptor_size{Info::NVN_STORAGE_BUFFER_DESCRIPTOR_SIZE};
+    const u32 upper_limit{info.nvn_buffer_base +
+                          descriptor_size * static_cast<u32>(Info::NUM_NVN_STORAGE_BUFFERS)};
     if (offset >= info.nvn_buffer_base && offset < upper_limit) {
         const std::size_t nvn_index{(offset - info.nvn_buffer_base) / descriptor_size};
         info.nvn_buffer_used.set(nvn_index, true);
@@ -456,6 +457,9 @@ void VisitUsages(Info& info, IR::Inst& inst) {
         break;
     case IR::Opcode::SetFragColor:
         info.stores_frag_color[inst.Arg(0).U32()] = true;
+        if (inst.Arg(1).U32() == 3) {
+            info.stores_frag_alpha[inst.Arg(0).U32()] = true;
+        }
         break;
     case IR::Opcode::SetSampleMask:
         info.stores_sample_mask = true;
@@ -723,6 +727,7 @@ void VisitUsages(Info& info, IR::Inst& inst) {
     case IR::Opcode::StorageAtomicAnd64:
     case IR::Opcode::StorageAtomicOr64:
     case IR::Opcode::StorageAtomicXor64:
+    case IR::Opcode::StorageAtomicExchange64:
         info.used_storage_buffer_types |= IR::Type::U64 | IR::Type::U32x2;
         info.uses_int64_bit_atomics = true;
         break;
@@ -767,6 +772,18 @@ void VisitUsages(Info& info, IR::Inst& inst) {
 }
 
 void VisitFpModifiers(Info& info, IR::Inst& inst) {
+    switch (inst.GetOpcode()) {
+    case IR::Opcode::ConvertF16F32:
+    case IR::Opcode::ConvertF32F16: {
+        const IR::FmzMode fmz_mode{inst.Flags<IR::FpControl>().fmz_mode};
+        if (fmz_mode != IR::FmzMode::FTZ && fmz_mode != IR::FmzMode::FMZ) {
+            info.uses_fp16_denorm_conversions = true;
+        }
+        break;
+    }
+    default:
+        break;
+    }
     switch (inst.GetOpcode()) {
     case IR::Opcode::FPAdd16:
     case IR::Opcode::FPFma16:
@@ -944,6 +961,8 @@ void GatherInfoFromHeader(Environment& env, Info& info) {
 
 void CollectShaderInfoPass(Environment& env, IR::Program& program) {
     Info& info{program.info};
+    // Read-only and atomic storage texel buffers also require ImageBuffer in SPIR-V.
+    info.uses_image_buffers |= !info.image_buffer_descriptors.empty();
     const u32 base{[&] {
         switch (program.stage) {
         case Stage::VertexA:
